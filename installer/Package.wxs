@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Установщик «Раздельный VPN»: на весь компьютер, служба LocalSystem с автозапуском и перезапуском при сбоях.
+  Обновление: остановка службы не трогает фильтры, маршруты и VPN — новая служба их подхватывает.
+  Удаление: «SplitVpn.Service.exe recover ‐‐uninstall» снимает всё и удаляет данные; ненулевой код прерывает удаление.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package
+      Name="Раздельный VPN"
+      Manufacturer="SplitVpn"
+      Version="$(ProductVersion)"
+      UpgradeCode="7E1B3C52-9D0A-4F6E-8B21-5C3A9F0D2E71"
+      Language="1049"
+      Codepage="1251"
+      Scope="perMachine"
+      InstallerVersion="500">
+
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        Schedule="afterInstallInitialize"
+        DowngradeErrorMessage="Установлена более новая версия «Раздельного VPN». Сначала удалите её." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="AppIcon" SourceFile="$(AssetsDir)\app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- Разрешить всё → «recover ‐‐uninstall» только при полном удалении, не при обновлении. -->
+    <SetProperty Id="RecoverNetwork" Value="&quot;[INSTALLFOLDER]SplitVpn.Service.exe&quot; recover --uninstall" Before="RecoverNetwork" Sequence="execute" />
+    <CustomAction Id="RecoverNetwork" DllEntry="WixQuietExec" BinaryRef="Wix4UtilCA_X64" Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="RecoverNetwork" After="StopServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="Раздельный VPN" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="ServiceComponents" />
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentGroupRef Id="ScriptComponents" />
+      <ComponentGroupRef Id="DataComponents" />
+      <ComponentGroupRef Id="ShortcutComponents" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="SplitVpn">
+        <Directory Id="ScriptsFolder" Name="scripts" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DataFolder" Name="SplitVpn" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="MenuFolder" Name="Раздельный VPN" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="ServiceComponents" Directory="INSTALLFOLDER">
+      <Component Id="ServiceExe" Guid="3A7C1E9B-5D42-4B8F-9C60-1F2E7A8D4C13">
+        <File Id="ServiceExe" Source="$(ServiceDir)\SplitVpn.Service.exe" KeyPath="yes" />
+        <ServiceInstall
+            Id="SplitVpnService"
+            Name="SplitVpn"
+            DisplayName="Раздельный VPN"
+            Description="Разделение трафика VPN (SSTP, L2TP/IPsec, IKEv2, PPTP, Cisco AnyConnect): российские адреса напрямую, остальные через VPN, защита при обрыве."
+            Type="ownProcess"
+            Start="auto"
+            ErrorControl="normal"
+            Account="LocalSystem"
+            Vital="yes">
+          <util:ServiceConfig
+              FirstFailureActionType="restart"
+              SecondFailureActionType="restart"
+              ThirdFailureActionType="restart"
+              RestartServiceDelayInSeconds="5"
+              ResetPeriodInDays="1" />
+        </ServiceInstall>
+        <!-- Пуск при установке, остановка при обновлении и удалении. При удалении службу останавливает
+             и MSI (After StopServices) до вызова команды recover. -->
+        <ServiceControl Id="SplitVpnServiceControl" Name="SplitVpn" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Всё опубликованное; сам файл службы лежит отдельно (см. build-installer.ps1) и описан выше с ServiceInstall. -->
+    <ComponentGroup Id="AppFiles">
+      <Files Include="$(PublishDir)\**" Directory="INSTALLFOLDER" />
+    </ComponentGroup>
+
+    <ComponentGroup Id="ScriptComponents" Directory="ScriptsFolder">
+      <Component Id="RecoverCmd" Guid="9B4E2D71-8C3A-4F5B-A1D6-2E7C9F3B5A48">
+        <File Id="RecoverCmd" Source="$(ScriptsDir)\recover-network.cmd" KeyPath="yes" />
+      </Component>
+      <Component Id="RecoverPs1" Guid="C2D8F4A6-1E3B-4C7D-9A5F-6B8E0D2C4F71">
+        <File Id="RecoverPs1" Source="$(ScriptsDir)\recover-network.ps1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="DataComponents" Directory="DataFolder">
+      <!-- Данные службы: настройки, секреты (DPAPI), база, журналы. Только SYSTEM и администраторы. -->
+      <Component Id="DataFolderAcl" Guid="5F1A7C3E-2B9D-4E86-8A4C-0D3F6B1E9A25">
+        <CreateFolder>
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" />
+        </CreateFolder>
+        <RemoveFolder Id="RemoveDataFolder" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="Software\SplitVpn" Name="DataFolder" Type="string" Value="[DataFolder]" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="ShortcutComponents">
+      <Component Id="MenuShortcuts" Directory="MenuFolder" Guid="D7E3B9A1-4C6F-4A2D-B8E5-3F1C7A9D2B64">
+        <Shortcut Id="AppShortcut" Name="Раздельный VPN" Description="Российские адреса напрямую, остальные через VPN" Target="[INSTALLFOLDER]SplitVpn.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+        <Shortcut Id="RecoverShortcut" Name="Восстановить сеть" Description="Снять защиту и вернуть обычный интернет (нужны права администратора)" Target="[ScriptsFolder]recover-network.cmd" WorkingDirectory="ScriptsFolder" />
+        <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\SplitVpn" Name="MenuShortcuts" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="DesktopShortcuts" Directory="DesktopFolder" Guid="E8F4C2B6-7A1D-4E3B-9C5A-4D2F8B6E1C97">
+        <Shortcut Id="DesktopRecoverShortcut" Name="Восстановить сеть — Раздельный VPN" Description="Аварийное восстановление сети (нужны права администратора)" Target="[ScriptsFolder]recover-network.cmd" WorkingDirectory="ScriptsFolder" />
+        <RegistryValue Root="HKCU" Key="Software\SplitVpn" Name="DesktopShortcuts" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

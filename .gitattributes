@@ -1,0 +1,9 @@
+﻿# gradlew — POSIX-скрипт, должен оставаться с LF; остальные текстовые файлы приводит scripts
+ormalize-eol.ps1
+*.bat text eol=crlf
+*.jar binary
+*.so binary
+*.png binary
+*.webp binary
+*.ico binary
+scripts/*.sh text eol=lf

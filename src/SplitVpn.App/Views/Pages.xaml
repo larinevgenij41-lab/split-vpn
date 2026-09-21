@@ -1,0 +1,839 @@
+﻿<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+    xmlns:vm="clr-namespace:SplitVpn.App.ViewModels"
+    xmlns:views="clr-namespace:SplitVpn.App.Views"
+    xmlns:ipc="clr-namespace:SplitVpn.Core.Ipc;assembly=SplitVpn.Core">
+
+    <DataTemplate DataType="{x:Type vm:ConnectionSecurityViewModel}">
+        <StackPanel>
+            <TextBlock Style="{StaticResource FieldLabel}" Text="Протокол" />
+            <ComboBox ItemsSource="{Binding Protocols}" DisplayMemberPath="Name" SelectedValuePath="Value"
+                      SelectedValue="{Binding Protocol}" AutomationProperties.Name="Протокол VPN" />
+            <TextBlock Style="{StaticResource Hint}" Text="{Binding ProtocolHint}" />
+            <!-- У AnyConnect один способ входа — его выбирает шлюз: поле не показывается. -->
+            <StackPanel Visibility="{Binding IsRas, Converter={StaticResource VisibleWhen}}">
+                <TextBlock Style="{StaticResource FieldLabel}" Text="Способ входа" />
+                <!-- IsAsync: при смене профиля WPF обновил бы выбранный способ раньше списка способов нового протокола,
+                     не нашёл бы его там и оставил поле пустым. Асинхронное значение приходит уже после списка. -->
+                <ComboBox ItemsSource="{Binding AuthMethods}" DisplayMemberPath="Name" SelectedValuePath="Value"
+                          SelectedValue="{Binding AuthMethod, IsAsync=True}" AutomationProperties.Name="Способ входа" />
+                <TextBlock Style="{StaticResource Hint}" Text="{Binding CompatibilityHint}" />
+            </StackPanel>
+            <StackPanel Visibility="{Binding NeedsPassword, Converter={StaticResource VisibleWhen}}">
+                <TextBlock Style="{StaticResource FieldLabel}" Text="Домен (необязательно)" />
+                <ui:TextBox Text="{Binding Domain, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Домен входа" />
+            </StackPanel>
+            <StackPanel Visibility="{Binding IsL2tp, Converter={StaticResource VisibleWhen}}">
+                <TextBlock Style="{StaticResource FieldLabel}" Text="Проверка IPsec" />
+                <ComboBox ItemsSource="{x:Static vm:ConnectionSecurityViewModel.IpsecMethods}" DisplayMemberPath="Name" SelectedValuePath="Value"
+                          SelectedValue="{Binding IpsecAuthentication}" AutomationProperties.Name="Проверка IPsec" />
+            </StackPanel>
+            <StackPanel Visibility="{Binding NeedsPsk, Converter={StaticResource VisibleWhen}}">
+                <TextBlock Style="{StaticResource FieldLabel}" Text="Общий ключ IPsec (пусто — не менять)" />
+                <ui:PasswordBox Password="{Binding PreSharedKey, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Ключ IPsec" />
+                <CheckBox Content="Удалить сохранённый ключ IPsec" IsChecked="{Binding ClearPreSharedKey}" Margin="0,8,0,0"
+                          Visibility="{Binding CanClearSavedKey, Converter={StaticResource VisibleWhen}}" />
+                <TextBlock Style="{StaticResource Hint}" Text="Ключ хранится зашифрованным отдельно от пароля и не включается в экспорт." />
+            </StackPanel>
+            <StackPanel Visibility="{Binding NeedsTrust, Converter={StaticResource VisibleWhen}}">
+                <TextBlock Style="{StaticResource FieldLabel}" Text="Имена сервера EAP из сертификата (через ;)" />
+                <ui:TextBox Text="{Binding ServerNames, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Имена сервера EAP" />
+                <TextBlock Style="{StaticResource FieldLabel}" Text="Отпечатки доверенных корневых CA (по одному в строке)" />
+                <ui:TextBox Text="{Binding TrustedRoots, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True" MinHeight="64"
+                            AutomationProperties.Name="Доверенные CA EAP" />
+                <TextBlock Style="{StaticResource Hint}" Text="SHA-1 отпечатки из 40 знаков. CA должны быть установлены в доверенных корневых центрах сертификации локального компьютера. Проверка сервера обязательна." />
+            </StackPanel>
+            <StackPanel Visibility="{Binding NeedsClientCertificate, Converter={StaticResource VisibleWhen}}">
+                <TextBlock Style="{StaticResource FieldLabel}" Text="Отпечаток клиентского сертификата EAP-TLS" />
+                <ui:TextBox Text="{Binding ClientCertificateThumbprint, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Сертификат EAP-TLS" />
+                <TextBlock Style="{StaticResource Hint}" Text="Сертификат локального компьютера в разделе «Личное», с назначением проверки подлинности клиента и закрытым ключом, доступным службе SYSTEM. Пароль пользователя не требуется." />
+            </StackPanel>
+            <TextBlock Style="{StaticResource Hint}" Visibility="{Binding NeedsMachineCertificate, Converter={StaticResource VisibleWhen}}"
+                       Text="Windows выберет подходящий сертификат компьютера из раздела «Личное». Требуются доверенная цепочка и доступ службы SYSTEM к закрытому ключу." />
+            <StackPanel Visibility="{Binding IsAnyConnect, Converter={StaticResource VisibleWhen}}">
+                <TextBlock Style="{StaticResource Hint}"
+                           Text="Вход — во встроенном браузере (SSO) или в форме шлюза: окно откроется само при подключении. Пароль не сохраняется. AnyConnect — только дополнительное подключение: в туннель идут сети, которые назначит шлюз (карточка «Сети шлюза» на доске маршрутизации)." />
+                <TextBlock Style="{StaticResource FieldLabel}" Text="Группа подключения (необязательно)" />
+                <ui:TextBox Text="{Binding AnyConnectGroup, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Группа подключения AnyConnect" />
+                <TextBlock Style="{StaticResource Hint}" Text="Пусто — шлюз предложит группу по умолчанию. Группу можно указать и в адресе: vpn.example.org/staff." />
+                <TextBlock Style="{StaticResource FieldLabel}" Text="Отпечаток клиентского сертификата (необязательно)" />
+                <ui:TextBox Text="{Binding AnyConnectCertificate, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Сертификат AnyConnect" />
+                <TextBlock Style="{StaticResource Hint}" Text="SHA-1 из 40 знаков. Сертификат с закрытым ключом должен лежать в хранилище локального компьютера, раздел «Личное»: импортируйте PFX туда." />
+                <CheckBox Margin="0,10,0,0" Content="DTLS (UDP 443) — быстрее; выключите, если UDP блокируется" IsChecked="{Binding UseDtls}" />
+                <CheckBox Margin="0,8,0,0" Content="Применять прокси шлюза (PAC)" IsChecked="{Binding ApplyServerProxy}" />
+                <TextBlock Style="{StaticResource Hint}" Text="PAC уводит трафик браузеров на корпоративный прокси мимо правил маршрутизации. Прокси ставит интерфейс, пока он запущен; Firefox и программы на WinHTTP его не получают." />
+                <TextBlock Style="{StaticResource FieldLabel}" Text="Идентификатор клиента (User-Agent)" />
+                <ui:TextBox Text="{Binding UserAgent, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Идентификатор клиента AnyConnect" />
+            </StackPanel>
+        </StackPanel>
+    </DataTemplate>
+
+    <!-- ===================== Главная ===================== -->
+    <DataTemplate DataType="{x:Type vm:HomeViewModel}">
+        <StackPanel MaxWidth="980" HorizontalAlignment="Left">
+            <TextBlock Style="{StaticResource PageTitle}" Text="Главная" />
+            <TextBlock Style="{StaticResource PageSubtitle}" Text="Российские адреса — напрямую, остальные — через VPN. Защита не даёт трафику уйти мимо туннеля." />
+
+            <!-- Состояние: индикатор, слова, кнопка -->
+            <ui:Card Style="{StaticResource PageCard}" Padding="24">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Grid Grid.Column="0" Width="64" Height="64" Margin="0,0,20,0" VerticalAlignment="Center">
+                        <Border CornerRadius="32" views:Tone.Background="{Binding Tone}" Opacity="0.14" />
+                        <ui:SymbolIcon FontSize="30" Symbol="{Binding StateSymbol}" views:Tone.Foreground="{Binding Tone}"
+                                       Visibility="{Binding IsTransitioning, Converter={StaticResource VisibleWhen}, ConverterParameter=invert}" />
+                        <ui:ProgressRing Width="32" Height="32" IsIndeterminate="{Binding IsTransitioning}" Visibility="{Binding IsTransitioning, Converter={StaticResource VisibleWhen}}" />
+                    </Grid>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,20,0">
+                        <TextBlock FontSize="24" FontWeight="SemiBold" Text="{Binding Main.StateText}" Style="{StaticResource Body}" AutomationProperties.LiveSetting="Assertive"
+                                   views:LiveRegion.Value="{Binding Main.StateText}" />
+                        <TextBlock Margin="0,4,0,0" FontSize="14" Text="{Binding Main.SummaryText}" Style="{StaticResource Body}" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Margin="0,6,0,0" Text="{Binding ErrorText}" Style="{StaticResource Body}" Foreground="{DynamicResource SystemFillColorCriticalBrush}"
+                                   Visibility="{Binding ErrorText, Converter={StaticResource VisibleWhen}}" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" VerticalAlignment="Center" MinWidth="220">
+                        <ui:Button Height="52" FontSize="16" Appearance="Primary" HorizontalAlignment="Stretch" Margin="0"
+                                   AutomationProperties.Name="{Binding ButtonText}" Command="{Binding Main.ToggleConnectionCommand}"
+                                   Content="{Binding ButtonText}" IsEnabled="{Binding Main.ServiceAvailable}" />
+                        <ui:Button Margin="0,8,0,0" HorizontalAlignment="Stretch" Appearance="Secondary" Content="Отключить и восстановить интернет"
+                                   ToolTip="Снять защиту: фильтры, маршруты и DNS возвращаются к исходным"
+                                   Command="{Binding Main.DisconnectAndRestoreCommand}" IsEnabled="{Binding Main.ServiceAvailable}"
+                                   Visibility="{Binding CanRestore, Converter={StaticResource VisibleWhen}}" />
+                        <ui:Button Margin="0,8,0,0" HorizontalAlignment="Stretch" Appearance="Secondary" Content="Повторить подключение"
+                                   Icon="{ui:SymbolIcon ArrowClockwise24}" Command="{Binding Main.ConnectCommand}" IsEnabled="{Binding Main.ServiceAvailable}"
+                                   ToolTip="Повторы остановлены до вашего действия: исправьте причину и повторите"
+                                   Visibility="{Binding CanRetry, Converter={StaticResource VisibleWhen}}" />
+                        <!-- Следующий шаг есть у каждого сбойного состояния, а не только у «Ошибки». -->
+                        <ui:Button Margin="0,8,0,0" HorizontalAlignment="Stretch" Appearance="Transparent" Content="{Binding ErrorActionText}"
+                                   Icon="{ui:SymbolIcon ChevronRight24}" Command="{Binding ErrorActionCommand}"
+                                   Visibility="{Binding HasErrorAction, Converter={StaticResource VisibleWhen}}" />
+                    </StackPanel>
+                </Grid>
+            </ui:Card>
+
+            <!-- Подробности отказа: что значит код, что сделать по шагам и чем помогут сведения о сертификате. -->
+            <ui:Card Style="{StaticResource PageCard}" Visibility="{Binding HasErrorDetails, Converter={StaticResource VisibleWhen}}">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                        <ui:SymbolIcon Symbol="ErrorCircle24" Margin="0,0,8,0" Foreground="{DynamicResource SystemFillColorCriticalBrush}" />
+                        <TextBlock Style="{StaticResource SectionTitle}" Margin="0" Text="{Binding ErrorSummary}" TextWrapping="Wrap" />
+                    </StackPanel>
+                    <TextBlock Style="{StaticResource Body}" Text="{Binding ErrorMeaning}" TextWrapping="Wrap" />
+                    <TextBlock Style="{StaticResource Body}" Margin="0,8,0,0" Text="{Binding ErrorCertificateText}" TextWrapping="Wrap"
+                               Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                               Visibility="{Binding ErrorCertificateText, Converter={StaticResource VisibleWhen}}" />
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Что сделать" />
+                    <ItemsControl ItemsSource="{Binding ErrorSteps}" AutomationProperties.Name="Что сделать по ошибке">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Style="{StaticResource Body}" Margin="0,0,0,6" Text="{Binding}" TextWrapping="Wrap" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <TextBlock Style="{StaticResource Hint}" Text="{Binding ErrorCodeText}"
+                               Visibility="{Binding ErrorCodeText, Converter={StaticResource VisibleWhen}}" />
+                    <StackPanel Style="{StaticResource ButtonRow}">
+                        <ui:Button Appearance="Secondary" Content="Копировать сведения" Icon="{ui:SymbolIcon Copy24}"
+                                   Command="{Binding CopyErrorCommand}" />
+                    </StackPanel>
+                </StackPanel>
+            </ui:Card>
+
+            <ui:Card Style="{StaticResource PageCard}" Visibility="{Binding PasswordRequired, Converter={StaticResource VisibleWhen}}">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource SectionTitle}" Margin="0,0,0,4" Text="{Binding PasswordTitle}" />
+                    <TextBlock Style="{StaticResource Hint}" Text="Пароль не сохранён или служба перезапускалась. Защита сохраняется." />
+                    <StackPanel Style="{StaticResource ButtonRow}">
+                        <ui:PasswordBox Width="280" Margin="0,0,8,0" Password="{Binding Password, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                        PlaceholderText="Пароль" AutomationProperties.Name="Пароль" />
+                        <ui:Button Appearance="Primary" Command="{Binding ConnectWithPasswordCommand}" Content="Подключить" />
+                    </StackPanel>
+                </StackPanel>
+            </ui:Card>
+
+            <ui:Card Style="{StaticResource PageCard}" Visibility="{Binding SignInRequired, Converter={StaticResource VisibleWhen}}">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource SectionTitle}" Margin="0,0,0,4" Text="{Binding SignInTitle}" />
+                    <TextBlock Style="{StaticResource Hint}" Text="Сеанс шлюза AnyConnect не переживает перезапуск службы и обрыв: войдите снова. Если организация помнит вход, окно закроется само через несколько секунд." />
+                    <TextBlock Style="{StaticResource Body}" Margin="0,6,0,0" Text="{Binding SignInError}" Foreground="{DynamicResource SystemFillColorCriticalBrush}"
+                               TextWrapping="Wrap" Visibility="{Binding SignInError, Converter={StaticResource VisibleWhen}}" />
+                    <StackPanel Style="{StaticResource ButtonRow}">
+                        <ui:Button Appearance="Primary" Command="{Binding SignInCommand}" Content="Войти" Icon="{ui:SymbolIcon PersonKey20}" />
+                    </StackPanel>
+                </StackPanel>
+            </ui:Card>
+
+            <!-- Плитки -->
+            <UniformGrid Columns="3" Margin="0,0,-12,0">
+                <views:Tile Caption="Подключение" Icon="{ui:SymbolIcon Person24}" Content="{Binding Profile}" ToolTip="{Binding Profile}" />
+                <views:Tile Caption="Основной адаптер" Icon="{ui:SymbolIcon Wifi124}" Content="{Binding Adapter}" ToolTip="{Binding Adapter}" />
+                <views:Tile Caption="Адрес в VPN" Icon="{ui:SymbolIcon Server24}" Content="{Binding VpnAddress}" ToolTip="{Binding VpnAddress}" />
+                <views:Tile Caption="Длительность" Icon="{ui:SymbolIcon Timer24}" Content="{Binding Duration}" ToolTip="{Binding Duration}" />
+                <views:Tile Caption="Скорость" Icon="{ui:SymbolIcon TopSpeed24}" Content="{Binding Main.SpeedText}" ToolTip="{Binding Main.SpeedText}" />
+                <views:Tile Caption="Отправлено / получено" Icon="{ui:SymbolIcon DataUsage24}">
+                    <TextBlock TextTrimming="CharacterEllipsis"><Run Text="{Binding Sent, Mode=OneWay}" /><Run Text=" / " /><Run Text="{Binding Received, Mode=OneWay}" /></TextBlock>
+                </views:Tile>
+            </UniformGrid>
+
+            <!-- Туннели -->
+            <ItemsControl ItemsSource="{Binding Tunnels}" Focusable="False" Margin="0,4,0,0"
+                          Visibility="{Binding Tunnels.Count, Converter={StaticResource VisibleWhen}}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:TunnelRow}">
+                        <Grid Margin="0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" /><ColumnDefinition Width="180" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <Ellipse Width="10" Height="10" Margin="0,0,8,0" VerticalAlignment="Center" views:Tone.Fill="{Binding Tone}" />
+                            <TextBlock Grid.Column="1" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}" Foreground="{DynamicResource TextFillColorPrimaryBrush}">
+                                <Run Text="{Binding Name, Mode=OneWay}" />
+                            </TextBlock>
+                            <!-- Роль подписана у каждого туннеля: «дополнительное» так же важно, как «опорное». -->
+                            <ui:Badge Grid.Column="2" Margin="0,0,8,0" Appearance="{Binding Role, Converter={StaticResource RoleAppearance}}" Content="{Binding RoleText}" />
+                            <TextBlock Grid.Column="3" VerticalAlignment="Center" Style="{StaticResource Hint}" Margin="0" TextTrimming="CharacterEllipsis" ToolTip="{Binding Detail}">
+                                <Run Text="{Binding State, Mode=OneWay}" /><Run Text=" · " /><Run Text="{Binding Protocol, Mode=OneWay}" /><Run Text=" · " /><Run Text="{Binding Detail, Mode=OneWay}" />
+                            </TextBlock>
+                            <!-- Туннель поднят, а на доске ему ничего не назначено: подключение работает вхолостую. -->
+                            <StackPanel Grid.Row="1" Grid.Column="3" Orientation="Horizontal" Margin="0,2,0,0"
+                                        Visibility="{Binding Note, Converter={StaticResource VisibleWhen}}">
+                                <ui:SymbolIcon Symbol="Warning24" FontSize="14" VerticalAlignment="Center" Margin="0,0,6,0"
+                                               Foreground="{DynamicResource SystemFillColorCautionBrush}" />
+                                <TextBlock VerticalAlignment="Center" Style="{StaticResource Hint}" Margin="0" Text="{Binding Note}" />
+                                <ui:Button Margin="8,0,0,0" Padding="8,2" Appearance="Transparent" Content="Маршрутизация" Icon="{ui:SymbolIcon ChevronRight24}"
+                                           Command="{Binding DataContext.OpenRoutingCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}" />
+                            </StackPanel>
+                        </Grid>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+            <!-- Предупреждения -->
+            <ItemsControl ItemsSource="{Binding Warnings}" Focusable="False" Margin="0,4,0,0">
+                <ItemsControl.ItemContainerStyle>
+                    <Style TargetType="ContentPresenter">
+                        <Setter Property="AutomationProperties.Name" Value="{Binding Text}" />
+                    </Style>
+                </ItemsControl.ItemContainerStyle>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:WarningRow}">
+                        <views:CardRow Title="{Binding Text}" Icon="{ui:SymbolIcon Warning24}">
+                            <!-- Кнопка есть и у предупреждений, которые служба присылает без действия: куда идти, знает интерфейс. -->
+                            <ui:Button Content="{Binding ActionText}" Margin="0" Icon="{ui:SymbolIcon ChevronRight24}"
+                                       Command="{Binding DataContext.WarningActionCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                       CommandParameter="{Binding}" Visibility="{Binding ActionText, Converter={StaticResource VisibleWhen}}" />
+                        </views:CardRow>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+            <!-- Постоянные пояснения (IPv6, DNS-over-HTTPS) — серой строкой: жёлтая карточка на каждом опросе читается как сбой. -->
+            <TextBlock Style="{StaticResource Hint}" Text="{Binding Note}" />
+        </StackPanel>
+    </DataTemplate>
+
+    <!-- ===================== Подключения ===================== -->
+    <DataTemplate DataType="{x:Type vm:ConnectionsViewModel}">
+        <StackPanel MaxWidth="980" HorizontalAlignment="Left">
+            <TextBlock Style="{StaticResource PageTitle}" Text="Подключения" />
+            <TextBlock Style="{StaticResource PageSubtitle}" Text="Профили SSTP, L2TP/IPsec, IKEv2, PPTP и Cisco AnyConnect. Включённые подключения поднимаются одновременно; куда идёт трафик — на странице «Маршрутизация». Изменение протокола или способа входа переподключает VPN." />
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="260" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Margin="0,0,16,0">
+                    <ui:ListView ItemsSource="{Binding Profiles}" SelectedItem="{Binding Selected}" MinHeight="180" BorderThickness="0"
+                                 Background="Transparent" AutomationProperties.Name="Список подключений"
+                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                        <!-- Без горизонтальной прокрутки элемент получает ширину колонки: длинное сокращается или переносится. -->
+                        <ui:ListView.ItemTemplate>
+                            <DataTemplate DataType="{x:Type vm:ProfileItem}">
+                                <Grid Margin="4,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+                                    <!-- Роль — в строке имени, сервер и протокол занимают всю ширину колонки. -->
+                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Margin="0,0,8,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                                    <TextBlock Grid.Row="1" Grid.ColumnSpan="2" Text="{Binding Server}" FontSize="12" TextTrimming="CharacterEllipsis" ToolTip="{Binding Server}" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                                    <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Text="{Binding Security.Summary}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                                    <ui:Badge Grid.Column="1" Appearance="{Binding Role, Converter={StaticResource RoleAppearance}}" Content="{Binding RoleText}"
+                                              Visibility="{Binding Role, Converter={StaticResource VisibleWhen}}" />
+                                    <!-- Бейдж вида Secondary в светлой теме — белый на белом: выключенное подписано обычным текстом. -->
+                                    <TextBlock Grid.Column="1" VerticalAlignment="Center" FontSize="12" Text="{Binding RoleText}" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                               Visibility="{Binding Role, Converter={StaticResource VisibleWhen}, ConverterParameter=invert}" />
+                                </Grid>
+                            </DataTemplate>
+                        </ui:ListView.ItemTemplate>
+                    </ui:ListView>
+                    <WrapPanel Margin="0,10,0,0">
+                        <ui:Button Content="Добавить" Icon="{ui:SymbolIcon Add24}" Command="{Binding AddCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Копировать" Icon="{ui:SymbolIcon Copy24}" Command="{Binding CopyCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Удалить" Icon="{ui:SymbolIcon Delete24}" Command="{Binding DeleteCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Импорт" Icon="{ui:SymbolIcon ArrowImport24}" Command="{Binding ImportCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Экспорт" Icon="{ui:SymbolIcon ArrowExportUp24}" Command="{Binding ExportCommand}" Margin="0,0,8,8" />
+                    </WrapPanel>
+                </StackPanel>
+
+                <ui:Card Grid.Column="1" Style="{StaticResource PageCard}" VerticalAlignment="Top"
+                         Visibility="{Binding HasSelection, Converter={StaticResource VisibleWhen}}">
+                    <StackPanel DataContext="{Binding Selected}">
+                        <ContentControl Content="{Binding Security}" Focusable="False" />
+                        <TextBlock Style="{StaticResource FieldLabel}" Margin="0,0,0,4" Text="Название" />
+                        <ui:TextBox Text="{Binding Name, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Название" />
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Сервер (хост или хост:порт)" />
+                        <ui:TextBox Text="{Binding Server, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="vpn.example.org:443" Icon="{ui:SymbolIcon Server24}" AutomationProperties.Name="Сервер" />
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="{Binding UserNameLabel}" />
+                        <ui:TextBox Text="{Binding UserName, UpdateSourceTrigger=PropertyChanged}" Icon="{ui:SymbolIcon Person24}" AutomationProperties.Name="Имя пользователя" />
+                        <StackPanel Visibility="{Binding Security.NeedsPassword, Converter={StaticResource VisibleWhen}}">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="Пароль (пусто — не менять)" />
+                            <ui:PasswordBox Password="{Binding DataContext.Password, RelativeSource={RelativeSource AncestorType=ui:Card}, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                            AutomationProperties.Name="Пароль" />
+                            <views:CardRow Margin="0,12,0,0" Title="Сохранять пароль" Description="Иначе пароль хранится только до перезапуска службы" Icon="{ui:SymbolIcon LockClosed24}">
+                                <ui:ToggleSwitch IsChecked="{Binding SavePassword}" AutomationProperties.Name="Сохранять пароль" />
+                            </views:CardRow>
+                        </StackPanel>
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="Роль" />
+                        <!-- IsAsync — как у «Способа входа»: у AnyConnect свой список ролей (без «Опорного»), и при смене
+                             профиля WPF сверял бы роль со списком прежнего профиля, не находил её и оставлял поле пустым. -->
+                        <ComboBox ItemsSource="{Binding RoleChoices}" DisplayMemberPath="Text" SelectedValuePath="Value"
+                                  SelectedValue="{Binding Role, IsAsync=True}" AutomationProperties.Name="Роль подключения" />
+                        <TextBlock Style="{StaticResource Hint}" Margin="0,4,0,12"
+                                   Text="Опорное — одно: его DNS используется по умолчанию, его обрыв включает защиту при обрыве. Дополнительные поднимаются рядом и получают только назначенное им." />
+                        <views:CardRow Title="Закрепить основной адаптер" Description="Прямой трафик и соединение с сервером только через него" Icon="{ui:SymbolIcon Wifi124}"
+                                       Visibility="{Binding Security.IsRas, Converter={StaticResource VisibleWhen}}">
+                            <ui:ToggleSwitch IsChecked="{Binding PinAdapter}" />
+                        </views:CardRow>
+                        <StackPanel Margin="0,0,0,6" Visibility="{Binding ShowPinnedAdapter, Converter={StaticResource VisibleWhen}}">
+                            <ComboBox ItemsSource="{Binding DataContext.Adapters, RelativeSource={RelativeSource AncestorType=ui:Card}}"
+                                      SelectedValuePath="InterfaceGuid" SelectedValue="{Binding PinnedInterfaceGuid}"
+                                      DisplayMemberPath="Name" AutomationProperties.Name="Адаптер" />
+                            <CheckBox Margin="0,8,0,0" Content="Если закреплённого нет — выбрать автоматически" IsChecked="{Binding AllowFallback}" />
+                        </StackPanel>
+                        <WrapPanel Margin="0,14,0,0">
+                            <ui:Button Appearance="Primary" Content="Сохранить" Icon="{ui:SymbolIcon Save24}" Command="{Binding DataContext.SaveCommand, RelativeSource={RelativeSource AncestorType=ui:Card}}" />
+                            <ui:Button Content="Проверить" Icon="{ui:SymbolIcon Beaker24}" Command="{Binding DataContext.TestCommand, RelativeSource={RelativeSource AncestorType=ui:Card}}"
+                                       ToolTip="Пробное подключение при снятой защите или отчёт по текущему сеансу" />
+                            <ui:Badge Appearance="Caution" Content="не сохранено" VerticalAlignment="Center"
+                                      Visibility="{Binding IsDirty, Converter={StaticResource VisibleWhen}}" />
+                        </WrapPanel>
+                        <TextBlock Style="{StaticResource Hint}" Text="Пароли хранит служба и в экспорт не включает. Пароль и ключ IPsec привязаны к серверу, протоколу и учётной записи: после их смены введите их заново." />
+                    </StackPanel>
+                </ui:Card>
+            </Grid>
+        </StackPanel>
+    </DataTemplate>
+
+    <!-- ===================== Маршрутизация ===================== -->
+    <DataTemplate DataType="{x:Type vm:BoardCard}">
+        <ui:Card Margin="0,0,0,6" Padding="10,8" views:BoardDrag.IsCard="True" Cursor="Hand"
+                 AutomationProperties.Name="{Binding Title}" AutomationProperties.HelpText="Перетащите в другую колонку или используйте меню «Переместить в…»">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel>
+                    <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                    <TextBlock Text="{Binding KindText}" FontSize="11.5" Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                               Visibility="{Binding KindText, Converter={StaticResource VisibleWhen}}" />
+                    <TextBlock Text="{Binding Subtitle}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                               Visibility="{Binding Subtitle, Converter={StaticResource VisibleWhen}}" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                    <ui:DropDownButton Icon="{ui:SymbolIcon ArrowMove24}" Appearance="Transparent" Padding="6,2" ToolTip="Переместить в…"
+                                       AutomationProperties.Name="{Binding Title, StringFormat=Переместить «{0}» в другую колонку}">
+                        <ui:DropDownButton.Flyout>
+                            <ContextMenu ItemsSource="{Binding MoveTargets}">
+                                <ContextMenu.ItemContainerStyle>
+                                    <Style TargetType="MenuItem">
+                                        <Setter Property="Header" Value="{Binding Title}" />
+                                        <Setter Property="Command" Value="{Binding DataContext.MoveToCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                        <Setter Property="CommandParameter" Value="{Binding}" />
+                                    </Style>
+                                </ContextMenu.ItemContainerStyle>
+                            </ContextMenu>
+                        </ui:DropDownButton.Flyout>
+                    </ui:DropDownButton>
+                    <ui:Button Appearance="Transparent" Padding="6,2" Icon="{ui:SymbolIcon Delete24}" Command="{Binding RemoveCommand}"
+                               Visibility="{Binding CanRemove, Converter={StaticResource VisibleWhen}}"
+                               ToolTip="Убрать с доски" AutomationProperties.Name="{Binding Title, StringFormat=Убрать «{0}» с доски}" />
+                </StackPanel>
+            </Grid>
+        </ui:Card>
+    </DataTemplate>
+
+    <DataTemplate DataType="{x:Type vm:BoardColumn}">
+        <Border Width="260" Margin="0,0,12,12" Padding="12" CornerRadius="8" views:BoardDrag.IsColumn="True"
+                Background="{DynamicResource ControlFillColorDefaultBrush}"
+                BorderThickness="1" BorderBrush="{DynamicResource ControlElevationBorderBrush}">
+            <StackPanel>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Ellipse Width="10" Height="10" Margin="0,0,8,0" VerticalAlignment="Top"
+                             views:Tone.Fill="{Binding Tone}" />
+                    <StackPanel Grid.Column="1">
+                        <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock Text="{Binding Subtitle}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </Grid>
+                <ItemsControl ItemsSource="{Binding Cards}" Margin="0,10,0,0" Focusable="False" MinHeight="60" />
+                <Grid Margin="0,4,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <ui:TextBox Text="{Binding NewValue, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="сеть или домен"
+                                AutomationProperties.Name="{Binding Title, StringFormat=Сеть или домен для колонки «{0}»}">
+                        <ui:TextBox.InputBindings>
+                            <KeyBinding Key="Enter" Command="{Binding AddCommand}" />
+                        </ui:TextBox.InputBindings>
+                    </ui:TextBox>
+                    <ui:Button Grid.Column="1" Margin="6,0,0,0" Icon="{ui:SymbolIcon Add24}" Command="{Binding AddCommand}"
+                               ToolTip="Добавить сеть (203.0.113.0/24) или домен (example.org)" AutomationProperties.Name="{Binding Title, StringFormat=Добавить в «{0}»}" />
+                </Grid>
+            </StackPanel>
+        </Border>
+    </DataTemplate>
+
+    <DataTemplate DataType="{x:Type vm:RoutingViewModel}">
+        <StackPanel MaxWidth="980" HorizontalAlignment="Left">
+            <TextBlock Style="{StaticResource PageTitle}" Text="Маршрутизация" />
+            <TextBlock Style="{StaticResource PageSubtitle}"
+                       Text="Перетащите карточку в нужную колонку: так вы выбираете, что идёт напрямую, что в туннель, а что блокируется. Всегда напрямую: адрес сервера, локальные сети и служебный DNS." />
+
+            <!-- Колонки переносятся на новую строку: вложенная горизонтальная прокрутка забирала бы колёсико мыши. -->
+            <ItemsControl ItemsSource="{Binding Columns}" Focusable="False" Margin="0,0,0,12">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <WrapPanel />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+            </ItemsControl>
+
+            <StackPanel Style="{StaticResource ButtonRow}">
+                <ui:Button Appearance="Primary" Content="Сохранить и применить" Icon="{ui:SymbolIcon Save24}" Command="{Binding SaveCommand}" IsEnabled="{Binding Dirty}" />
+                <ui:Button Content="Отменить изменения" Icon="{ui:SymbolIcon ArrowUndo24}" Command="{Binding ReloadCommand}" IsEnabled="{Binding Dirty}" />
+                <ui:Badge Appearance="Caution" Content="есть несохранённые изменения" VerticalAlignment="Center"
+                          Visibility="{Binding Dirty, Converter={StaticResource VisibleWhen}}" />
+            </StackPanel>
+
+            <ui:CardExpander Margin="0,12,0,6" Icon="{ui:SymbolIcon BranchFork24}">
+                <ui:CardExpander.Header>
+                    <StackPanel>
+                        <TextBlock Text="Группы подключений" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock FontSize="12.5" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                   Text="Группа — колонка, за которой стоит несколько туннелей. Нагрузка делится по адресам назначения, поэтому одна закачка остаётся в одном туннеле. Упавший участник теряет свою долю, и она переходит остальным." />
+                    </StackPanel>
+                </ui:CardExpander.Header>
+                <StackPanel>
+                    <ItemsControl ItemsSource="{Binding Groups}" Focusable="False">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate DataType="{x:Type vm:GroupItem}">
+                                <ui:Card Margin="0,0,0,8" Padding="12">
+                                    <StackPanel>
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <ui:TextBox Text="{Binding Name, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Название группы" />
+                                            <CheckBox Grid.Column="1" Margin="12,0,12,0" VerticalAlignment="Center" Content="Резерв: всё через первое доступное" IsChecked="{Binding Failover}"
+                                                      ToolTip="Включено — весь трафик группы идёт через первое поднятое подключение, остальные ждут. Выключено — нагрузка делится между всеми." />
+                                            <ui:Button Grid.Column="2" Appearance="Transparent" Icon="{ui:SymbolIcon Delete24}" AutomationProperties.Name="{Binding Name, StringFormat=Удалить группу «{0}»}" ToolTip="Удалить группу"
+                                                       Command="{Binding DataContext.RemoveGroupCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}" CommandParameter="{Binding}" />
+                                        </Grid>
+                                        <ItemsControl ItemsSource="{Binding Members}" Margin="0,8,0,0" Focusable="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate>
+                                                    <WrapPanel />
+                                                </ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate DataType="{x:Type vm:GroupMember}">
+                                                    <CheckBox Margin="0,0,16,4" Content="{Binding Name}" IsChecked="{Binding Included}" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+                                    </StackPanel>
+                                </ui:Card>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <ui:Button Content="Добавить группу" Icon="{ui:SymbolIcon Add24}" Command="{Binding AddGroupCommand}" Margin="0,4,0,0" />
+                    <TextBlock Style="{StaticResource Hint}" Text="Группа появляется отдельной колонкой на доске после добавления." />
+                </StackPanel>
+            </ui:CardExpander>
+
+            <ui:CardExpander Icon="{ui:SymbolIcon Database24}">
+                <ui:CardExpander.Header>
+                    <StackPanel>
+                        <TextBlock Text="RU-база" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock FontSize="12.5" Text="{Binding GeoSummary}" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </ui:CardExpander.Header>
+                <StackPanel>
+                    <TextBlock Style="{StaticResource Body}" Text="{Binding GeoChecks}" />
+                    <ui:InfoBar Margin="0,8,0,0" IsClosable="False" Severity="Warning" Title="Нужно подтверждение"
+                                IsOpen="{Binding GeoPending, Converter={StaticResource HasValue}, Mode=OneWay}" Message="{Binding GeoPending}" />
+                    <WrapPanel Margin="0,8,0,0" Visibility="{Binding GeoPending, Converter={StaticResource VisibleWhen}}">
+                        <ui:Button Appearance="Primary" Content="Принять" Command="{Binding AcceptGeoCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Отклонить" Command="{Binding RejectGeoCommand}" Margin="0,0,8,8" />
+                    </WrapPanel>
+                    <WrapPanel Margin="0,8,0,0">
+                        <ui:Button Content="Проверить сейчас" Icon="{ui:SymbolIcon CloudArrowDown24}" Command="{Binding UpdateGeoCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Импортировать файл" Icon="{ui:SymbolIcon ArrowImport24}" Command="{Binding ImportGeoCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Вернуть предыдущую" Icon="{ui:SymbolIcon ArrowUndo24}" Command="{Binding RollbackGeoCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Снова предлагать отклонённые версии" Command="{Binding ClearSkippedCommand}" Margin="0,0,8,8"
+                                   Visibility="{Binding GeoSkipped, Converter={StaticResource VisibleWhen}}" />
+                    </WrapPanel>
+                    <TextBlock Style="{StaticResource Hint}" Text="Дата данных и дата проверки — разные вещи: база может не меняться несколько дней. Источник и расписание — в «Настройках»." />
+                </StackPanel>
+            </ui:CardExpander>
+
+            <ui:CardExpander Icon="{ui:SymbolIcon ShieldKeyhole24}">
+                <ui:CardExpander.Header>
+                    <StackPanel>
+                        <TextBlock Text="Обход блокировок" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock FontSize="12.5" Text="{Binding BypassSummary}" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </ui:CardExpander.Header>
+                <StackPanel>
+                    <TextBlock Style="{StaticResource Body}" Text="{Binding BypassChecks}" />
+                    <ui:InfoBar Margin="0,8,0,0" IsClosable="False" Severity="Warning" Title="Нужно подтверждение"
+                                IsOpen="{Binding BypassPending, Converter={StaticResource HasValue}, Mode=OneWay}" Message="{Binding BypassPending}" />
+                    <WrapPanel Margin="0,8,0,0" Visibility="{Binding BypassPending, Converter={StaticResource VisibleWhen}}">
+                        <ui:Button Appearance="Primary" Content="Принять" Command="{Binding AcceptBypassCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Отклонить" Command="{Binding RejectBypassCommand}" Margin="0,0,8,8" />
+                    </WrapPanel>
+                    <WrapPanel Margin="0,8,0,0">
+                        <ui:Button Content="Проверить сейчас" Icon="{ui:SymbolIcon CloudArrowDown24}" Command="{Binding UpdateBypassCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Вернуть предыдущий" Icon="{ui:SymbolIcon ArrowUndo24}" Command="{Binding RollbackBypassCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Снова предлагать отклонённые версии" Command="{Binding ClearBypassSkippedCommand}" Margin="0,0,8,8"
+                                   Visibility="{Binding BypassSkipped, Converter={StaticResource VisibleWhen}}" />
+                    </WrapPanel>
+                    <TextBlock Style="{StaticResource Hint}" Text="Список заблокированных в России ресурсов и ресурсов, закрытых для России. Он важнее RU-базы: адрес из обоих списков идёт по карточке «Обход блокировок». Куда его направить — карточкой на доске выше." />
+                </StackPanel>
+            </ui:CardExpander>
+        </StackPanel>
+    </DataTemplate>
+
+    <!-- ===================== Проверить адрес ===================== -->
+    <DataTemplate DataType="{x:Type vm:CheckAddressViewModel}">
+        <StackPanel MaxWidth="980" HorizontalAlignment="Left">
+            <TextBlock Style="{StaticResource PageTitle}" Text="Проверить адрес" />
+            <TextBlock Style="{StaticResource PageSubtitle}" Text="Куда пойдёт трафик к адресу или домену и почему. У CDN разные адреса одного сайта могут идти разными путями." />
+            <Grid Margin="0,0,0,16">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <ui:TextBox Text="{Binding Query, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="IP-адрес или домен, например ya.ru" Icon="{ui:SymbolIcon Search24}" AutomationProperties.Name="Адрес или домен" />
+                <ui:Button Grid.Column="1" Appearance="Primary" Content="Проверить" Command="{Binding CheckCommand}" IsDefault="True" Margin="8,0,0,0" />
+            </Grid>
+            <ItemsControl ItemsSource="{Binding Results}" Focusable="False">
+                <ItemsControl.ItemContainerStyle>
+                    <Style TargetType="ContentPresenter">
+                        <Setter Property="AutomationProperties.Name" Value="{Binding Address}" />
+                    </Style>
+                </ItemsControl.ItemContainerStyle>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="{x:Type ipc:AddressCheckItem}">
+                        <ui:Card Style="{StaticResource PageCard}">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock FontSize="16" FontWeight="SemiBold" FontFamily="Cascadia Mono, Consolas" Text="{Binding Address}" Style="{StaticResource Body}" VerticalAlignment="Center" Margin="0,0,12,0" />
+                                    <ui:Badge Appearance="{Binding Decision, Converter={StaticResource DecisionAppearance}}" Content="{Binding Decision, Converter={StaticResource DecisionText}}" />
+                                    <ui:Badge Margin="8,0,0,0" Appearance="{Binding TargetName, Converter={StaticResource DecisionAppearance}}" Content="{Binding TargetName}" ContentStringFormat="цель: {0}" />
+                                    <ui:Badge Margin="8,0,0,0" Appearance="Danger" Content="заблокировано сейчас" Visibility="{Binding Blocked, Converter={StaticResource VisibleWhen}}" />
+                                </StackPanel>
+                                <TextBlock Margin="0,8,0,0" Style="{StaticResource Body}" Text="{Binding Explanation}" />
+                                <TextBlock Style="{StaticResource Hint}">
+                                    <Run Text="Должен идти через: " /><Run Text="{Binding ExpectedInterface, Mode=OneWay}" /><Run Text=" · по таблице маршрутов Windows сейчас: " /><Run Text="{Binding ActualInterface, Mode=OneWay, TargetNullValue=—}" />
+                                </TextBlock>
+                            </StackPanel>
+                        </ui:Card>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <TextBlock Style="{StaticResource Hint}" Text="{Binding Note}" />
+        </StackPanel>
+    </DataTemplate>
+
+    <!-- ===================== Защита и DNS ===================== -->
+    <DataTemplate DataType="{x:Type vm:ProtectionViewModel}">
+        <StackPanel MaxWidth="980" HorizontalAlignment="Left">
+            <TextBlock Style="{StaticResource PageTitle}" Text="Защита и DNS" />
+            <TextBlock Style="{StaticResource PageSubtitle}" Text="Защита сохраняется после перезагрузки. Снять — «Отключить и восстановить интернет» на главной." />
+
+            <TextBlock Style="{StaticResource SectionTitle}" Margin="0,0,0,8" Text="Если VPN оборвался" />
+            <ui:Card Style="{StaticResource PageCard}">
+                <StackPanel>
+                    <RadioButton GroupName="outage" Content="Блокировать трафик, назначенный VPN — Россия продолжает работать" IsChecked="{Binding BlockVpnTraffic}" />
+                    <RadioButton GroupName="outage" Margin="0,8,0,0" Content="Блокировать весь публичный интернет" IsChecked="{Binding BlockAllPublic}" />
+                    <RadioButton GroupName="outage" Margin="0,8,0,0" Content="Разрешить всё напрямую — без защиты" IsChecked="{Binding AllowAll}" />
+                </StackPanel>
+            </ui:Card>
+            <views:CardRow Title="DNS напрямую при обрыве" Description="Без этого при обрыве открываются только сайты, чьи адреса система уже запомнила; с ним провайдер видит, какие сайты открываются" Icon="{ui:SymbolIcon EyeOff24}">
+                <ui:ToggleSwitch IsChecked="{Binding DnsDirectOnOutage}" />
+            </views:CardRow>
+
+            <TextBlock Style="{StaticResource SectionTitle}" Text="Локальная сеть" />
+            <views:CardRow Title="Локальный доступ" Description="Принтеры, NAS, роутер и сети адаптеров — напрямую" Icon="{ui:SymbolIcon Router24}">
+                <ui:ToggleSwitch IsChecked="{Binding LocalAccess}" />
+            </views:CardRow>
+            <views:CardRow Title="Локальные DNS-суффиксы" Description="Имена с этими суффиксами разрешаются через DNS локальной сети" Icon="{ui:SymbolIcon Globe24}">
+                <ui:TextBox Width="260" Text="{Binding LocalSuffixes, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="home.arpa, lan" AutomationProperties.Name="Локальные суффиксы" />
+            </views:CardRow>
+            <StackPanel Visibility="{Binding Main.Settings.ShowAdvanced, Converter={StaticResource VisibleWhen}}">
+                <views:CardRow Title="DNS локальной сети" Description="Пусто — DNS основного адаптера" Icon="{ui:SymbolIcon Options24}">
+                    <ui:TextBox Width="260" Text="{Binding LocalDnsServer, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="192.168.1.1" AutomationProperties.Name="DNS локальной сети" />
+                </views:CardRow>
+                <views:CardRow Title="DNS через VPN" Description="Пусто — DNS, выданный сервером" Icon="{ui:SymbolIcon Options24}">
+                    <ui:TextBox Width="260" Text="{Binding UpstreamDns, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="1.1.1.1, 8.8.8.8" AutomationProperties.Name="DNS через VPN" />
+                </views:CardRow>
+            </StackPanel>
+            <TextBlock Style="{StaticResource Hint}" Text="IPv6 ограничен: VPN-сервер работает только с IPv4, поэтому публичный IPv6 блокируется, пока включена защита." />
+            <StackPanel Style="{StaticResource ButtonRow}">
+                <ui:Button Appearance="Primary" Content="Сохранить и применить" Icon="{ui:SymbolIcon Save24}" Command="{Binding SaveCommand}" />
+                <ui:Badge Appearance="Caution" Content="есть несохранённые изменения" VerticalAlignment="Center"
+                          Visibility="{Binding Dirty, Converter={StaticResource VisibleWhen}}" />
+            </StackPanel>
+        </StackPanel>
+    </DataTemplate>
+
+    <!-- ===================== Настройки ===================== -->
+    <DataTemplate DataType="{x:Type vm:SettingsViewModel}">
+        <StackPanel MaxWidth="980" HorizontalAlignment="Left">
+            <TextBlock Style="{StaticResource PageTitle}" Text="Настройки" />
+            <TextBlock Style="{StaticResource PageSubtitle}" Text="Запуск, внешний вид и обновление списков адресов: RU-базы и списка обхода блокировок." />
+
+            <TextBlock Style="{StaticResource SectionTitle}" Margin="0,0,0,8" Text="Запуск" />
+            <views:CardRow Title="Запускать при входе в Windows" Description="Интерфейс стартует свёрнутым в трей" Icon="{ui:SymbolIcon Power24}">
+                <ui:ToggleSwitch IsChecked="{Binding Autostart}" />
+            </views:CardRow>
+            <ui:InfoBar Severity="Informational" IsOpen="True" Margin="0,0,0,8" IsClosable="False"
+                        Visibility="{Binding AnyConnectNeedsAutostart, Converter={StaticResource VisibleWhen}}"
+                        Message="Есть включённое подключение Cisco AnyConnect: вход в него показывает приложение, поэтому без запуска при входе в Windows после перезагрузки вход не начнётся." />
+            <views:CardRow Title="Подключать VPN автоматически" Description="При запуске Windows, если пароль сохранён" Icon="{ui:SymbolIcon PlugConnected24}">
+                <ui:ToggleSwitch IsChecked="{Binding AutoConnect}" />
+            </views:CardRow>
+
+            <TextBlock Style="{StaticResource SectionTitle}" Text="Интерфейс" />
+            <views:CardRow Title="Тема" Icon="{ui:SymbolIcon Lightbulb24}">
+                <ComboBox Width="200" ItemsSource="{x:Static vm:SettingsViewModel.Themes}" DisplayMemberPath="Text" SelectedValuePath="Value" SelectedValue="{Binding Theme}" AutomationProperties.Name="Тема" />
+            </views:CardRow>
+            <views:CardRow Title="Уведомления" Description="Только о сбоях и восстановлении" Icon="{ui:SymbolIcon AlertOn24}">
+                <ui:ToggleSwitch IsChecked="{Binding Notifications}" />
+            </views:CardRow>
+            <views:CardRow Title="Расширенные настройки" Description="Показывать поля DNS и зеркала базы" Icon="{ui:SymbolIcon Wrench24}">
+                <ui:ToggleSwitch IsChecked="{Binding ShowAdvanced}" />
+            </views:CardRow>
+
+            <TextBlock Style="{StaticResource SectionTitle}" Text="Обновление RU-базы" />
+            <views:CardRow Title="Проверять обновления автоматически" Icon="{ui:SymbolIcon CloudArrowDown24}">
+                <ui:ToggleSwitch IsChecked="{Binding GeoAutoUpdate}" />
+            </views:CardRow>
+            <views:CardRow Title="Как часто" Icon="{ui:SymbolIcon CalendarLtr24}">
+                <ComboBox Width="200" ItemsSource="{x:Static vm:SettingsViewModel.Intervals}" DisplayMemberPath="Text" SelectedValuePath="Value" SelectedValue="{Binding GeoInterval}" AutomationProperties.Name="Интервал" />
+            </views:CardRow>
+            <views:CardRow Title="Источник" Description="Loyalsoldier — GeoLite2 по стране использования; ipverse — по стране регистрации" Icon="{ui:SymbolIcon Database24}">
+                <ComboBox MinWidth="280" ItemsSource="{x:Static vm:SettingsViewModel.Sources}" DisplayMemberPath="Text" SelectedValuePath="Value" SelectedValue="{Binding GeoSource}" AutomationProperties.Name="Источник базы" />
+            </views:CardRow>
+            <views:CardRow Title="Свой адрес" Description="HTTPS-ссылка на список сетей" Icon="{ui:SymbolIcon Globe24}" Visibility="{Binding ShowCustomUrl, Converter={StaticResource VisibleWhen}}">
+                <ui:TextBox Width="300" Text="{Binding GeoCustomUrl, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="https://…/ru.txt" AutomationProperties.Name="Адрес своего источника" />
+            </views:CardRow>
+            <views:CardRow Title="Зеркала той же базы" Description="HTTPS, через запятую" Icon="{ui:SymbolIcon Cloud24}" Visibility="{Binding ShowAdvanced, Converter={StaticResource VisibleWhen}}">
+                <ui:TextBox Width="300" Text="{Binding GeoMirrors, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="https://…/ru.txt" AutomationProperties.Name="Зеркала" />
+            </views:CardRow>
+            <views:CardRow Title="В лимитной сети откладывать фоновую загрузку" Description="Ручная проверка остаётся доступной" Icon="{ui:SymbolIcon DataUsage24}">
+                <ui:ToggleSwitch IsChecked="{Binding DeferOnMetered}" />
+            </views:CardRow>
+
+            <TextBlock Style="{StaticResource SectionTitle}" Text="Обновление списка обхода блокировок" />
+            <views:CardRow Title="Проверять обновления автоматически" Description="Список заблокированных в России ресурсов; куда его направить — на доске маршрутизации" Icon="{ui:SymbolIcon ShieldKeyhole24}">
+                <ui:ToggleSwitch IsChecked="{Binding BypassAutoUpdate}" />
+            </views:CardRow>
+            <views:CardRow Title="Как часто" Icon="{ui:SymbolIcon CalendarLtr24}">
+                <ComboBox Width="200" ItemsSource="{x:Static vm:SettingsViewModel.Intervals}" DisplayMemberPath="Text" SelectedValuePath="Value" SelectedValue="{Binding BypassInterval}" AutomationProperties.Name="Интервал обновления списка обхода блокировок" />
+            </views:CardRow>
+
+            <StackPanel Style="{StaticResource ButtonRow}">
+                <ui:Button Appearance="Primary" Content="Сохранить" Icon="{ui:SymbolIcon Save24}" Command="{Binding SaveCommand}" />
+                <ui:Button Content="Запустить мастер настройки" Icon="{ui:SymbolIcon Rocket24}" Command="{Binding Main.OpenWizardCommand}" />
+                <ui:Badge Appearance="Caution" Content="есть несохранённые изменения" VerticalAlignment="Center"
+                          Visibility="{Binding Dirty, Converter={StaticResource VisibleWhen}}" />
+            </StackPanel>
+        </StackPanel>
+    </DataTemplate>
+
+    <!-- ===================== Диагностика ===================== -->
+    <DataTemplate DataType="{x:Type vm:DiagnosticsViewModel}">
+        <StackPanel MaxWidth="980" HorizontalAlignment="Left">
+            <TextBlock Style="{StaticResource PageTitle}" Text="Диагностика" />
+            <TextBlock Style="{StaticResource PageSubtitle}" Text="События службы, отчёт для разбора и аварийное восстановление сети." />
+            <views:CardRow Title="Восстановить сеть" Description="Снимает защиту, маршруты и DNS приложения, разрывает VPN. Без службы — с правами администратора" Icon="{ui:SymbolIcon ArrowReset24}">
+                <ui:Button Appearance="Danger" Margin="0" Content="Восстановить сеть" Command="{Binding RecoverNetworkCommand}" />
+            </views:CardRow>
+            <views:CardRow Title="Запустить службу" Description="Служба не отвечает: например, остановлена восстановлением сети. Запуск — с правами администратора"
+                           Icon="{ui:SymbolIcon Play24}" Visibility="{Binding CanStartService, Converter={StaticResource VisibleWhen}}">
+                <ui:Button Appearance="Primary" Margin="0" Content="Запустить службу" Command="{Binding StartServiceCommand}" />
+            </views:CardRow>
+            <views:CardRow Title="Отчёт" Description="Состояние, адаптеры и события в файл JSON" Icon="{ui:SymbolIcon DocumentText24}">
+                <StackPanel Orientation="Horizontal">
+                    <CheckBox Content="Скрыть личные данные" IsChecked="{Binding MaskReport}" Margin="0,0,12,0" VerticalAlignment="Center" />
+                    <ui:Button Content="Сохранить" Icon="{ui:SymbolIcon Save24}" Command="{Binding ExportReportCommand}" />
+                    <ui:Button Margin="0" Content="Журналы" Icon="{ui:SymbolIcon FolderOpen24}" Command="{Binding OpenLogsCommand}" ToolTip="Папка журналов службы (доступна администраторам)" />
+                </StackPanel>
+            </views:CardRow>
+            <ItemsControl ItemsSource="{Binding GatewaySessions}" Focusable="False" Visibility="{Binding GatewaySessions.Count, Converter={StaticResource VisibleWhen}}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:GatewaySessionRow}">
+                        <views:CardRow Title="{Binding Title}" Description="{Binding Description}" Icon="{ui:SymbolIcon Server24}" />
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <TextBlock Style="{StaticResource SectionTitle}" Text="События службы" />
+            <ui:Card Style="{StaticResource PageCard}" Padding="12,8">
+                <!-- До 500 событий: список виртуализирован и прокручивается сам, иначе каждая строка создаётся заранее. -->
+                <ItemsControl ItemsSource="{Binding Events}" Focusable="False" MaxHeight="480"
+                              VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
+                    <ItemsControl.Template>
+                        <ControlTemplate TargetType="ItemsControl">
+                            <ScrollViewer Focusable="False" CanContentScroll="True" VerticalScrollBarVisibility="Auto">
+                                <ItemsPresenter />
+                            </ScrollViewer>
+                        </ControlTemplate>
+                    </ItemsControl.Template>
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <VirtualizingStackPanel />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemContainerStyle>
+                        <Style TargetType="ContentPresenter">
+                            <Setter Property="AutomationProperties.Name" Value="{Binding Text}" />
+                        </Style>
+                    </ItemsControl.ItemContainerStyle>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type ipc:ServiceEvent}">
+                            <Grid Margin="0,4">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="110" /><ColumnDefinition Width="Auto" MinWidth="90" /><ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="{Binding TimeUtc, Converter={StaticResource LocalTime}}" Style="{StaticResource Hint}" Margin="0" VerticalAlignment="Center" FontFamily="Cascadia Mono, Consolas" />
+                                <ui:Badge Grid.Column="1" HorizontalAlignment="Left" Margin="0,0,10,0" Appearance="{Binding Level, Converter={StaticResource LevelAppearance}}" Content="{Binding Level}" />
+                                <TextBlock Grid.Column="2" Text="{Binding Text}" Style="{StaticResource Body}" VerticalAlignment="Center" />
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ui:Card>
+        </StackPanel>
+    </DataTemplate>
+
+    <!-- ===================== О программе ===================== -->
+    <DataTemplate DataType="{x:Type vm:AboutViewModel}">
+        <StackPanel MaxWidth="980" HorizontalAlignment="Left">
+            <TextBlock Style="{StaticResource PageTitle}" Text="О программе" />
+            <ui:Card Style="{StaticResource PageCard}">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                        <ui:ImageIcon Width="40" Height="40" Source="pack://application:,,,/Assets/app.ico" Margin="0,0,16,0" />
+                        <StackPanel VerticalAlignment="Center">
+                            <TextBlock FontSize="18" FontWeight="SemiBold" Style="{StaticResource Body}"><Run Text="Раздельный VPN " /><Run Text="{Binding Version, Mode=OneWay}" /></TextBlock>
+                            <TextBlock Style="{StaticResource Hint}" Margin="0" Text="VPN-клиент Windows: российские адреса напрямую, остальные через VPN, защита при обрыве." />
+                        </StackPanel>
+                    </StackPanel>
+                    <TextBlock Style="{StaticResource Hint}" Margin="0,12,0,0" Text="{Binding CheckTargets}" />
+                </StackPanel>
+            </ui:Card>
+            <views:CardRow Title="RU-база" Description="Loyalsoldier/geoip на основе GeoLite2 (MaxMind, CC BY-SA 4.0); ipverse/rir-ip" Icon="{ui:SymbolIcon Database24}" />
+            <views:CardRow Title="Список обхода блокировок" Description="1andrevich/Re-filter-lists, файл ipsum.lst (GPL-3.0)" Icon="{ui:SymbolIcon ShieldKeyhole24}" />
+            <views:CardRow Title="Компоненты" Description="WPF-UI, H.NotifyIcon, CommunityToolkit.Mvvm (MIT); Serilog (Apache-2.0); Microsoft Edge WebView2; OpenConnect, GnuTLS, Nettle, GMP, libxml2 (LGPL и совместимые, тексты — в папке licenses); Wintun; встроенные RAS/EAP, WFP и DPAPI Windows" Icon="{ui:SymbolIcon Certificate24}" />
+        </StackPanel>
+    </DataTemplate>
+
+    <!-- ===================== Мастер ===================== -->
+    <DataTemplate DataType="{x:Type vm:WizardViewModel}">
+        <ui:Card Padding="28" VerticalAlignment="Center">
+            <StackPanel>
+                <TextBlock Style="{StaticResource PageTitle}" Text="Настройка «Раздельного VPN»" />
+                <TextBlock Style="{StaticResource PageSubtitle}" Text="{Binding StepTitle}" Margin="0,0,0,16" AutomationProperties.LiveSetting="Polite"
+                           views:LiveRegion.Value="{Binding StepTitle}" />
+
+                <StackPanel Visibility="{Binding Step, Converter={StaticResource StepVisible}, ConverterParameter=0}">
+                    <ContentControl Content="{Binding Security}" Focusable="False" />
+                    <TextBlock Style="{StaticResource FieldLabel}" Margin="0,0,0,4" Text="Название" />
+                    <ui:TextBox Text="{Binding Name, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Название" />
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Сервер (хост или хост:порт)" />
+                    <ui:TextBox Text="{Binding Server, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="vpn.example.org:443" Icon="{ui:SymbolIcon Server24}" AutomationProperties.Name="Сервер" />
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Имя пользователя" />
+                    <ui:TextBox Text="{Binding UserName, UpdateSourceTrigger=PropertyChanged}" Icon="{ui:SymbolIcon Person24}" AutomationProperties.Name="Имя пользователя" />
+                    <StackPanel Visibility="{Binding Security.NeedsPassword, Converter={StaticResource VisibleWhen}}">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Пароль" />
+                    <ui:PasswordBox Password="{Binding Password, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Пароль" />
+                    <CheckBox Margin="0,10,0,0" Content="Сохранить пароль" IsChecked="{Binding SavePassword}" />
+                    </StackPanel>
+                    <TextBlock Style="{StaticResource Hint}" Text="Параметры должны соответствовать VPN-серверу. Пароль и ключ IPsec хранит служба в зашифрованном виде." />
+                </StackPanel>
+
+                <StackPanel Visibility="{Binding Step, Converter={StaticResource StepVisible}, ConverterParameter=1}">
+                    <TextBlock Style="{StaticResource Body}" Text="Через какой адаптер идут российские адреса и соединение с сервером." />
+                    <RadioButton GroupName="adapter" Margin="0,12,0,0" Content="Автоматически (адаптер с маршрутом по умолчанию)" IsChecked="{Binding PinAdapter, Converter={StaticResource Not}}" />
+                    <RadioButton GroupName="adapter" Margin="0,8,0,0" Content="Закрепить адаптер" IsChecked="{Binding PinAdapter}" />
+                    <ComboBox Margin="24,8,0,0" ItemsSource="{Binding Adapters}" SelectedItem="{Binding PinnedAdapter}" DisplayMemberPath="Name" IsEnabled="{Binding PinAdapter}" AutomationProperties.Name="Адаптер" />
+                </StackPanel>
+
+                <StackPanel Visibility="{Binding Step, Converter={StaticResource StepVisible}, ConverterParameter=2}">
+                    <RadioButton GroupName="wmode" Content="Россия напрямую, остальное через VPN" IsChecked="{Binding RussiaDirect}" />
+                    <RadioButton GroupName="wmode" Margin="0,8,0,0" Content="Весь интернет через VPN" IsChecked="{Binding RussiaDirect, Converter={StaticResource Not}}" />
+                    <TextBlock Style="{StaticResource Hint}" Text="Режим можно поменять в любой момент на странице «Маршрутизация»." />
+                </StackPanel>
+
+                <StackPanel Visibility="{Binding Step, Converter={StaticResource StepVisible}, ConverterParameter=3}">
+                    <TextBlock Style="{StaticResource Body}" Text="Для режима «Россия напрямую» нужна RU-база — список российских сетей." />
+                    <RadioButton GroupName="geo" Margin="0,12,0,0" Content="Скачать сейчас напрямую, через основной адаптер" IsChecked="{Binding GeoDownloadNow}" />
+                    <RadioButton GroupName="geo" Margin="0,8,0,0" Content="Подключиться в режиме «весь через VPN» и скачать через туннель" IsChecked="{Binding GeoViaTunnel}" />
+                    <RadioButton GroupName="geo" Margin="0,8,0,0" Content="Импортировать файл" IsChecked="{Binding GeoImport}" />
+                    <DockPanel Margin="24,8,0,0">
+                        <ui:Button DockPanel.Dock="Right" Content="Выбрать…" Icon="{ui:SymbolIcon FolderOpen24}" Command="{Binding BrowseImportCommand}" Margin="8,0,0,0" />
+                        <ui:TextBox Text="{Binding ImportPath, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="Путь к файлу со списком сетей"
+                                    IsEnabled="{Binding GeoImport}" AutomationProperties.Name="Файл базы" />
+                    </DockPanel>
+                </StackPanel>
+
+                <StackPanel Visibility="{Binding Step, Converter={StaticResource StepVisible}, ConverterParameter=4}">
+                    <StackPanel Orientation="Horizontal">
+                        <ui:ProgressRing Width="28" Height="28" IsIndeterminate="{Binding IsBusy}" Margin="0,0,12,0" Visibility="{Binding IsBusy, Converter={StaticResource VisibleWhen}}" />
+                        <TextBlock Style="{StaticResource Body}" Text="{Binding Progress}" VerticalAlignment="Center" AutomationProperties.LiveSetting="Polite"
+                                   views:LiveRegion.Value="{Binding Progress}" />
+                    </StackPanel>
+                </StackPanel>
+
+                <ui:InfoBar Margin="0,12,0,0" IsClosable="False" Severity="Error" IsOpen="{Binding Error, Converter={StaticResource HasValue}, Mode=OneWay}" Message="{Binding Error}"
+                            AutomationProperties.Name="{Binding Error, TargetNullValue=''}" AutomationProperties.LiveSetting="Assertive" views:LiveRegion.Value="{Binding Error}" />
+
+                <DockPanel Margin="0,20,0,0">
+                    <ui:Button DockPanel.Dock="Left" Content="Отмена" Command="{Binding CancelCommand}" IsEnabled="{Binding CanCancel}" />
+                    <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                        <ui:Button Content="Назад" Command="{Binding BackCommand}" IsEnabled="{Binding CanGoBack}" />
+                        <ui:Button Appearance="Primary" Margin="0" Content="{Binding NextText}" Command="{Binding NextCommand}" IsDefault="True" />
+                    </StackPanel>
+                </DockPanel>
+            </StackPanel>
+        </ui:Card>
+    </DataTemplate>
+</ResourceDictionary>

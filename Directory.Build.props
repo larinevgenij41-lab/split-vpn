@@ -1,0 +1,17 @@
+﻿<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <PlatformTarget>x64</PlatformTarget>
+    <SatelliteResourceLanguages>ru</SatelliteResourceLanguages>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <Company>SplitVpn</Company>
+    <Product>Р Р°Р·РґРµР»СЊРЅС‹Р№ VPN</Product>
+    <Version>0.7.2</Version>
+    <!-- CA1848/CA1873: РІС‹СЃРѕРєРѕРїСЂРѕРёР·РІРѕРґРёС‚РµР»СЊРЅРѕРµ Р»РѕРіРёСЂРѕРІР°РЅРёРµ РЅРµ С‚СЂРµР±СѓРµС‚СЃСЏ; CA2007: ConfigureAwait РІ РїСЂРёР»РѕР¶РµРЅРёРё РЅРµ РЅСѓР¶РµРЅ -->
+    <NoWarn>$(NoWarn);CA1848;CA1873;CA2007;CA1303;CA1716</NoWarn>
+  </PropertyGroup>
+</Project>
