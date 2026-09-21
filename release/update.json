@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.8.0",
+  "tag": "v0.8.0",
+  "releasedUtc": "2026-09-21T13:29:46Z",
+  "package": {
+    "fileName": "SplitVpn-0.8.0.msi",
+    "size": 64024902,
+    "sha256": "e0491422f79f94516d60c02865ae711d9416c66f2e3b531df64115e0ba96203d",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.8.0/SplitVpn-0.8.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.8.0.msi"
+    ]
+  },
+  "notes": "Выпуск объединяет два этапа: исправления доменной маршрутизации и DNS по аудиту 0.7.3 и автоматическое обновление программы 0.8.0.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.8.0",
+  "kid": "sv-2026-09"
+}
