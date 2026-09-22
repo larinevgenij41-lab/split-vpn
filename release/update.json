@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.9.1",
+  "tag": "v0.9.1",
+  "releasedUtc": "2026-09-22T18:40:09Z",
+  "package": {
+    "fileName": "SplitVpn-0.9.1.msi",
+    "size": 64028998,
+    "sha256": "e45646973f3d6632fadc6cc4a80f74927978a9b1d8dc73d94ed4504a5530f1d5",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.9.1/SplitVpn-0.9.1.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.9.1.msi"
+    ]
+  },
+  "notes": "Правила для частных сетей: удалённая сеть за VPN теперь доступна.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.9.1",
+  "kid": "sv-2026-09-2"
+}
