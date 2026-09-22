@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.9.0",
+  "tag": "v0.9.0",
+  "releasedUtc": "2026-09-22T09:47:24Z",
+  "package": {
+    "fileName": "SplitVpn-0.9.0.msi",
+    "size": 64037190,
+    "sha256": "3026a719222d5aff7f98265a3f58da416b6219213b42acee3dfe0861f10f865b",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.9.0/SplitVpn-0.9.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.9.0.msi"
+    ]
+  },
+  "notes": "Свой выключатель у каждого подключения и порядок подключений.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.9.0",
+  "kid": "sv-2026-09"
+}
