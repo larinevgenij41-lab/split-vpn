@@ -1,0 +1,11 @@
+# Текстовые файлы приводит к CRLF скрипт scripts\normalize-eol.ps1 (в git включён core.safecrlf).
+*.bat text eol=crlf
+*.jar binary
+*.so binary
+*.png binary
+*.webp binary
+*.ico binary
+scripts/*.sh text eol=lf
+# Манифест обновлений и подпись к нему: байты не трогать, по ним считается подпись выпуска.
+release/update.json -text
+release/update.json.sig -text

@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.8.1",
+  "tag": "v0.8.1",
+  "releasedUtc": "2026-09-22T07:52:15Z",
+  "package": {
+    "fileName": "SplitVpn-0.8.1.msi",
+    "size": 64016710,
+    "sha256": "cc21d4a52787b2ecc8d2ef348e90e2916d0c926d0812da3773917477da519452",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.8.1/SplitVpn-0.8.1.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.8.1.msi"
+    ]
+  },
+  "notes": "Исправление: туннель поднимался долго после обрыва связи.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.8.1",
+  "kid": "sv-2026-09"
+}

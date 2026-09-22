@@ -1,0 +1,17 @@
+﻿<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <PlatformTarget>x64</PlatformTarget>
+    <SatelliteResourceLanguages>ru</SatelliteResourceLanguages>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <Company>SplitVpn</Company>
+    <Product>Раздельный VPN</Product>
+    <Version>0.8.1</Version>
+    <!-- CA1848/CA1873: высокопроизводительное логирование не требуется; CA2007: ConfigureAwait в приложении не нужен -->
+    <NoWarn>$(NoWarn);CA1848;CA1873;CA2007;CA1303;CA1716</NoWarn>
+  </PropertyGroup>
+</Project>
