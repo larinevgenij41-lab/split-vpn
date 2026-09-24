@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.9.2",
+  "tag": "v0.9.2",
+  "releasedUtc": "2026-09-24T17:55:17Z",
+  "package": {
+    "fileName": "SplitVpn-0.9.2.msi",
+    "size": 64028998,
+    "sha256": "69b39d69bdf639bd42cc516bf235580ad13bd683ec91003a02abb178a7d884d7",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.9.2/SplitVpn-0.9.2.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.9.2.msi"
+    ]
+  },
+  "notes": "Диагностика редкой ошибки «Конец диапазона меньше начала».",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.9.2",
+  "kid": "sv-2026-09-2"
+}
