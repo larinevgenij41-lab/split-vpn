@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.9.4",
+  "tag": "v0.9.4",
+  "releasedUtc": "2026-09-24T20:02:22Z",
+  "package": {
+    "fileName": "SplitVpn-0.9.4.msi",
+    "size": 64049478,
+    "sha256": "07e91fedd388e9e9a4782120586278f433e7bac470e8805e8940089190e1869f",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.9.4/SplitVpn-0.9.4.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.9.4.msi"
+    ]
+  },
+  "notes": "Интерфейс стал ровнее и аккуратнее: единые отступы и ширина страниц, оформленные карточки, равномерная сетка показателей и маршрутизации. В узком окне колонки, поля и кнопки переносятся, а длинные подписи остаются читаемыми. В редакторе подключения название и сервер теперь находятся в начале формы.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.9.4",
+  "kid": "sv-2026-09-2"
+}
