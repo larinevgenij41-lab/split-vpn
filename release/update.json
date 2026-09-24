@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.9.3",
+  "tag": "v0.9.3",
+  "releasedUtc": "2026-09-24T19:22:27Z",
+  "package": {
+    "fileName": "SplitVpn-0.9.3.msi",
+    "size": 64041286,
+    "sha256": "0d5dbb65c465d138be03446b80c5f1915e6cb6ba88396de55a6ae358416c3a43",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.9.3/SplitVpn-0.9.3.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.9.3.msi"
+    ]
+  },
+  "notes": "Ускорены обработка DNS и сборка правил маршрутизации. Исправлены конфликты доменных правил, освобождение ресурсов DNS и AnyConnect, запоздавшие результаты подключения и обновлений. Загрузка списков адресов корректно учитывает смену источника и ручной импорт; при ошибках записи или применения сохраняется прежняя версия.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.9.3",
+  "kid": "sv-2026-09-2"
+}
