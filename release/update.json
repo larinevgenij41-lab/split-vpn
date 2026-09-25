@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.9.5",
+  "tag": "v0.9.5",
+  "releasedUtc": "2026-09-25T09:25:14Z",
+  "package": {
+    "fileName": "SplitVpn-0.9.5.msi",
+    "size": 64049478,
+    "sha256": "99887c47df185320bbf4b6622c6d8085d7496f5e59ebd927d9a6d99ac761b980",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.9.5/SplitVpn-0.9.5.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.9.5.msi"
+    ]
+  },
+  "notes": "Исправлены ошибки DNS и выбора маршрутов при нескольких VPN, доменных исключениях и частичных сбоях. Разрешение адресов VPN-серверов больше не задерживает команды подключения и отключения. Обновление DNS сохраняет действующее VPN-соединение, а восстановление маршрутов и фильтров корректно завершает прерванное применение.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.9.5",
+  "kid": "sv-2026-09-2"
+}
