@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.9.6",
+  "tag": "v0.9.6",
+  "releasedUtc": "2026-09-27T07:30:59Z",
+  "expiresUtc": "2026-11-26T07:30:59Z",
+  "package": {
+    "fileName": "SplitVpn-0.9.6.msi",
+    "size": 64090469,
+    "sha256": "88b297577751a3b49e7717e913282b5c8f340691c08548ffb651c5dd166c8c52",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.9.6/SplitVpn-0.9.6.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.9.6.msi"
+    ]
+  },
+  "notes": "Выпуск по итогам полного код-ревью: исправлены уязвимости защиты и обновления, ошибки DNS-посредника, подключения нескольких туннелей и интерфейса. Ускорены доменные маршруты, обновление фильтров WFP и DNS-кеш.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.9.6",
+  "kid": "sv-2026-09-2"
+}
