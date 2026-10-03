@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.10.2",
+  "tag": "v0.10.2",
+  "releasedUtc": "2026-10-03T19:08:13Z",
+  "expiresUtc": "2026-12-02T19:08:13Z",
+  "package": {
+    "fileName": "SplitVpn-0.10.2.msi",
+    "size": 64119143,
+    "sha256": "1937e0ba8f9d0a6eb08c05304d065f8ec25ceb2bb905281ccc978b3ece7f3888",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.10.2/SplitVpn-0.10.2.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.10.2.msi"
+    ]
+  },
+  "notes": "IKEv2 теперь работает под защитой «Раздельного VPN»: подключение поднимается и пропускает трафик, в том числе к серверам, которые принимают только современное шифрование.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.10.2",
+  "kid": "sv-2026-09-2"
+}
