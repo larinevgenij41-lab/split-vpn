@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <RootNamespace>SplitVpn.Cli</RootNamespace>
+    <AssemblyName>splitvpn-cli</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <!-- CA1812: классы команд создаются через рефлексию диспетчера не используются; CA1031: dev-утилита печатает любые ошибки -->
+    <NoWarn>$(NoWarn);CA1031</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SplitVpn.Core\SplitVpn.Core.csproj" />
+    <ProjectReference Include="..\SplitVpn.Windows\SplitVpn.Windows.csproj" />
+  </ItemGroup>
+
+</Project>

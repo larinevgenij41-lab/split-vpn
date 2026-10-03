@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Помощник протокола AnyConnect: процесс, в котором работает libopenconnect. Запускается службой. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <RootNamespace>SplitVpn.OpenConnect</RootNamespace>
+    <AssemblyName>SplitVpn.OpenConnect</AssemblyName>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <OpenConnectBin>$(MSBuildThisFileDirectory)..\..\third_party\openconnect\bin\</OpenConnectBin>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SplitVpn.Core\SplitVpn.Core.csproj" />
+    <ProjectReference Include="..\SplitVpn.Windows\SplitVpn.Windows.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SplitVpn.Service.Tests" />
+  </ItemGroup>
+
+  <!--
+    Нативные библиотеки — из scripts\build-openconnect.sh. Кладутся рядом с exe: wintun.dll библиотека
+    ищет только в каталоге приложения. Без собранного каталога проект собирается (тестам DLL не нужны),
+    а установщик проверяет их наличие сам.
+  -->
+  <ItemGroup Condition="Exists('$(OpenConnectBin)libopenconnect-5.dll')">
+    <None Include="$(OpenConnectBin)*.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Visible="false" />
+    <None Include="$(OpenConnectBin)licenses\*.txt" Link="licenses\openconnect\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Visible="false" />
+    <None Include="$(OpenConnectBin)SHA256SUMS.txt" Link="licenses\openconnect\SHA256SUMS.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.10.0",
+  "tag": "v0.10.0",
+  "releasedUtc": "2026-10-03T09:36:05Z",
+  "expiresUtc": "2026-12-02T09:36:05Z",
+  "package": {
+    "fileName": "SplitVpn-0.10.0.msi",
+    "size": 64123239,
+    "sha256": "cf5528b04e5dc269c1a736e05a6e3799a8d3f7e42424a1ecb172c6cf9cb3e873",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.10.0/SplitVpn-0.10.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.10.0.msi"
+    ]
+  },
+  "notes": "Подробный журнал на срок и архив для разбора: редкие проблемы (например, при входе в Windows под другим пользователем) теперь можно записать подробно и передать одним файлом.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.10.0",
+  "kid": "sv-2026-09-2"
+}
