@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.10.1",
+  "tag": "v0.10.1",
+  "releasedUtc": "2026-10-03T14:11:05Z",
+  "expiresUtc": "2026-12-02T14:11:05Z",
+  "package": {
+    "fileName": "SplitVpn-0.10.1.msi",
+    "size": 64123239,
+    "sha256": "76d8668dc4f7ffd60afc94198447a513208f7d59abcc4612c99bca959f85bc96",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.10.1/SplitVpn-0.10.1.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.10.1.msi"
+    ]
+  },
+  "notes": "В интерфейсе появился индикатор работы службы: краткое описание текущего этапа, прогресс и время выполнения. При обновлении маршрутов и правил защиты показываются реальные счётчики выполненных операций.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.10.1",
+  "kid": "sv-2026-09"
+}
