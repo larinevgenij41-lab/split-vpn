@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.12.0",
+  "tag": "v0.12.0",
+  "releasedUtc": "2026-10-15T15:06:53Z",
+  "expiresUtc": "2026-12-14T15:06:53Z",
+  "package": {
+    "fileName": "SplitVpn-0.12.0.msi",
+    "size": 64172406,
+    "sha256": "0d2608c983a2d56eec048f1c2f1de7e30fdf42ed0bff459915c8c2dc144161b5",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.12.0/SplitVpn-0.12.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.12.0.msi"
+    ]
+  },
+  "notes": "Radmin VPN, Hamachi, ZeroTier и Tailscale теперь работают вместе с защитой без «Локального доступа». Программа распознаёт их адаптеры, не выбирает их основными и пропускает их трафик; переподключение Radmin VPN больше не перестраивает правила. Любой другой адаптер можно отметить доверенным на странице «Защита и DNS».",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.12.0",
+  "kid": "sv-2026-09-2"
+}
