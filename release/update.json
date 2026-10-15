@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.11.1",
+  "tag": "v0.11.1",
+  "releasedUtc": "2026-10-15T09:45:25Z",
+  "expiresUtc": "2026-12-14T09:45:25Z",
+  "package": {
+    "fileName": "SplitVpn-0.11.1.msi",
+    "size": 64160118,
+    "sha256": "ef627da6093bfedefff6d520367fd3d8a3342dae5ffc31a29e55a1eb75673c52",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.11.1/SplitVpn-0.11.1.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.11.1.msi"
+    ]
+  },
+  "notes": "Ручные правила доски теперь важнее сетей, которые присылает шлюз Cisco AnyConnect: адреса, для которых вы задали свой маршрут, идут по вашему правилу. Перенос карточки «Сети шлюза» в другую колонку больше не переподключает AnyConnect и не требует нового входа через SSO.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.11.1",
+  "kid": "sv-2026-09-2"
+}
