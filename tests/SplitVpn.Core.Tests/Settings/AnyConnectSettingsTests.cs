@@ -130,6 +130,15 @@ public sealed class AnyConnectSettingsTests
     }
 
     [Fact]
+    public void ConnectionKey_IgnoresUserRulesFlag()
+    {
+        var profile = AnyConnect();
+        var toggled = profile with { AnyConnect = profile.AnyConnect with { UserRulesOverrideServerNetworks = false } };
+
+        Assert.Equal(VpnProtocols.ConnectionKey(profile), VpnProtocols.ConnectionKey(toggled));
+    }
+
+    [Fact]
     public void SettingsWithAnyConnect_RoundTripInCurrentSchema()
     {
         var profile = AnyConnect() with { AnyConnect = new AnyConnectSettings { Group = "Офис_SSO", UseDtls = false, ServerNetworksTarget = RouteTarget.Direct } };
@@ -155,5 +164,29 @@ public sealed class AnyConnectSettingsTests
 
         Assert.True(loaded.IsSuccess, loaded.Error);
         Assert.Equal(new AnyConnectSettings(), loaded.Settings!.Profiles[0].AnyConnect);
+    }
+
+    [Fact]
+    public void AnyConnectBlockWithoutUserRulesFlag_KeepsUserRulesPriority()
+    {
+        var profile = AnyConnect() with { AnyConnect = new AnyConnectSettings { UserRulesOverrideServerNetworks = false } };
+        var json = SettingsSerializer.Serialize(With(profile))
+            .Replace("\"userRulesOverrideServerNetworks\"", "\"ignoredOldField\"", StringComparison.Ordinal);
+
+        var loaded = SettingsSerializer.Deserialize(json);
+
+        Assert.True(loaded.IsSuccess, loaded.Error);
+        Assert.True(loaded.Settings!.Profile(profile.Id)!.AnyConnect.UserRulesOverrideServerNetworks);
+    }
+
+    [Fact]
+    public void UserRulesFlagOff_RoundTrips()
+    {
+        var profile = AnyConnect() with { AnyConnect = new AnyConnectSettings { UserRulesOverrideServerNetworks = false } };
+
+        var loaded = SettingsSerializer.Deserialize(SettingsSerializer.Serialize(With(profile)));
+
+        Assert.True(loaded.IsSuccess, loaded.Error);
+        Assert.False(loaded.Settings!.Profile(profile.Id)!.AnyConnect.UserRulesOverrideServerNetworks);
     }
 }

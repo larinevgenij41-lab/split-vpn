@@ -30,7 +30,20 @@ public static class VpnProtocols
     };
     public static string ConnectionKey(ConnectionProfile profile) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
         System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { profile.Id, profile.Server, profile.Protocol, profile.AuthMethod,
-            profile.UserName, profile.Domain, profile.IpsecAuthentication, profile.Eap, profile.AnyConnect }, JsonDefaults.Compact)));
+            profile.UserName, profile.Domain, profile.IpsecAuthentication, profile.Eap, AnyConnect = AnyConnectKeyPart(profile.AnyConnect) },
+            JsonDefaults.Compact)));
+
+    /// <summary>
+    /// Настройки шлюза для ключа подключения без флага приоритета ручных правил: он влияет только на маршруты,
+    /// и его переключение не должно переподключать AnyConnect (а значит, требовать нового входа).
+    /// </summary>
+    private static System.Text.Json.Nodes.JsonObject AnyConnectKeyPart(AnyConnectSettings settings)
+    {
+        var node = System.Text.Json.JsonSerializer.SerializeToNode(settings, JsonDefaults.Compact)!.AsObject();
+        var name = nameof(AnyConnectSettings.UserRulesOverrideServerNetworks);
+        node.Remove(JsonDefaults.Compact.PropertyNamingPolicy?.ConvertName(name) ?? name);
+        return node;
+    }
     public static bool IsEap(AuthMethod method) => method is AuthMethod.EapMsChapV2 or AuthMethod.PeapMsChapV2
         or AuthMethod.EapTls or AuthMethod.TtlsMsChapV2 or AuthMethod.TtlsPap;
 

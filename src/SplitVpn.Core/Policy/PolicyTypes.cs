@@ -89,8 +89,8 @@ public enum DecisionSource
     TunnelInfrastructure,
 }
 
-/// <summary>Сети шлюза и цель, в которую их направил пользователь.</summary>
-public sealed record ServerNetworks(RouteTarget Target, IReadOnlyList<Ipv4Cidr> Cidrs);
+/// <summary>Сети шлюза и цель, в которую их направил пользователь; UserRulesWin — ручные правила важнее этих сетей.</summary>
+public sealed record ServerNetworks(RouteTarget Target, IReadOnlyList<Ipv4Cidr> Cidrs, bool UserRulesWin = true);
 
 /// <summary>Служебный адрес туннеля, который должен идти через этот туннель.</summary>
 public readonly record struct TunnelHost(Guid Tunnel, uint Address);

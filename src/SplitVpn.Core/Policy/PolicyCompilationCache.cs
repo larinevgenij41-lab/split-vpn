@@ -46,5 +46,6 @@ public sealed class PolicyCompilationCache
         && a.Groups.Count == b.Groups.Count && a.Groups.Zip(b.Groups).All(p =>
             p.First.Id == p.Second.Id && p.First.Members.SequenceEqual(p.Second.Members))
         && a.ServerNetworks.Count == b.ServerNetworks.Count && a.ServerNetworks.Zip(b.ServerNetworks).All(p =>
-            p.First.Target == p.Second.Target && p.First.Cidrs.SequenceEqual(p.Second.Cidrs));
+            p.First.Target == p.Second.Target && p.First.Cidrs.SequenceEqual(p.Second.Cidrs)
+            && p.First.UserRulesWin == p.Second.UserRulesWin);
 }

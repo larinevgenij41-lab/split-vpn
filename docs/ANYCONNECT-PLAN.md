@@ -175,7 +175,7 @@
   - `PolicyInput.ServerNetworks[(RouteTarget, Cidrs)]` и `DecisionSource.ServerNetwork` — только пока туннель `Established`, без кэша. До входа 10.x остаётся `Local`, частные адреса в интернет не уходят.
   - Окрашивание после `SpecialRanges.Local`, до `OnLinkSet`.
   - Следом новый слой **`TunnelInfrastructure`**: адреса `VpnDns` и проекции всех туннелей, чтобы 10/8 AnyConnect не перехватил DNS или пир другого туннеля.
-  - Итоговый приоритет: пользовательские правила < сети сервера < LAN on-link, loopback, инфраструктура туннелей, служебный DNS и серверы.
+  - Итоговый приоритет (с 0.11.0, флаг `UserRulesOverrideServerNetworks`, по умолчанию включён): сети сервера < пользовательские правила < LAN on-link, loopback, инфраструктура туннелей, служебный DNS и серверы. С выключенным флагом — прежний порядок: пользовательские правила (кроме «Блокировать») < сети сервера < …
   - Пустой `SplitIncludes` значит сетей сервера нет: предупреждение в карточке, Default не захватывается. Split Exclude в v1 игнорируется.
 - **DNS.**
   - В `BuildDomainRoutes` добавляются правила на время работы (в настройки не пишутся): суффиксы из `SplitDns`, иначе из `Domains` (без однословных вроде `local`) плюс хост PAC. Цель — цель карточки; явное пользовательское доменное правило побеждает.
@@ -191,7 +191,7 @@
 
 - **Модель (схема остаётся v3, изменения аддитивные):**
   - `VpnProtocol.AnyConnect` («Cisco AnyConnect»), `AuthMethod.GatewayForm`; ветки в `Name`/`Supports`/`TryParseServer` (`host[:port][/group]`)/`ConnectionKey`;
-  - `ConnectionProfile.AnyConnect: AnyConnectSettings {Group, CertThumbprint, UseDtls = true, ApplyServerProxy = false, UserAgent, ServerNetworksTarget: RouteTarget?}`;
+  - `ConnectionProfile.AnyConnect: AnyConnectSettings {Group, CertThumbprint, UseDtls = true, ApplyServerProxy = false, UserAgent, ServerNetworksTarget: RouteTarget?, UserRulesOverrideServerNetworks = true}`;
   - `SettingsValidator`: роль не Primary, не участник групп, не цель Default/Geo, `ServerNetworksTarget` не группа.
 - **IPC** (`Messages.cs`): `ContractVersion = 4`; `BeginSignInRequest`, `CancelSignInRequest`, `SsoNavigationRequest`, `SubmitAuthFormRequest`; `TunnelStatusDto.SignIn`, `TunnelStatusDto.ServerNetworks` (сети, DNS, суффиксы, PAC, MTU, срок сеанса).
 - **UI:**

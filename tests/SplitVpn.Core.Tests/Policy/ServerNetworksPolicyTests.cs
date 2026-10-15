@@ -11,11 +11,13 @@ public sealed class ServerNetworksPolicyTests
     private static readonly uint SstpDnsInPrivateRange = Ipv4.Parse("10.8.0.1");
     private static readonly uint GatewayDns = Ipv4.Parse("10.0.16.21");
 
-    private static PolicyInput Input(params string[] networks) => new()
+    private static PolicyInput Input(params string[] networks) => Input(true, networks);
+
+    private static PolicyInput Input(bool userRulesWin, params string[] networks) => new()
     {
         DefaultTarget = RouteTarget.Tunnel(Sstp),
         ServerAddresses = [SstpServer],
-        ServerNetworks = [new ServerNetworks(RouteTarget.Tunnel(Gateway), networks.Select(Ipv4Cidr.Parse).ToList())],
+        ServerNetworks = [new ServerNetworks(RouteTarget.Tunnel(Gateway), networks.Select(Ipv4Cidr.Parse).ToList(), userRulesWin)],
     };
 
     [Fact]
@@ -41,9 +43,9 @@ public sealed class ServerNetworksPolicyTests
     }
 
     [Fact]
-    public void ServerNetworks_OverrideUserRulesButNotOnLinkLoopbackOrServers()
+    public void UserRulesFlagOff_ServerNetworksOverrideUserRulesButNotOnLinkLoopbackOrServers()
     {
-        var input = Input("10.0.0.0/8", "192.168.0.0/16", "203.0.113.10/32") with
+        var input = Input(false, "10.0.0.0/8", "192.168.0.0/16", "203.0.113.10/32") with
         {
             Rules = [new UserRule(Ipv4Cidr.Parse("10.5.0.0/16"), RouteTarget.Direct)],
             OnLinePrefixes = [Ipv4Cidr.Parse("192.168.1.0/24")],
@@ -56,6 +58,62 @@ public sealed class ServerNetworksPolicyTests
         Assert.Equal(Gateway, policy.Classify(Ipv4.Parse("192.168.2.10")).Tunnel);
         Assert.Equal(DecisionSource.Server, policy.Classify(SstpServer).Source);
         Assert.Equal(Decision.Local, policy.Classify(Ipv4.Parse("127.0.0.1")).Decision);
+    }
+
+    [Fact]
+    public void UserRules_WinOverServerNetworksButNotOverOnLinkLoopbackOrServers()
+    {
+        var input = Input("10.0.0.0/8", "192.168.0.0/16", "203.0.113.10/32") with
+        {
+            Rules =
+            [
+                new UserRule(Ipv4Cidr.Parse("10.100.5.0/24"), RouteTarget.Tunnel(Sstp)),
+                new UserRule(Ipv4Cidr.Parse("192.168.0.0/16"), RouteTarget.Direct),
+            ],
+            OnLinePrefixes = [Ipv4Cidr.Parse("192.168.1.0/24")],
+        };
+
+        var policy = PolicyCompiler.Compile(input);
+
+        var manual = policy.Classify(Ipv4.Parse("10.100.5.11"));
+        Assert.Equal(Sstp, manual.Tunnel);
+        Assert.Equal(DecisionSource.UserRule, manual.Source);
+        Assert.Equal(Gateway, policy.Classify(Ipv4.Parse("10.100.6.1")).Tunnel);
+        Assert.Equal(Decision.Direct, policy.Classify(Ipv4.Parse("192.168.2.10")).Decision);
+        Assert.Equal(DecisionSource.OnLink, policy.Classify(Ipv4.Parse("192.168.1.10")).Source);
+        Assert.Equal(DecisionSource.Server, policy.Classify(SstpServer).Source);
+        Assert.Equal(Decision.Local, policy.Classify(Ipv4.Parse("127.0.0.1")).Decision);
+        Assert.DoesNotContain(policy.RouteCidrsFor(Gateway), c => c.Contains(Ipv4.Parse("10.100.5.11")));
+    }
+
+    /// <summary>Широкое ручное правило сильнее и более узкой сети шлюза внутри него: длина префикса не важна.</summary>
+    [Fact]
+    public void WideUserRule_WinsOverNarrowerServerNetwork()
+    {
+        var input = Input("10.100.5.0/26") with
+        {
+            Rules = [new UserRule(Ipv4Cidr.Parse("10.100.0.0/16"), RouteTarget.Tunnel(Sstp))],
+        };
+
+        var policy = PolicyCompiler.Compile(input);
+
+        Assert.Equal(Sstp, policy.Classify(Ipv4.Parse("10.100.5.11")).Tunnel);
+        Assert.Empty(policy.RouteCidrsFor(Gateway));
+    }
+
+    [Fact]
+    public void UserRules_DoNotWinOverTunnelHosts()
+    {
+        var input = Input("10.0.0.0/8") with
+        {
+            Rules = [new UserRule(Ipv4Cidr.Parse("10.0.16.0/24"), RouteTarget.Direct)],
+            TunnelHosts = [new TunnelHost(Gateway, GatewayDns)],
+        };
+
+        var policy = PolicyCompiler.Compile(input);
+
+        Assert.Equal(DecisionSource.TunnelInfrastructure, policy.Classify(GatewayDns).Source);
+        Assert.Equal(Decision.Direct, policy.Classify(Ipv4.Parse("10.0.16.22")).Decision);
     }
 
     [Fact]

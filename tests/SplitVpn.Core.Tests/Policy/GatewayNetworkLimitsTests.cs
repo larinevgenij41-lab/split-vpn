@@ -72,10 +72,11 @@ public sealed class GatewayNetworkLimitsTests
     }
 
     [Fact]
-    public void Compiler_StillOverridesOtherUserRules()
+    public void Compiler_WithUserRulesFlagOff_StillOverridesOtherUserRules()
     {
         var input = Input("162.159.0.0/16", "10.0.0.0/8") with
         {
+            ServerNetworks = [Input("162.159.0.0/16", "10.0.0.0/8").ServerNetworks[0] with { UserRulesWin = false }],
             Rules =
             [
                 new UserRule(Ipv4Cidr.Parse("162.159.5.0/24"), RouteTarget.Direct),

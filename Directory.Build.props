@@ -10,7 +10,7 @@
     <InvariantGlobalization>false</InvariantGlobalization>
     <Company>SplitVpn</Company>
     <Product>Раздельный VPN</Product>
-    <Version>0.10.2</Version>
+    <Version>0.11.0</Version>
     <!-- CA1848/CA1873: высокопроизводительное логирование не требуется; CA2007: ConfigureAwait в приложении не нужен -->
     <NoWarn>$(NoWarn);CA1848;CA1873;CA2007;CA1303;CA1716</NoWarn>
   </PropertyGroup>

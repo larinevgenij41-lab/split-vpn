@@ -167,13 +167,14 @@ public static class PolicyCompiler
         painter.Paint(SpecialRanges.Reserved, Reserved(input.DefaultTarget));
         painter.Paint(SpecialRanges.LinkScope, local);
         Verify(painter, "зарезервированные и link-scope", input);
-        foreach (var (target, cidr) in input.ServerNetworks
-            .SelectMany(n => n.Cidrs.Where(c => c.PrefixLength >= MinServerNetworkPrefix).Select(c => (n.Target, c)))
+        foreach (var (target, cidr, userRulesWin) in input.ServerNetworks
+            .SelectMany(n => n.Cidrs.Where(c => c.PrefixLength >= MinServerNetworkPrefix).Select(c => (n.Target, c, n.UserRulesWin)))
             .OrderBy(n => n.c.PrefixLength))
         {
-            // Сети шлюза перекрывают правила пользователя, но не его запрет: адрес, который он запретил,
-            // не должен уйти в корпоративный туннель только потому, что шлюз прислал охватывающую сеть.
-            painter.PaintKeeping(cidr.ToRange(), Label(target, DecisionSource.ServerNetwork), IsUserBlock);
+            // Запрет пользователя сохраняется всегда: адрес, который он запретил, не должен уйти в корпоративный
+            // туннель только потому, что шлюз прислал охватывающую сеть. С флагом UserRulesWin так же сохраняются
+            // все ручные правила, какой бы ни была длина их префикса.
+            painter.PaintKeeping(cidr.ToRange(), Label(target, DecisionSource.ServerNetwork), userRulesWin ? IsUserRule : IsUserBlock);
         }
 
         Verify(painter, "сети шлюза", input);
@@ -279,6 +280,9 @@ public static class PolicyCompiler
             $"  адреса туннелей: {Join(input.TunnelHosts.Select(h => $"{h.Tunnel}:{Ipv4.Format(h.Address)}"))}",
             $"  закрепления: {input.PinnedHosts.Count}");
     }
+
+    /// <summary>Решение принято любым правилом пользователя.</summary>
+    private static bool IsUserRule(Classification label) => label.Source == DecisionSource.UserRule;
 
     /// <summary>Решение принято правилом пользователя «Блокировать»: его не перекрывает никакой следующий слой.</summary>
     private static bool IsUserBlock(Classification label) =>

@@ -54,6 +54,10 @@ public sealed record AnyConnectSettings
 
     /// <summary>Куда направлены сети, присланные шлюзом; null — в этот же туннель.</summary>
     public RouteTarget? ServerNetworksTarget { get; init; }
+
+    /// <summary>Ручные правила важнее сетей шлюза: адрес под правилом пользователя не уходит в туннель шлюза,
+    /// даже если шлюз прислал охватывающую сеть; по умолчанию включено.</summary>
+    public bool UserRulesOverrideServerNetworks { get; init; } = true;
 }
 
 public enum AdapterSelection

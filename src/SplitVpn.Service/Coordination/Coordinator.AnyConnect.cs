@@ -415,7 +415,10 @@ public sealed partial class Coordinator
         {
             if (_settings.Profile(tunnel.ProfileId) is { } profile)
             {
-                result.Add(new ServerNetworks(AppSettings.ServerNetworksTarget(profile), tunnel.Session!.IncludeCidrs()));
+                result.Add(new ServerNetworks(
+                    AppSettings.ServerNetworksTarget(profile),
+                    tunnel.Session!.IncludeCidrs(),
+                    profile.AnyConnect.UserRulesOverrideServerNetworks));
             }
         }
 

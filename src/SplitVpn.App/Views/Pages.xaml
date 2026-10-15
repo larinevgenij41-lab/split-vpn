@@ -393,6 +393,9 @@
                                Visibility="{Binding KindText, Converter={StaticResource VisibleWhen}}" />
                     <TextBlock Text="{Binding Subtitle}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                Visibility="{Binding Subtitle, Converter={StaticResource VisibleWhen}}" />
+                    <CheckBox Margin="0,6,0,0" Content="Ручные правила важнее сетей шлюза" IsChecked="{Binding UserRulesWin}"
+                              Visibility="{Binding IsServerNetworks, Converter={StaticResource VisibleWhen}}"
+                              ToolTip="Адреса, на которые есть ваши правила, не уходят в туннель шлюза, даже если шлюз прислал охватывающую сеть" />
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal">
                     <ui:DropDownButton Icon="{ui:SymbolIcon ArrowMove24}" Appearance="Transparent" Padding="6,2" ToolTip="Переместить в…"

@@ -116,7 +116,8 @@ public sealed partial class RoutingViewModel : PageViewModel
         foreach (var profile in _settings.Profiles.Where(p => p is { Protocol: VpnProtocol.AnyConnect } && p.Role != ProfileRole.Off))
         {
             var status = Main.Status?.Tunnels.FirstOrDefault(t => t.ProfileId == profile.Id)?.ServerNetworks;
-            _cards.Add(new BoardCard(this, CardKind.ServerNetworks, $"Сети шлюза «{profile.Name}»", GatewaySummary(status), AppSettings.ServerNetworksTarget(profile))
+            _cards.Add(new BoardCard(this, CardKind.ServerNetworks, $"Сети шлюза «{profile.Name}»", GatewaySummary(status),
+                AppSettings.ServerNetworksTarget(profile), profile.AnyConnect.UserRulesOverrideServerNetworks)
             {
                 ProfileId = profile.Id,
             });
@@ -347,7 +348,14 @@ public sealed partial class RoutingViewModel : PageViewModel
             DomainRules = _cards.Where(c => c.Kind == CardKind.Domain)
                 .Select(c => new DomainRuleSetting { Suffix = c.Title, Target = c.Target, Comment = c.Subtitle }).ToList(),
             Profiles = fresh.Profiles.Select(p => _cards.Find(c => c.Kind == CardKind.ServerNetworks && c.ProfileId == p.Id) is { } card
-                ? p with { AnyConnect = p.AnyConnect with { ServerNetworksTarget = card.Target == RouteTarget.Tunnel(p.Id) ? null : card.Target } }
+                ? p with
+                {
+                    AnyConnect = p.AnyConnect with
+                    {
+                        ServerNetworksTarget = card.Target == RouteTarget.Tunnel(p.Id) ? null : card.Target,
+                        UserRulesOverrideServerNetworks = card.UserRulesWin,
+                    },
+                }
                 : p).ToList(),
         };
         var response = await Service.CommandAsync(new SaveSettingsRequest(updated));
@@ -502,9 +510,10 @@ public sealed partial class BoardCard : ObservableObject
 {
     private readonly RoutingViewModel _board;
 
-    public BoardCard(RoutingViewModel board, CardKind kind, string title, string? subtitle, RouteTarget target)
+    public BoardCard(RoutingViewModel board, CardKind kind, string title, string? subtitle, RouteTarget target, bool userRulesWin = true)
     {
         _board = board;
+        _userRulesWin = userRulesWin;
         Kind = kind;
         Title = title;
         _subtitle = subtitle;
@@ -522,6 +531,14 @@ public sealed partial class BoardCard : ObservableObject
     private string? _subtitle;
 
     public RouteTarget Target { get; set; }
+
+    /// <summary>Для карточки сетей шлюза: ручные правила важнее этих сетей.</summary>
+    [ObservableProperty]
+    private bool _userRulesWin = true;
+
+    public bool IsServerNetworks => Kind == CardKind.ServerNetworks;
+
+    partial void OnUserRulesWinChanged(bool value) => _board.MarkDirty();
 
     /// <summary>Карточку только что перенесли: фокус клавиатуры переходит на неё в новой колонке, а не теряется.</summary>
     internal bool FocusOnLoad { get; set; }
