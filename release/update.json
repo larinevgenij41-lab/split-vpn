@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.12.2",
+  "tag": "v0.12.2",
+  "releasedUtc": "2026-10-22T09:30:17Z",
+  "expiresUtc": "2026-12-21T09:30:17Z",
+  "package": {
+    "fileName": "SplitVpn-0.12.2.msi",
+    "size": 64180598,
+    "sha256": "41db7b8e0016b368951ed32271004c7eae2f2b789f64b2758b6a03bbf9ab2c88",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.12.2/SplitVpn-0.12.2.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.12.2.msi"
+    ]
+  },
+  "notes": "Служебный выпуск: работа программы не изменилась. Исправлены автоматические проверки последовательного подключения туннелей, из-за которых сборка выпуска иногда останавливалась.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.12.2",
+  "kid": "sv-2026-09-2"
+}
