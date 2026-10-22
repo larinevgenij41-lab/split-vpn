@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Стенд КТ0 AnyConnect: не входит в решение и поставку. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>OcSpike</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <MSBuildWarningsAsMessages>MSB3277</MSBuildWarningsAsMessages>
+    <NoWarn>$(NoWarn);CA1806;CA1861;WFO0003;CA1031;CA1303;CA1305;CA1307;CA1310;CA1812;CA2000;CA5392;CA1416</NoWarn>
+    <OpenConnectBin>$(MSBuildThisFileDirectory)..\..\third_party\openconnect\work\stage\bin\</OpenConnectBin>
+    <WintunDll>$(MSBuildThisFileDirectory)..\..\third_party\openconnect\work\openconnect-9.21\.libs\wintun.dll</WintunDll>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" />
+    <ProjectReference Include="..\..\src\SplitVpn.Core\SplitVpn.Core.csproj" />
+  </ItemGroup>
+
+  <Target Name="CopyOpenConnect" AfterTargets="Build">
+    <ItemGroup>
+      <OcDll Include="$(OpenConnectBin)*.dll" />
+      <OcDll Include="C:\msys64\ucrt64\bin\libbrotlicommon.dll;C:\msys64\ucrt64\bin\libiconv-2.dll;C:\msys64\ucrt64\bin\libbrotlidec.dll;C:\msys64\ucrt64\bin\libbrotlienc.dll;C:\msys64\ucrt64\bin\libffi-8.dll;C:\msys64\ucrt64\bin\libidn2-0.dll;C:\msys64\ucrt64\bin\libintl-8.dll;C:\msys64\ucrt64\bin\libnettle-9.dll;C:\msys64\ucrt64\bin\libtasn1-6.dll;C:\msys64\ucrt64\bin\libunistring-5.dll;C:\msys64\ucrt64\bin\libwinpthread-1.dll;C:\msys64\ucrt64\bin\libzstd.dll;C:\msys64\ucrt64\bin\libgmp-10.dll;C:\msys64\ucrt64\bin\libgnutls-30.dll;C:\msys64\ucrt64\bin\libhogweed-7.dll;C:\msys64\ucrt64\bin\liblz4.dll;C:\msys64\ucrt64\bin\libp11-kit-0.dll;C:\msys64\ucrt64\bin\libxml2-16.dll;C:\msys64\ucrt64\bin\zlib1.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(OcDll)" DestinationFolder="$(OutDir)openconnect\" SkipUnchangedFiles="true" />
+    <!-- libopenconnect грузит wintun.dll только из каталога exe (LOAD_LIBRARY_SEARCH_APPLICATION_DIR) -->
+    <Copy SourceFiles="$(WintunDll)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

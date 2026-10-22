@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.12.1",
+  "tag": "v0.12.1",
+  "releasedUtc": "2026-10-22T09:11:17Z",
+  "expiresUtc": "2026-12-21T09:11:17Z",
+  "package": {
+    "fileName": "SplitVpn-0.12.1.msi",
+    "size": 64164214,
+    "sha256": "10928fe7d9fe197b35185fe589163b0999f16ee59e8b2d0b39d774acb2d12bc8",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.12.1/SplitVpn-0.12.1.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.12.1.msi"
+    ]
+  },
+  "notes": "Исправление: если правилом «Напрямую» направить сам адрес VPN-сервера, защита теперь пропускает к нему любой трафик, а не только подключение туннеля. Раньше, например, SSH к этому серверу блокировался фильтром «Блокировать всё».",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.12.1",
+  "kid": "sv-2026-09-2"
+}
