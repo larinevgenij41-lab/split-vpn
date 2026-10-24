@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SplitVpn.App/SplitVpn.App.csproj" />
+    <Project Path="src/SplitVpn.Cli/SplitVpn.Cli.csproj" />
+    <Project Path="src/SplitVpn.Core/SplitVpn.Core.csproj" />
+    <Project Path="src/SplitVpn.OpenConnect/SplitVpn.OpenConnect.csproj" />
+    <Project Path="src/SplitVpn.Service/SplitVpn.Service.csproj" />
+    <Project Path="src/SplitVpn.Windows/SplitVpn.Windows.csproj" />
+  </Folder>
+  <Folder Name="/installer/">
+    <Project Path="installer/SplitVpn.Installer.wixproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SplitVpn.Core.Tests/SplitVpn.Core.Tests.csproj" />
+    <Project Path="tests/SplitVpn.Service.Tests/SplitVpn.Service.Tests.csproj" />
+  </Folder>
+</Solution>

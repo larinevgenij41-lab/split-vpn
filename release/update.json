@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.13.0",
+  "tag": "v0.13.0",
+  "releasedUtc": "2026-10-24T08:38:51Z",
+  "expiresUtc": "2026-12-23T08:38:51Z",
+  "package": {
+    "fileName": "SplitVpn-0.13.0.msi",
+    "size": 64172406,
+    "sha256": "3cb3181eb3bce02a266f75f8ea8093deecec241ace406749566d514c53d33502",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.13.0/SplitVpn-0.13.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.13.0.msi"
+    ]
+  },
+  "notes": "На странице «Маршрутизация» сети и домены теперь можно объединять в сворачиваемые папки. Несколько карточек заменяются одной, а перенос папки сразу меняет маршрут всех вложенных правил. Папки сохраняются в настройках; существующие конфигурации продолжают работать.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.13.0",
+  "kid": "sv-2026-09-2"
+}
