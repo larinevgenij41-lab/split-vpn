@@ -1,0 +1,45 @@
+{
+  "comment": "Нативные зависимости протокола AnyConnect. Сборка: scripts\\build-openconnect.sh (MSYS2 UCRT64), результат — third_party\\openconnect\\bin (не в git). Хеши проверяются скриптом.",
+  "openconnect": {
+    "version": "9.21",
+    "source": "https://www.infradead.org/openconnect/download/openconnect-9.21.tar.gz",
+    "signature": "https://www.infradead.org/openconnect/download/openconnect-9.21.tar.gz.asc",
+    "sha256": "5b32369467db6e5f317aa1ed12cfcbb81ed00bdbc765450b6bfcbdc300944a58",
+    "license": "LGPL-2.1-or-later",
+    "patches": [
+      "compat.c: #include <sec_api/stdlib_s.h> заменён на <stdlib.h> — в заголовках mingw-w64 14 каталога sec_api нет"
+    ],
+    "dlls": [ "libopenconnect-5.dll" ]
+  },
+  "wintun": {
+    "version": "0.14.1",
+    "source": "https://www.wintun.net/builds/wintun-0.14.1.zip",
+    "sha256": "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51",
+    "license": "Prebuilt Binaries License (распространение без изменений, LICENSE.txt в архиве)",
+    "dlls": [ "wintun.dll" ]
+  },
+  "ocshim": {
+    "source": "native/ocshim/ocshim.c",
+    "license": "собственный код SplitVpn",
+    "dlls": [ "ocshim.dll" ]
+  },
+  "msys2Repository": "https://repo.msys2.org/mingw/ucrt64/",
+  "packages": [
+    { "name": "mingw-w64-ucrt-x86_64-brotli", "version": "1.2.0-1", "sha256": "9cc89665496ea504751476eafba15c71c554aaf3004babc2004f7c07ffd60514", "license": "MIT", "home": "https://github.com/google/brotli", "dlls": [ "libbrotlicommon.dll", "libbrotlidec.dll", "libbrotlienc.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libffi", "version": "3.8.0-1", "sha256": "99ad12f4ecfa00a889ef9c5c0188592368a5bac109d0c508ce4e04f29ea95a76", "license": "MIT", "home": "https://sourceware.org/libffi", "dlls": [ "libffi-8.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-gmp", "version": "6.3.0-2", "sha256": "e82a75968a556484a50084578238a84eb60fb93e34986fd6695c537975bd39ea", "license": "LGPL-3.0-or-later OR GPL-2.0-or-later", "home": "https://gmplib.org/", "dlls": [ "libgmp-10.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-gnutls", "version": "3.8.13-3", "sha256": "303da3babd11f545fcac647439298e8559951ce6a1086666faf8ad2a1f708be6", "license": "LGPL-2.1-or-later", "home": "https://www.gnutls.org/", "dlls": [ "libgnutls-30.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-nettle", "version": "4.0-1", "sha256": "47b49f1723ef2c75ff3042b6e463910c47cdffa3342e175b6409fb9d630e64ed", "license": "LGPL-3.0-or-later OR GPL-2.0-or-later", "home": "https://www.lysator.liu.se/~nisse/nettle", "dlls": [ "libhogweed-7.dll", "libnettle-9.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libiconv", "version": "1.19-1", "sha256": "9a500f38c2b91808741c62fae746b3e9110b33a1ecf5c30fa0c66dbedddf7e16", "license": "LGPL-2.1-or-later", "home": "https://www.gnu.org/software/libiconv/", "dlls": [ "libiconv-2.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libidn2", "version": "2.3.8-4", "sha256": "d5f4b5e9d99ff7b2a986d1dc0c73da2bcd93ba68462be7b1debbd6ef76371f57", "license": "LGPL-3.0-or-later OR GPL-2.0-or-later", "home": "https://www.gnu.org/software/libidn/#libidn2", "dlls": [ "libidn2-0.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-gettext-runtime", "version": "1.0-1", "sha256": "ba693dda4ac375af76ce481ff3a6e7481286546cc7dc6d56c7021dae34084157", "license": "LGPL-2.1-or-later (libintl)", "home": "https://www.gnu.org/software/gettext/", "dlls": [ "libintl-8.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-lz4", "version": "1.10.0-1", "sha256": "00a807df81a4b7e82445178b8625962ed592cf1f0a08a8e04c8b9338c4362638", "license": "BSD-2-Clause (библиотека)", "home": "https://lz4.github.io/lz4/", "dlls": [ "liblz4.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-p11-kit", "version": "0.26.5-1", "sha256": "6e1645f0afa669f3e3325abb891d79c58dacf0bb5f9bb1ea719d22da1d754e62", "license": "BSD-3-Clause", "home": "https://p11-glue.freedesktop.org/p11-kit.html", "dlls": [ "libp11-kit-0.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libtasn1", "version": "4.21.0-1", "sha256": "d098b27834c3b25142b6f5aa9a0ca5731a8e4334c232786406cb149dd8bde2ba", "license": "LGPL-2.1-or-later (библиотека)", "home": "https://www.gnu.org/software/libtasn1/", "dlls": [ "libtasn1-6.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libunistring", "version": "1.4.2-1", "sha256": "e784273da19bbdcc91cbb510b5e27c3ac021b026140734eefcce5ccbd878bd97", "license": "LGPL-3.0-or-later OR GPL-3.0-or-later", "home": "https://www.gnu.org/software/libunistring", "dlls": [ "libunistring-5.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libwinpthread", "version": "14.0.0.r375.g9c1abbbf5-1", "sha256": "61d340fe8eebc77ee821badca246827fe90545e99685e503bdea16a8d25df512", "license": "MIT AND BSD-3-Clause-Clear", "home": "https://www.mingw-w64.org/", "dlls": [ "libwinpthread-1.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libxml2", "version": "2.15.4-1", "sha256": "ea6b8e7ee24d8674e719f1f0a1b3747a72158ab786dfc5392ccb9f8edd09582a", "license": "MIT", "home": "https://gitlab.gnome.org/GNOME/libxml2", "dlls": [ "libxml2-16.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-zstd", "version": "1.5.7-2", "sha256": "dbdb8427280046a2b41697780aa4c52983b708082b0da4755951dc3bea96ca89", "license": "BSD-3-Clause", "home": "https://facebook.github.io/zstd/", "dlls": [ "libzstd.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-zlib", "version": "1.3.2-2", "sha256": "841401182976d2f9e17e5c0ebaac51f2a8014140ea53d67625e91c8fb3c85ea0", "license": "Zlib", "home": "https://www.zlib.net/", "dlls": [ "zlib1.dll" ] }
+  ]
+}

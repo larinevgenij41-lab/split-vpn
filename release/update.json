@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.14.0",
+  "tag": "v0.14.0",
+  "releasedUtc": "2026-11-03T10:13:37Z",
+  "expiresUtc": "2027-01-02T10:13:37Z",
+  "package": {
+    "fileName": "SplitVpn-0.14.0.msi",
+    "size": 64156022,
+    "sha256": "0d72de6120b8103869bb8c550a00d51fc2357aa499c71e9b074bd478d3bd6efc",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.14.0/SplitVpn-0.14.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.14.0.msi"
+    ]
+  },
+  "notes": "Список обхода блокировок сворачивается до подсетей /24: маршрутов и фильтров защиты в три раза меньше, Windows меньше нагружается при подключении и сверке. Исправлено 86 ошибок по итогам аудита кода: DNS и маршрутизация, AnyConnect, восстановление сети, обновления, диагностика без секретов, сохранение настроек и гонки в интерфейсе.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.14.0",
+  "kid": "sv-2026-09-2"
+}
