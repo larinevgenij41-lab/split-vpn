@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.3",
+  "tag": "v0.15.3",
+  "releasedUtc": "2026-11-05T05:34:33Z",
+  "expiresUtc": "2027-01-04T05:34:33Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.3.msi",
+    "size": 64188276,
+    "sha256": "4c8c54ecb1f6cf0f607fc0072e775a3679d97f9cd71a35fe611e62d77e7b7336",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.3/SplitVpn-0.15.3.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.3.msi"
+    ]
+  },
+  "notes": "Подключение заметно меньше нагружает Windows: фильтров защиты WFP несколько сотен вместо десятков тысяч, а маршрутов при \"остальном интернете через VPN\" примерно на треть меньше. Исправлены переподключения по кругу при проверке туннеля и блокировка сети после сброса сети Windows, а также ошибки защиты при обрывах, AnyConnect и DNS. Версии 0.15.0-0.15.2 отдельно не выпускались, их изменения вошли в этот выпуск.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.3",
+  "kid": "sv-2026-09-2"
+}
