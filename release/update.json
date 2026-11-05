@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.4",
+  "tag": "v0.15.4",
+  "releasedUtc": "2026-11-05T07:05:54Z",
+  "expiresUtc": "2027-01-04T07:05:54Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.4.msi",
+    "size": 64192372,
+    "sha256": "2c0f8e8f5fb7913c9246fb492b1536762969a51e54a6fb4ea184382664bb7303",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.4/SplitVpn-0.15.4.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.4.msi"
+    ]
+  },
+  "notes": "Служба сразу замечает появившуюся сеть: Wi-Fi после загрузки Windows, сна или перезапуска драйвера получает доступ в интернет без ожидания очередной проверки. Из-за задержки Windows могла решить, что у Wi-Fi нет интернета, и сама перезапускала адаптер, а с ним рвался VPN и пропадала вся сеть. Также появилось отдельное предупреждение, если параллельно поднято подключение Windows к тому же VPN-серверу.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.4",
+  "kid": "sv-2026-09"
+}

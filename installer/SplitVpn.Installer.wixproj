@@ -1,0 +1,21 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+
+  <PropertyGroup>
+    <!-- EULA WiX v7 (OSMF 1.1) принята пользователем 2026-09-13: личное использование, плата не требуется. -->
+    <AcceptEula>wix7</AcceptEula>
+    <OutputName>SplitVpn-$(Version)</OutputName>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <OutputType>Package</OutputType>
+    <SuppressSpecificWarnings>1150</SuppressSpecificWarnings>
+    <!-- ICE61: AllowSameVersionUpgrades намеренно — переустановка той же версии при разработке. -->
+    <SuppressIces>ICE61</SuppressIces>
+    <DefineConstants>PublishDir=$(MSBuildThisFileDirectory)..\artifacts\publish\install;ServiceDir=$(MSBuildThisFileDirectory)..\artifacts\publish\install-service;ScriptsDir=$(MSBuildThisFileDirectory)..\scripts;AssetsDir=$(MSBuildThisFileDirectory)..\src\SplitVpn.App\Assets;ProductVersion=$(Version)</DefineConstants>
+    <OutputPath>..\artifacts\installer\</OutputPath>
+    <IntermediateOutputPath>obj\</IntermediateOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" />
+  </ItemGroup>
+
+</Project>
