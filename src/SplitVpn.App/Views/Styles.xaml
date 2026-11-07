@@ -1,0 +1,211 @@
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+    xmlns:views="clr-namespace:SplitVpn.App.Views">
+
+    <views:VisibleWhenConverter x:Key="VisibleWhen" />
+    <views:WidthBelowConverter x:Key="WidthBelow" />
+    <views:StepVisibilityConverter x:Key="StepVisible" />
+    <views:InverseBoolConverter x:Key="Not" />
+    <views:DecisionTextConverter x:Key="DecisionText" />
+    <views:LocalTimeConverter x:Key="LocalTime" />
+    <views:HasValueConverter x:Key="HasValue" />
+    <views:SeverityConverter x:Key="ErrorSeverity" />
+    <views:LevelToAppearanceConverter x:Key="LevelAppearance" />
+    <views:DecisionToAppearanceConverter x:Key="DecisionAppearance" />
+    <views:RoleToAppearanceConverter x:Key="RoleAppearance" />
+
+    <DataTemplate x:Key="WrappingChoiceContent">
+        <TextBlock Text="{Binding}" TextWrapping="Wrap" />
+    </DataTemplate>
+    <Style TargetType="CheckBox" BasedOn="{StaticResource {x:Type CheckBox}}">
+        <Setter Property="ContentTemplate" Value="{StaticResource WrappingChoiceContent}" />
+        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+    </Style>
+    <Style TargetType="RadioButton" BasedOn="{StaticResource {x:Type RadioButton}}">
+        <Setter Property="ContentTemplate" Value="{StaticResource WrappingChoiceContent}" />
+        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+    </Style>
+
+    <!-- Общая ширина страниц: растяжение до лимита не зависит от длины текста. -->
+    <Style x:Key="PageLayout" TargetType="StackPanel">
+        <Setter Property="MaxWidth" Value="1040" />
+        <Setter Property="HorizontalAlignment" Value="Stretch" />
+    </Style>
+
+    <!-- Типографика -->
+    <Style x:Key="PageTitle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="28" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Margin" Value="0,0,0,8" />
+        <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
+    </Style>
+    <Style x:Key="PageSubtitle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="14" />
+        <Setter Property="Margin" Value="0,0,0,24" />
+        <Setter Property="LineHeight" Value="20" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+        <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}" />
+    </Style>
+    <Style x:Key="SectionTitle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="16" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Margin" Value="0,24,0,12" />
+        <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
+    </Style>
+    <Style x:Key="Hint" TargetType="TextBlock">
+        <Setter Property="TextWrapping" Value="Wrap" />
+        <Setter Property="FontSize" Value="13" />
+        <Setter Property="LineHeight" Value="18" />
+        <Setter Property="Margin" Value="0,6,0,0" />
+        <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}" />
+    </Style>
+    <Style x:Key="Body" TargetType="TextBlock">
+        <Setter Property="TextWrapping" Value="Wrap" />
+        <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
+    </Style>
+    <Style x:Key="FieldLabel" TargetType="TextBlock">
+        <Setter Property="Margin" Value="0,16,0,6" />
+        <Setter Property="FontSize" Value="13" />
+        <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}" />
+    </Style>
+
+    <!-- Карточка-контейнер -->
+    <Style x:Key="PageCard" TargetType="ui:Card" BasedOn="{StaticResource {x:Type ui:Card}}">
+        <Setter Property="Margin" Value="0,0,0,12" />
+        <Setter Property="Padding" Value="20" />
+        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+    </Style>
+    <Style x:Key="ButtonRow" TargetType="WrapPanel">
+        <Style.Resources>
+            <Style TargetType="ui:Button" BasedOn="{StaticResource {x:Type ui:Button}}">
+                <Setter Property="Margin" Value="0,0,8,8" />
+            </Style>
+            <Style TargetType="ui:Badge" BasedOn="{StaticResource {x:Type ui:Badge}}">
+                <Setter Property="Margin" Value="0,0,8,8" />
+            </Style>
+        </Style.Resources>
+        <Setter Property="Orientation" Value="Horizontal" />
+        <Setter Property="Margin" Value="0,16,-8,-8" />
+    </Style>
+    <Style BasedOn="{StaticResource {x:Type ui:Button}}" TargetType="ui:Button">
+        <Setter Property="Margin" Value="0,0,8,0" />
+    </Style>
+
+    <Style BasedOn="{StaticResource {x:Type ui:CardExpander}}" TargetType="ui:CardExpander">
+        <Setter Property="Margin" Value="0,0,0,12" />
+    </Style>
+
+    <!-- Строка настроек: значок | заголовок и описание | элемент управления -->
+    <Style TargetType="views:CardRow">
+        <Setter Property="Margin" Value="0,0,0,8" />
+        <Setter Property="MinHeight" Value="72" />
+        <Setter Property="Focusable" Value="False" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="views:CardRow">
+                    <Border
+                        Padding="20,16"
+                        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                        BorderThickness="1"
+                        CornerRadius="8">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <ContentPresenter
+                                Grid.Column="0"
+                                Width="24"
+                                Margin="0,0,16,0"
+                                VerticalAlignment="Center"
+                                Content="{TemplateBinding Icon}"
+                                TextElement.FontSize="20"
+                                TextElement.Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                            <StackPanel x:Name="RowText" Grid.Column="1" VerticalAlignment="Center" Margin="0,0,16,0">
+                                <TextBlock Text="{TemplateBinding Title}" FontWeight="Medium" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                                <TextBlock
+                                    FontSize="13"
+                                    LineHeight="18"
+                                    Margin="0,4,0,0"
+                                    Text="{TemplateBinding Description}"
+                                    TextWrapping="Wrap"
+                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                    Visibility="{Binding Description, RelativeSource={RelativeSource TemplatedParent}, Converter={StaticResource VisibleWhen}}" />
+                            </StackPanel>
+                            <ContentPresenter x:Name="RowControl" Grid.Column="2" VerticalAlignment="Center" Content="{TemplateBinding Content}" />
+                        </Grid>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <MultiDataTrigger>
+                            <MultiDataTrigger.Conditions>
+                                <Condition Binding="{Binding ActualWidth, RelativeSource={RelativeSource Self}, Converter={StaticResource WidthBelow}, ConverterParameter=600}" Value="True" />
+                                <Condition Binding="{Binding Content.ActualWidth, RelativeSource={RelativeSource Self}, Converter={StaticResource WidthBelow}, ConverterParameter=100}" Value="False" />
+                            </MultiDataTrigger.Conditions>
+                            <Setter TargetName="RowText" Property="Grid.ColumnSpan" Value="2" />
+                            <Setter TargetName="RowText" Property="Margin" Value="0" />
+                            <Setter TargetName="RowControl" Property="Grid.Row" Value="1" />
+                            <Setter TargetName="RowControl" Property="Grid.Column" Value="1" />
+                            <Setter TargetName="RowControl" Property="Grid.ColumnSpan" Value="2" />
+                            <Setter TargetName="RowControl" Property="HorizontalAlignment" Value="Left" />
+                            <Setter TargetName="RowControl" Property="Margin" Value="0,12,0,0" />
+                        </MultiDataTrigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Плитка показателя -->
+    <Style TargetType="views:Tile">
+        <Setter Property="MinHeight" Value="84" />
+        <Setter Property="Focusable" Value="False" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="views:Tile">
+                    <Border
+                        Padding="16,14"
+                        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                        BorderThickness="1"
+                        CornerRadius="8">
+                        <StackPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <ContentPresenter Width="18" Margin="0,0,8,0" Content="{TemplateBinding Icon}" TextElement.FontSize="16"
+                                                  TextElement.Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                                <TextBlock Grid.Column="1" FontSize="13" Text="{TemplateBinding Caption}" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                            </Grid>
+                            <ContentPresenter Margin="0,8,0,0" Content="{TemplateBinding Content}" TextElement.FontSize="16"
+                                              TextElement.FontWeight="SemiBold" TextElement.Foreground="{DynamicResource TextFillColorPrimaryBrush}">
+                                <!-- Длинное значение обрезается многоточием; полный текст — в подсказке плитки. -->
+                                <ContentPresenter.Resources>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+                                    </Style>
+                                </ContentPresenter.Resources>
+                            </ContentPresenter>
+                        </StackPanel>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Бейдж без лишних отступов -->
+    <Style BasedOn="{StaticResource {x:Type ui:Badge}}" TargetType="ui:Badge">
+        <Setter Property="Padding" Value="8,2" />
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+</ResourceDictionary>

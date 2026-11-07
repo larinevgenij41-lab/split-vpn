@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.5",
+  "tag": "v0.15.5",
+  "releasedUtc": "2026-11-07T08:22:36Z",
+  "expiresUtc": "2027-01-06T08:22:36Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.5.msi",
+    "size": 64188276,
+    "sha256": "436e7c6960e45b6c0247754d0a04bd757dbd459c44f06178e77639e8f305f9de",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.5/SplitVpn-0.15.5.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.5.msi"
+    ]
+  },
+  "notes": "Новый Wi-Fi после сна или загрузки Windows подхватывается сразу, даже если в этот момент служба занята проверкой сети. Подключение Windows к тому же VPN-серверу теперь распознаётся и тогда, когда сервер в двух подключениях записан по-разному (имя и IP-адрес), и предупреждение появляется сразу, а не через 5 минут. В интерфейсе: понятнее меню значка в трее, подсказка в пустом списке подключений, заметный признак неполного архива диагностики.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.5",
+  "kid": "sv-2026-09-2"
+}
