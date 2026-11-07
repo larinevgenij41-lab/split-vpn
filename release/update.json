@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.6",
+  "tag": "v0.15.6",
+  "releasedUtc": "2026-11-07T15:27:24Z",
+  "expiresUtc": "2027-01-06T15:27:24Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.6.msi",
+    "size": 64208741,
+    "sha256": "4aaa062d1099e90431ceab007a6eb58515c78a96ebc139afeb5587d7a9d4c6bf",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.6/SplitVpn-0.15.6.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.6.msi"
+    ]
+  },
+  "notes": "Выпуск по итогам полной проверки программы. Главное: настройки больше не затираются, если окно открылось раньше, чем ответила служба; \"Отключить и восстановить интернет\" снимает защиту даже тогда, когда Windows не отпускает VPN-соединение; сохранённый пароль не пропадает из-за кратковременного сбоя Windows. Если сервер SSTP не присылает промежуточный сертификат, программа скачивает его сама, не открывая адрес другим программам.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.6",
+  "kid": "sv-2026-09-2"
+}

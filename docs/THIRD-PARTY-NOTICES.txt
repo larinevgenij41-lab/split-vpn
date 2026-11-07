@@ -1,0 +1,57 @@
+﻿Раздельный VPN — сторонние данные и компоненты
+
+Собственный код проекта распространяется по лицензии MIT (файл LICENSE в корне репозитория).
+Перечисленные ниже компоненты остаются под своими лицензиями. Библиотеки LGPL подключаются
+динамически отдельными DLL и заменяемы: собрать и подставить свою сборку можно без изменения
+остального кода (scripts/build-openconnect.sh). Списки адресов (RU-база и список обхода
+блокировок) в поставку не входят — их скачивает сама программа по выбору пользователя,
+условия их использования — у поставщиков списков.
+
+RU-база (список российских IP-сетей)
+------------------------------------
+Loyalsoldier/geoip — https://github.com/Loyalsoldier/geoip
+  Файл text/ru.txt формируется из GeoLite2 Country (MaxMind).
+  GeoLite2: This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com.
+  Лицензия данных GeoLite2: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0).
+  Код Loyalsoldier/geoip: MIT.
+ipverse/rir-ip — https://github.com/ipverse/rir-ip
+  Списки по стране регистрации из данных региональных регистраторов (RIR). Данные RIR — по условиям регистраторов;
+  формат агрегирования ipverse — MIT.
+
+Список обхода блокировок
+------------------------
+1andrevich/Re-filter-lists — https://github.com/1andrevich/Re-filter-lists
+  Файл ipsum.lst: подсети ресурсов, заблокированных в России, и ресурсов, закрытых для России. Обновляется ежедневно.
+  Лицензия: GPL-3.0.
+
+Программные компоненты
+----------------------
+WPF-UI (lepoco/wpfui) — MIT — https://github.com/lepoco/wpfui
+H.NotifyIcon (HavenDV/H.NotifyIcon) — MIT — https://github.com/HavenDV/H.NotifyIcon
+CommunityToolkit.Mvvm — MIT — https://github.com/CommunityToolkit/dotnet
+Serilog, Serilog.Sinks.File, Serilog.Extensions.Hosting — Apache-2.0 — https://serilog.net
+Microsoft.Windows.CsWin32 — MIT — https://github.com/microsoft/CsWin32
+Microsoft.Extensions.Hosting, Microsoft.Extensions.Hosting.WindowsServices — MIT — https://github.com/dotnet/runtime
+xunit.v3 — Apache-2.0 — https://xunit.net (только тесты)
+WiX Toolset 7 — OSMF Maintainer Fee License; бесплатно для личного использования — https://wixtoolset.org (только сборка установщика)
+
+Протокол Cisco AnyConnect (нативные библиотеки рядом с SplitVpn.OpenConnect.exe)
+-------------------------------------------------------------------------------
+Точные версии, SHA-256 архивов и адреса исходников — third_party/openconnect/manifest.json; полные тексты лицензий
+и README с условиями — в каталоге установки licenses\openconnect. Библиотеки подключаются динамически и заменяемы.
+OpenConnect 9.21 — LGPL-2.1-or-later — https://www.infradead.org/openconnect/
+  Изменение: compat.c — заголовок sec_api/stdlib_s.h заменён на stdlib.h (сборка в MSYS2 UCRT64).
+GnuTLS 3.8.13 — LGPL-2.1-or-later — https://www.gnutls.org/
+Nettle 4.0, GMP 6.3.0, libidn2 2.3.8 — LGPL-3.0-or-later или GPL-2.0-or-later (используется LGPL-3.0)
+libunistring 1.4.2 — LGPL-3.0-or-later или GPL-3.0-or-later (используется LGPL-3.0)
+libiconv 1.19, libintl (gettext 1.0), libtasn1 4.21.0 — LGPL-2.1-or-later
+p11-kit 0.26.5 — BSD-3-Clause; zstd 1.5.7 — BSD-3-Clause; lz4 1.10.0 — BSD-2-Clause; zlib 1.3.2 — Zlib
+libxml2 2.15.4, libffi 3.8.0, brotli 1.2.0 — MIT; winpthreads (mingw-w64) — MIT и BSD-3-Clause-Clear
+Wintun 0.14.1 (WireGuard LLC) — Prebuilt Binaries License, распространяется без изменений — https://www.wintun.net/
+Исходники LGPL-компонентов в использованных версиях предоставляются бесплатно по запросу; сборки пакетов MSYS2 —
+https://github.com/msys2/MINGW-packages.
+Встроенные средства Windows
+---------------------------
+SSTP-клиент (RAS/RasMan), Windows Filtering Platform, IP Helper, DPAPI — часть Windows; лицензия Windows.
+
+Тексты лицензий MIT, Apache-2.0 и BSD-3-Clause — https://opensource.org/licenses/MIT, https://www.apache.org/licenses/LICENSE-2.0 и https://opensource.org/licenses/BSD-3-Clause.

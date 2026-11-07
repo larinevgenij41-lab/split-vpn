@@ -1,0 +1,359 @@
+using System.Globalization;
+using System.Text;
+using Microsoft.Win32;
+using SplitVpn.Core.Ipc;
+using SplitVpn.Core.Net;
+using SplitVpn.Core.Policy;
+using SplitVpn.Windows.Net;
+using SplitVpn.Windows.Ras;
+using SplitVpn.Windows.Wfp;
+
+namespace SplitVpn.Windows.Diagnostics;
+
+/// <summary>Туннель службы для детектора: по LUID ищутся чужие маршруты, имя попадает в предупреждение.</summary>
+public sealed record ConflictTunnel(ulong Luid, string Name);
+
+/// <summary>
+/// Сервер подключения службы: чужое подключение Windows к нему же - отдельный, худший конфликт.
+/// <paramref name="Addresses"/> - адреса, в которые служба уже разрешила имя; пусто - туннеля ещё не было.
+/// </summary>
+public sealed record ConflictServer(string ProfileName, string Host, IReadOnlyList<uint> Addresses, Guid ProfileId = default);
+
+/// <summary>
+/// Что детектор знает о службе: поднятые туннели и серверы всех её подключений. <paramref name="Resolve"/>
+/// разрешает имя узла в IPv4-адреса (пусто - не разрешилось); null - имена не разрешаются, серверы
+/// сравниваются только по имени и известным адресам.
+/// </summary>
+public sealed record ConflictInputs(IReadOnlyList<ConflictTunnel> Tunnels, IReadOnlyList<ConflictServer> Servers,
+    Func<string, IReadOnlyList<uint>>? Resolve = null);
+
+/// <summary>
+/// Конфликты с другими программами, которые могут нарушить разделение или защиту:
+/// чужие активные VPN-соединения, чужие маршруты на нашем туннеле (постоянные маршруты PPP-интерфейсов),
+/// жёсткие разрешения WFP в sublayer с весом не ниже нашего.
+/// </summary>
+public static class ConflictDetector
+{
+    /// <summary>Сколько чужих маршрутов одного туннеля называть: остальные — той же природы.</summary>
+    private const int MaxRoutesPerTunnel = 3;
+
+    public static IReadOnlyList<StatusWarning> Detect(string ownPhonebook, IReadOnlyList<ConflictTunnel> tunnels,
+        IReadOnlyList<ConflictServer>? servers = null, Func<string, IReadOnlyList<uint>>? resolve = null)
+    {
+        ArgumentNullException.ThrowIfNull(tunnels);
+        var warnings = new List<StatusWarning>();
+        AddForeignConnections(warnings, ownPhonebook, servers ?? [], resolve);
+        if (tunnels.Count > 0)
+        {
+            AddForeignTunnelRoutes(warnings, tunnels);
+        }
+
+        AddHardPermits(warnings);
+        return warnings;
+    }
+
+    private static void AddForeignConnections(List<StatusWarning> warnings, string ownPhonebook, IReadOnlyList<ConflictServer> servers,
+        Func<string, IReadOnlyList<uint>>? resolve)
+    {
+        var own = FullPathOrSelf(ownPhonebook);
+        var cached = resolve is null ? null : CachedResolver(resolve);
+        foreach (var connection in RasClient.EnumerateConnections().Where(c => !IsOwn(c.Phonebook, own)))
+        {
+            var server = servers.Count == 0 ? null : RasPhonebook.TryReadServer(connection.Phonebook, connection.EntryName);
+            warnings.Add(ForeignConnectionWarning(connection.EntryName, server, servers, cached));
+        }
+    }
+
+    /// <summary>
+    /// Чужое подключение Windows к тому же серверу, что и подключение службы, - не просто лишние маршруты:
+    /// два сеанса одного пользователя сервер может связать с одним адресом туннеля, и пропадает связь у обоих.
+    /// </summary>
+    internal static StatusWarning ForeignConnectionWarning(string entryName, string? foreignServer, IReadOnlyList<ConflictServer> servers,
+        Func<string, IReadOnlyList<uint>>? resolve = null)
+    {
+        var same = SameServer(foreignServer, servers, resolve);
+        var text = same is null
+            ? $"Активно другое VPN-подключение «{entryName}»: его маршруты и DNS могут перехватывать трафик."
+            : $"Активно VPN-подключение Windows «{entryName}» к тому же серверу, что и «{same.ProfileName}»: "
+              + "два сеанса к одному серверу мешают друг другу, и интернет может пропадать. "
+              + $"Отключите «{entryName}» и его автоматическое подключение в параметрах VPN Windows.";
+        return new StatusWarning("foreign-vpn", text, null) { Subject = entryName, SameServerProfileId = same?.ProfileId };
+    }
+
+    /// <summary>
+    /// Подключение службы с тем же сервером: по имени узла, а если имена разные - по адресам. Адрес сервера
+    /// службы - известный ей или полученный разрешением имени; адрес чужого сервера - IP-адрес из записи или
+    /// результат разрешения её имени. Так совпадают и "имя против адреса", и два имени одного сервера.
+    /// </summary>
+    internal static ConflictServer? SameServer(string? foreignServer, IReadOnlyList<ConflictServer> servers, Func<string, IReadOnlyList<uint>>? resolve = null)
+    {
+        if (string.IsNullOrWhiteSpace(foreignServer))
+        {
+            return null;
+        }
+
+        var host = ServerAddress.TryParse(foreignServer, out var parsed) ? parsed.Host : foreignServer.Trim();
+        var byName = servers.FirstOrDefault(s => string.Equals(Normalize(s.Host), Normalize(host), StringComparison.OrdinalIgnoreCase));
+        if (byName is not null)
+        {
+            return byName;
+        }
+
+        var foreign = AddressesOf(host, resolve);
+        if (foreign.Count == 0)
+        {
+            return null;
+        }
+
+        return servers.FirstOrDefault(s => s.Addresses.Concat(s.Addresses.Count > 0 ? [] : AddressesOf(s.Host, resolve)).Any(foreign.Contains));
+    }
+
+    /// <summary>IP-адрес узла как есть; имя - через разрешение, если оно доступно.</summary>
+    private static IReadOnlyList<uint> AddressesOf(string host, Func<string, IReadOnlyList<uint>>? resolve)
+    {
+        var name = Normalize(host);
+        if (Ipv4.TryParse(name, out var address))
+        {
+            return [address];
+        }
+
+        return name.Length == 0 || resolve is null ? [] : resolve(name);
+    }
+
+    /// <summary>Одно разрешение на имя за проверку: чужих подключений и серверов службы может быть несколько.</summary>
+    private static Func<string, IReadOnlyList<uint>> CachedResolver(Func<string, IReadOnlyList<uint>> resolve)
+    {
+        var cache = new Dictionary<string, IReadOnlyList<uint>>(StringComparer.OrdinalIgnoreCase);
+        return host =>
+        {
+            if (!cache.TryGetValue(host, out var addresses))
+            {
+                addresses = resolve(host);
+                cache[host] = addresses;
+            }
+
+            return addresses;
+        };
+    }
+
+    private static string Normalize(string host) => host.Trim().TrimEnd('.');
+
+    /// <summary>
+    /// Соединение своей телефонной книги. У соединения без записи (RAS вернул пустой путь) полного пути нет:
+    /// Path.GetFullPath бросил бы ArgumentException, а само соединение — заведомо чужое.
+    /// </summary>
+    private static bool IsOwn(string? phonebook, string own) =>
+        own.Length > 0 && !string.IsNullOrWhiteSpace(phonebook)
+        && string.Equals(FullPathOrSelf(phonebook), own, StringComparison.OrdinalIgnoreCase);
+
+    private static string FullPathOrSelf(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return "";
+        }
+
+        try
+        {
+            return Path.GetFullPath(path);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or IOException or System.Security.SecurityException)
+        {
+            return path;
+        }
+    }
+
+    private static void AddForeignTunnelRoutes(List<StatusWarning> warnings, IReadOnlyList<ConflictTunnel> tunnels)
+    {
+        // Windows сам ставит на каждый интерфейс 224.0.0.0/4, 255.255.255.255/32 и маршруты link-local — это не конфликт.
+        var foreign = NetInventory.ReadRoutesV4()
+            .Where(r => r.RouteMetric != RouteOps.MarkerMetric && r.Destination.PrefixLength is > 1 and < 32)
+            .Where(r => !IsLinkLocalOrMulticast(r.Destination))
+            .ToList();
+        if (foreign.Count == 0)
+        {
+            return;
+        }
+
+        // Телефонные книги Windows читаются только когда чужой маршрут уже найден.
+        var profiles = new Lazy<List<WindowsVpnEntry>>(ReadWindowsVpnEntries);
+        var tunnelLuids = tunnels.Select(t => t.Luid).ToHashSet();
+        var localNetworks = LocalNetworks(foreign, tunnelLuids);
+        foreach (var tunnel in tunnels)
+        {
+            var reported = 0;
+            foreach (var destination in foreign.Where(r => r.InterfaceLuid == tunnel.Luid).Select(r => r.Destination).Distinct())
+            {
+                if (reported == MaxRoutesPerTunnel)
+                {
+                    break;
+                }
+
+                // Маршрут без записи в профилях Windows выдал при подключении сам сервер VPN (сети за ним, его
+                // собственная подсеть). Частная сеть за сервером опасна, только если перехватывает локальную сеть
+                // другого адаптера: маршрут не шире этой сети выигрывает у неё. Публичная — всегда: она может увести
+                // в туннель адреса, которые идут напрямую.
+                var source = SourceProfile(profiles.Value, destination);
+                var hijacks = localNetworks.FirstOrDefault(n => Overlaps(n, destination) && destination.PrefixLength >= n.PrefixLength);
+                var isPrivate = RangeSet.From([destination.ToRange()]).Subtract(SpecialRanges.Private).Count == 0;
+                if (source is null && isPrivate && hijacks == default)
+                {
+                    continue;
+                }
+
+                reported++;
+                warnings.Add(new StatusWarning("foreign-routes",
+                    $"На туннеле «{tunnel.Name}» чужой маршрут {destination}"
+                    + (source is not null ? $" — вероятно, постоянный маршрут VPN-профиля Windows «{source}»."
+                        : hijacks != default ? $": он перехватывает локальную сеть {hijacks}." : "."), null)
+                {
+                    Subject = tunnel.Name,
+                });
+            }
+        }
+    }
+
+    /// <summary>Сети других адаптеров, доступные без шлюза: маршруты к ним без следующего узла, кроме адресов узлов.</summary>
+    private static List<Ipv4Cidr> LocalNetworks(IEnumerable<RouteEntry> routes, HashSet<ulong> tunnelLuids) =>
+        routes.Where(r => !tunnelLuids.Contains(r.InterfaceLuid) && r.NextHop == 0 && r.Destination.PrefixLength is >= 8 and <= 30)
+            .Select(r => r.Destination)
+            .Distinct()
+            .ToList();
+
+    private static bool Overlaps(Ipv4Cidr a, Ipv4Cidr b) => a.Contains(b.Network) || b.Contains(a.Network);
+
+    private static bool IsLinkLocalOrMulticast(Ipv4Cidr cidr) =>
+        Ipv4Cidr.Parse("169.254.0.0/16").Contains(cidr.Network) || Ipv4Cidr.Parse("224.0.0.0/4").Contains(cidr.Network);
+
+    private static void AddHardPermits(List<StatusWarning> warnings)
+    {
+        var inventory = WfpInspector.Capture();
+        var ownKey = WfpIdentity.Product.SubLayerKey;
+        var ownWeight = inventory.SubLayers.FirstOrDefault(s => s.Key == ownKey)?.Weight ?? ushort.MaxValue;
+        var risky = inventory.SubLayers.Where(s => s.Key != ownKey && s.Weight >= ownWeight && s.HardPermitCount > 0).ToList();
+        if (risky.Count > 0)
+        {
+            warnings.Add(new StatusWarning("wfp-hard-permit",
+                $"Защита не гарантирована: другая программа разрешает трафик жёсткими правилами WFP ({string.Join(", ", risky.Select(s => s.Name))}).", null));
+        }
+    }
+
+    /// <summary>Запись телефонной книги Windows: имя и шестнадцатеричный список её маршрутов.</summary>
+    private sealed record WindowsVpnEntry(string Name, string Routes);
+
+    /// <summary>
+    /// Профиль Windows, которому прописан такой же маршрут. Маршруты профиля лежат в записи телефонной книги
+    /// («Routes=…») как шестнадцатеричный список: у каждого маршрута идут подряд семейство адресов (2 — IPv4),
+    /// длина префикса и сам адрес. По этой тройке и опознаётся источник.
+    /// </summary>
+    private static string? SourceProfile(IReadOnlyList<WindowsVpnEntry> entries, Ipv4Cidr destination)
+    {
+        var pattern = LittleEndian(2) + LittleEndian((uint)destination.PrefixLength) + BigEndian(destination.Network);
+        var found = entries.FirstOrDefault(e => e.Routes.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+        // Имя записи могло не прочитаться (телефонная книга в однобайтовой кодировке): тогда источник не называем.
+        return found is null || found.Name.Contains('�', StringComparison.Ordinal) ? null : found.Name;
+    }
+
+    private static string LittleEndian(uint value) =>
+        string.Create(CultureInfo.InvariantCulture, $"{(byte)value:X2}{(byte)(value >> 8):X2}{(byte)(value >> 16):X2}{(byte)(value >> 24):X2}");
+
+    private static string BigEndian(uint value) =>
+        string.Create(CultureInfo.InvariantCulture, $"{(byte)(value >> 24):X2}{(byte)(value >> 16):X2}{(byte)(value >> 8):X2}{(byte)value:X2}");
+
+    /// <summary>Телефонные книги VPN-профилей Windows: общая и по одной у каждого пользователя.</summary>
+    private static List<WindowsVpnEntry> ReadWindowsVpnEntries()
+    {
+        var entries = new List<WindowsVpnEntry>();
+        foreach (var (path, root) in WindowsPhonebooks())
+        {
+            try
+            {
+                ReadPhonebook(path, root, entries);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException or ArgumentException or NotSupportedException)
+            {
+                // Телефонная книга недоступна: источник чужого маршрута просто не будет назван.
+            }
+        }
+
+        return entries;
+    }
+
+    private const string PhonebookSuffix = @"Microsoft\Network\Connections\Pbk\rasphone.pbk";
+
+    /// <summary>
+    /// Путь книги и каталог, за пределы которого её настоящий путь уходить не должен: сам каталог Pbk, так что
+    /// подмена его или любого каталога выше ссылкой на другое место отвергается.
+    /// </summary>
+    private static IEnumerable<(string Path, string Root)> WindowsPhonebooks()
+    {
+        var common = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), PhonebookSuffix);
+        yield return (common, Path.GetDirectoryName(common)!);
+        string[] users;
+        try
+        {
+            var configured = Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList", "ProfilesDirectory", null) as string;
+            var root = Environment.ExpandEnvironmentVariables(string.IsNullOrWhiteSpace(configured) ? @"%SystemDrive%\Users" : configured);
+            users = Directory.Exists(root) ? Directory.GetDirectories(root) : [];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException or ArgumentException)
+        {
+            users = [];
+        }
+
+        foreach (var user in users)
+        {
+            var path = Path.Combine(user, "AppData", "Roaming", PhonebookSuffix);
+            yield return (path, Path.GetDirectoryName(path)!);
+        }
+    }
+
+    /// <summary>
+    /// Разбор телефонной книги: имена записей и их маршруты. Файл текстовый, строки «ключ=значение».
+    /// Книга лежит в профиле пользователя, а служба читает её правами SYSTEM: каталог, подменённый ссылкой
+    /// на чужой файл, канал или файл под блокировкой, не читается (<see cref="Security.ConfinedFile"/>),
+    /// а размер проверяется у уже открытого файла.
+    /// </summary>
+    private static void ReadPhonebook(string path, string root, List<WindowsVpnEntry> entries)
+    {
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        using var stream = Security.ConfinedFile.OpenRead(path, root);
+        if (stream is null || stream.Length > 4 * 1024 * 1024)
+        {
+            return;
+        }
+
+        var name = "";
+        var routes = new StringBuilder();
+        // Кодировка книги зависит от системы: нечитаемые символы заменяются, такие имена в текст не попадут.
+        using var reader = new StreamReader(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        while (reader.ReadLine() is { } line)
+        {
+            var text = line.Trim();
+            if (text.StartsWith('[') && text.EndsWith(']'))
+            {
+                Flush(entries, name, routes);
+                name = text[1..^1];
+                routes.Clear();
+            }
+            else if (text.StartsWith("Routes=", StringComparison.OrdinalIgnoreCase))
+            {
+                routes.Append(text["Routes=".Length..]);
+            }
+        }
+
+        Flush(entries, name, routes);
+    }
+
+    private static void Flush(List<WindowsVpnEntry> entries, string name, StringBuilder routes)
+    {
+        if (name.Length > 0 && routes.Length > 0)
+        {
+            entries.Add(new WindowsVpnEntry(name, routes.ToString()));
+        }
+    }
+}
