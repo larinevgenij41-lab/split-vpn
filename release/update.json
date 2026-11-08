@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.7",
+  "tag": "v0.15.7",
+  "releasedUtc": "2026-11-08T20:48:09Z",
+  "expiresUtc": "2027-01-07T20:48:09Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.7.msi",
+    "size": 64212837,
+    "sha256": "b779979bd51433d88879e5d295304912470598dd9108f2eae8a0dfc0f801ca63",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.7/SplitVpn-0.15.7.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.7.msi"
+    ]
+  },
+  "notes": "Исправления по итогам проверки всего кода. Главное: при отключении VPN обычный DNS возвращается всем адаптерам, даже если на одном из них это не удалось; компьютер, который подключается к провайдеру сам по PPPoE (без роутера), теперь работает с программой, а не остаётся без интернета.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.7",
+  "kid": "sv-2026-09-2"
+}
