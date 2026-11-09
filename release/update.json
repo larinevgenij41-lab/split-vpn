@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.9",
+  "tag": "v0.15.9",
+  "releasedUtc": "2026-11-09T11:59:53Z",
+  "expiresUtc": "2027-01-08T11:59:53Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.9.msi",
+    "size": 64220998,
+    "sha256": "316f28d4c1453b01b0222f5ff266e58a3d3d0aa0afa75744d884416a49bfe0f6",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.9/SplitVpn-0.15.9.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.9.msi"
+    ]
+  },
+  "notes": "Исправления по разбору сбоя при запуске Windows. После включения компьютера Windows примерно через 30 секунд сама сбрасывала Wi-Fi, считая сеть \"без интернета\": её проверка интернета упиралась в защиту, пока VPN ещё поднимался. Сброс обрывал только что поднятый VPN, а сервер ещё пару минут держал оборванный сеанс, и интернета не было 2-3 минуты.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.9",
+  "kid": "sv-2026-09-2"
+}
