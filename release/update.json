@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.8",
+  "tag": "v0.15.8",
+  "releasedUtc": "2026-11-09T09:46:58Z",
+  "expiresUtc": "2027-01-08T09:46:58Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.8.msi",
+    "size": 64220998,
+    "sha256": "39325497a631cb796efd55b1f9dd680fb0e44d48e5a0132a408fc1cb57889d2c",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.8/SplitVpn-0.15.8.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.8.msi"
+    ]
+  },
+  "notes": "Исправления по итогам двух кругов поиска ошибок. Главное: прямой трафик больше не блокируется, когда Windows выбирает не тот адаптер, что программа; после обновления программы корпоративный VPN сохраняет свой DNS; \"Восстановить сеть\" снимает блокировку и тогда, когда защиту держит чужая программа.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.8",
+  "kid": "sv-2026-09-2"
+}
