@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.12",
+  "tag": "v0.15.12",
+  "releasedUtc": "2026-11-10T14:19:25Z",
+  "expiresUtc": "2027-01-09T14:19:25Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.12.msi",
+    "size": 64229192,
+    "sha256": "7c7c76fafbfe44a24418dc8eab013fb6d6ee7f3df80261d65e50233f57b11b59",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.12/SplitVpn-0.15.12.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.12.msi"
+    ]
+  },
+  "notes": "Исправлен сбой сохранения настроек с ошибкой `startIndex`. Если удаление сохранённых данных входа завершится ошибкой или файл настроек не запишется, SplitVPN восстанавливает пароль VPN и общий ключ IPsec для прежних настроек.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.12",
+  "kid": "sv-2026-09-2"
+}
