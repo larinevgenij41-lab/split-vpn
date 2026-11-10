@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.13",
+  "tag": "v0.15.13",
+  "releasedUtc": "2026-11-10T20:25:34Z",
+  "expiresUtc": "2027-01-09T20:25:34Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.13.msi",
+    "size": 64225096,
+    "sha256": "a702e4025870fb3926b5088f6fe126273e0fe2aa8f86a6e12a4620121eaa462c",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.13/SplitVpn-0.15.13.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.13.msi"
+    ]
+  },
+  "notes": "Исправлены все 22 замечания расширенного ревью и отдельная гонка CNAME. Обновление повышает надёжность DNS, восстановления сети, загрузки обновлений и сохранения настроек.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.13",
+  "kid": "sv-2026-09-2"
+}
