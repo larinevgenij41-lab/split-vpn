@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.10",
+  "tag": "v0.15.10",
+  "releasedUtc": "2026-11-10T09:34:47Z",
+  "expiresUtc": "2027-01-09T09:34:47Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.10.msi",
+    "size": 64221000,
+    "sha256": "2a8e15345102198d8731a1cf0636dd8386d846abbf5e899e55ed7a92da257df0",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.10/SplitVpn-0.15.10.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.10.msi"
+    ]
+  },
+  "notes": "Устойчивее проверка интернета Windows при смене сети и обновлении DNS-адресов. Отвергнутые DNS-ответы больше не мешают другим доменным правилам. Уточнено переключение на резерв после обрыва, упрощены действия при ошибках подключения и недоступной службе.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.10",
+  "kid": "sv-2026-09-2"
+}
