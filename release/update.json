@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.11",
+  "tag": "v0.15.11",
+  "releasedUtc": "2026-11-10T12:00:33Z",
+  "expiresUtc": "2027-01-09T12:00:33Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.11.msi",
+    "size": 64237384,
+    "sha256": "b4652a0c553d492eed1ad30e448697f4784021bab1533a8c8bedd515677c2568",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.11/SplitVpn-0.15.11.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.11.msi"
+    ]
+  },
+  "notes": "Исправления DNS, проверки интернета Windows и интерфейса перевыпущены под номером 0.15.11. Обновление теперь отличается от ранее установленной 0.15.10 и может быть предложено автоматически. Состав исправлений совпадает с опубликованной 0.15.10.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.11",
+  "kid": "sv-2026-09-2"
+}
