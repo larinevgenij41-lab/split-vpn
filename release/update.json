@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.15",
+  "tag": "v0.15.15",
+  "releasedUtc": "2026-11-11T15:20:01Z",
+  "expiresUtc": "2027-01-10T15:20:01Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.15.msi",
+    "size": 64274263,
+    "sha256": "bba4570a8922831ab75c7449ebf0a274b12ff56edbd39bdb14f0fb1a93494e9b",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.15/SplitVpn-0.15.15.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.15.msi"
+    ]
+  },
+  "notes": "Удобнее добавление и редактирование VPN. Введённые пароль и ключ IPsec сохраняются при переключении между подключениями, перезагрузке страницы и ошибках сохранения.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.15",
+  "kid": "sv-2026-09-2"
+}
