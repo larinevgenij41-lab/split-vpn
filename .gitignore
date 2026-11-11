@@ -1,0 +1,33 @@
+﻿bin/
+obj/
+*.user
+*.suo
+.vs/
+TestResults/
+logs/
+artifacts/
+*.etl
+*.pcapng
+*.pbk
+*.msi
+*.wixpdb
+*.log
+secret.bin
+secrets.bin
+
+*.jks
+*.keystore
+*.apk
+*.aab
+
+# OpenConnect: рабочие каталоги сборки и готовые DLL (воспроизводятся скриптом по хешам)
+third_party/openconnect/work/
+third_party/openconnect/bin/
+*.dll
+
+# Ключи и сертификаты не хранятся в репозитории
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer

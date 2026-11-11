@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.14",
+  "tag": "v0.15.14",
+  "releasedUtc": "2026-11-11T14:17:21Z",
+  "expiresUtc": "2027-01-10T14:17:21Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.14.msi",
+    "size": 64257879,
+    "sha256": "fe6bedc8d5971d9aa9038e69196335c64bcf93c5161cd8e647f943dd250d01cd",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.14/SplitVpn-0.15.14.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.14.msi"
+    ]
+  },
+  "notes": "Исправлены 15 замечаний ревью: защита доменной маршрутизации, сохранение настроек, повторный вход AnyConnect и восстановление пользовательского прокси. Добавлены 22 регрессионных сценария.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.14",
+  "kid": "sv-2026-09-2"
+}
