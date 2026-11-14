@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.17",
+  "tag": "v0.15.17",
+  "releasedUtc": "2026-11-14T20:17:38Z",
+  "expiresUtc": "2027-01-13T20:17:38Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.17.msi",
+    "size": 64290647,
+    "sha256": "3231014ec24a61eedc7ee443575460de8b9881f19cf0041e18fea369c1b63ad6",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.17/SplitVpn-0.15.17.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.17.msi"
+    ]
+  },
+  "notes": "VPN работает у всех пользователей компьютера. Если у одного из пользователей Windows настроено своё VPN-подключение к тому же серверу, служба разрывает его, а не теряет общий туннель.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.17",
+  "kid": "sv-2026-09-2"
+}
