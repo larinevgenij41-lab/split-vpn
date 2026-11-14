@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.16",
+  "tag": "v0.15.16",
+  "releasedUtc": "2026-11-14T06:42:02Z",
+  "expiresUtc": "2027-01-13T06:42:02Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.16.msi",
+    "size": 64274263,
+    "sha256": "f3cb8a701816577fc3cbd600c6a1e501be7e6b01879db310ca2e03ded3efc00b",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.16/SplitVpn-0.15.16.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.16.msi"
+    ]
+  },
+  "notes": "Исправлен сброс Wi-Fi после включения компьютера и после переподключения Wi-Fi. Исправление из 0.15.9 срабатывало не всегда: с 11 по 14 ноября Windows сбрасывала Wi-Fi при 4 загрузках из 6.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.16",
+  "kid": "sv-2026-09-2"
+}
