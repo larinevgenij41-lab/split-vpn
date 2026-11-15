@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.18",
+  "tag": "v0.15.18",
+  "releasedUtc": "2026-11-15T05:31:29Z",
+  "expiresUtc": "2027-01-14T05:31:29Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.18.msi",
+    "size": 64270167,
+    "sha256": "80a99e854326a74abfdbb653332b61458eed853db5d8642789f010ea48008d53",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.18/SplitVpn-0.15.18.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.18.msi"
+    ]
+  },
+  "notes": "Исправлена настоящая причина сброса Wi-Fi после включения компьютера и после переподключения Wi-Fi.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.18",
+  "kid": "sv-2026-09-2"
+}
