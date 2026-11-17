@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.16.0",
+  "tag": "v0.16.0",
+  "releasedUtc": "2026-11-17T18:20:35Z",
+  "expiresUtc": "2027-01-16T18:20:35Z",
+  "package": {
+    "fileName": "SplitVpn-0.16.0.msi",
+    "size": 75133018,
+    "sha256": "3461f062de6712cbf1de3119a58ddfbcb4859f9878b14eb983b00ff6404a3f7a",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.16.0/SplitVpn-0.16.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.16.0.msi"
+    ]
+  },
+  "notes": "Новый тип подключения \"VPN поверх SSH\": туннель через обычное соединение SSH с вашим сервером. Он проходит там, где провайдер обрывает SSTP, WireGuard и другие VPN. Через него идёт только TCP.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.16.0",
+  "kid": "sv-2026-09-2"
+}
