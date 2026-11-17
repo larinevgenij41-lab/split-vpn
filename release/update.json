@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.16.1",
+  "tag": "v0.16.1",
+  "releasedUtc": "2026-11-17T18:58:04Z",
+  "expiresUtc": "2027-01-16T18:58:04Z",
+  "package": {
+    "fileName": "SplitVpn-0.16.1.msi",
+    "size": 75149402,
+    "sha256": "f9d2c10c28056cecf9e0063e4c1539e91c35efd255f3b5cc911049b3d11f30fb",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.16.1/SplitVpn-0.16.1.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.16.1.msi"
+    ]
+  },
+  "notes": "Обновление повышает надёжность VPN поверх SSH. При сбоях служба перебирает адреса сервера и обновляет их через DNS. Пробы связи прекращаются при отключении. При сохранении профиля служба проверяет ключ устройства, а утилита обнаруживает одновременное изменение настроек другим клиентом.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.16.1",
+  "kid": "sv-2026-09-2"
+}

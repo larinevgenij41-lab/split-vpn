@@ -1,0 +1,69 @@
+{
+  "comment": "Нативные зависимости протокола AnyConnect. Сборка: scripts\\build-openconnect.sh (MSYS2 UCRT64), результат — third_party\\openconnect\\bin (не в git). Хеши входов проверяет скрипт сборки, хеши готовых DLL (binaries) — scripts\\build-installer.ps1: другой состав или другой байт в bin останавливает сборку установщика. Пересобранные libopenconnect-5.dll и ocshim.dll могут отличаться побайтно (метка времени компоновщика): новые хеши вносятся сюда отдельным коммитом после проверки.",
+  "binaries": {
+    "libbrotlicommon.dll": "c62c08223e450dfc2fff33c752cc228505ffd9d755201958ba800d5d30481a2c",
+    "libbrotlidec.dll": "e270b6e576594ee8ee6e33ccc54e34a54304616dd6225652e11e49d6f17ef896",
+    "libbrotlienc.dll": "82573820fe9cc3f57004b6603428e2fa1bfc9d2048707bfcead3cfc5ef3ab284",
+    "libffi-8.dll": "f96cf79b75f33a10023d001673b564538023395c94b3c58e1db53114976a7c25",
+    "libgmp-10.dll": "c2567ccf3f410c3411ba7cd4b7ba14f393a0e70a1d0c0593297df6706b5fba96",
+    "libgnutls-30.dll": "f7f05c96572506c81f2ffa89b518234afa4af2603aad8903db257a4f1e97e9e6",
+    "libhogweed-7.dll": "b48e33181b78d715ba310581f4c72376c959854638bf635e1703e5fc1b783498",
+    "libiconv-2.dll": "94ec68fb8d342b6c91b6b48a8d95092819cdcd006a7166e0b68062f946afd08a",
+    "libidn2-0.dll": "a054a6bb69aaf4666157f968740412e9697085cbc1e48a78f8dd9622169c5aaf",
+    "libintl-8.dll": "0e5a178731e6be6d115442a6ade3df7f03265cd1fc4338f8b6f86a8001cbf582",
+    "liblz4.dll": "5e83fd34144fa033c12e22718317ec2123f8a3460903932b0bfddb8aad379cfd",
+    "libnettle-9.dll": "9b9f8bffca94d3cca7d1afb77d9deb0fa34427eaa05f1832037f46bc9e3dc134",
+    "libopenconnect-5.dll": "e2257f9954118af25896931e2f2d05788367835bd13d9c7abea1e515d8095ae4",
+    "libp11-kit-0.dll": "c24fcbd4d67f6f837a1cc29bd37a2980670febfa64b1a424720e5768ff91cfa8",
+    "libtasn1-6.dll": "9793128fa5028fe8d8b49407a6ed900a2315444f9f7444a146f0b62f08c1c5bb",
+    "libunistring-5.dll": "ee39258fa1086269674a8179d3cfaf7c4e380ada14441b5dd9ed53d82d15c4e3",
+    "libwinpthread-1.dll": "bbe82da090a3a135eb4209466142e28e97fc9d61d8d4070a8585cbc8a15ab970",
+    "libxml2-16.dll": "5cf84e4be1d9da56a6269b1bd18c8ab5fcce11087aa24002dfce57e46238455b",
+    "libzstd.dll": "48368ab0ca622d0ec12f41ce85d91f22866bf5da92c77a69a06483564c93816c",
+    "ocshim.dll": "999765f7b9d344a4e1ca9f9b5606033f01d0b73dd388f7ade57a63a50b7cabd7",
+    "wintun.dll": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+    "zlib1.dll": "11cd91171765cd65f1c3362e3df67e5f5a618a6b88c8cdec899b802eaf1c7b0d"
+  },
+  "openconnect": {
+    "version": "9.21",
+    "source": "https://www.infradead.org/openconnect/download/openconnect-9.21.tar.gz",
+    "signature": "https://www.infradead.org/openconnect/download/openconnect-9.21.tar.gz.asc",
+    "sha256": "5b32369467db6e5f317aa1ed12cfcbb81ed00bdbc765450b6bfcbdc300944a58",
+    "license": "LGPL-2.1-or-later",
+    "patches": [
+      "compat.c: #include <sec_api/stdlib_s.h> заменён на <stdlib.h> — в заголовках mingw-w64 14 каталога sec_api нет"
+    ],
+    "dlls": [ "libopenconnect-5.dll" ]
+  },
+  "wintun": {
+    "version": "0.14.1",
+    "source": "https://www.wintun.net/builds/wintun-0.14.1.zip",
+    "sha256": "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51",
+    "license": "Prebuilt Binaries License (распространение без изменений, LICENSE.txt в архиве)",
+    "dlls": [ "wintun.dll" ]
+  },
+  "ocshim": {
+    "source": "native/ocshim/ocshim.c",
+    "license": "собственный код SplitVpn",
+    "dlls": [ "ocshim.dll" ]
+  },
+  "msys2Repository": "https://repo.msys2.org/mingw/ucrt64/",
+  "packages": [
+    { "name": "mingw-w64-ucrt-x86_64-brotli", "version": "1.2.0-1", "sha256": "9cc89665496ea504751476eafba15c71c554aaf3004babc2004f7c07ffd60514", "license": "MIT", "home": "https://github.com/google/brotli", "dlls": [ "libbrotlicommon.dll", "libbrotlidec.dll", "libbrotlienc.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libffi", "version": "3.8.0-1", "sha256": "99ad12f4ecfa00a889ef9c5c0188592368a5bac109d0c508ce4e04f29ea95a76", "license": "MIT", "home": "https://sourceware.org/libffi", "dlls": [ "libffi-8.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-gmp", "version": "6.3.0-2", "sha256": "e82a75968a556484a50084578238a84eb60fb93e34986fd6695c537975bd39ea", "license": "LGPL-3.0-or-later OR GPL-2.0-or-later", "home": "https://gmplib.org/", "dlls": [ "libgmp-10.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-gnutls", "version": "3.8.13-3", "sha256": "303da3babd11f545fcac647439298e8559951ce6a1086666faf8ad2a1f708be6", "license": "LGPL-2.1-or-later", "home": "https://www.gnutls.org/", "dlls": [ "libgnutls-30.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-nettle", "version": "4.0-1", "sha256": "47b49f1723ef2c75ff3042b6e463910c47cdffa3342e175b6409fb9d630e64ed", "license": "LGPL-3.0-or-later OR GPL-2.0-or-later", "home": "https://www.lysator.liu.se/~nisse/nettle", "dlls": [ "libhogweed-7.dll", "libnettle-9.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libiconv", "version": "1.19-1", "sha256": "9a500f38c2b91808741c62fae746b3e9110b33a1ecf5c30fa0c66dbedddf7e16", "license": "LGPL-2.1-or-later", "home": "https://www.gnu.org/software/libiconv/", "dlls": [ "libiconv-2.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libidn2", "version": "2.3.8-4", "sha256": "d5f4b5e9d99ff7b2a986d1dc0c73da2bcd93ba68462be7b1debbd6ef76371f57", "license": "LGPL-3.0-or-later OR GPL-2.0-or-later", "home": "https://www.gnu.org/software/libidn/#libidn2", "dlls": [ "libidn2-0.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-gettext-runtime", "version": "1.0-1", "sha256": "ba693dda4ac375af76ce481ff3a6e7481286546cc7dc6d56c7021dae34084157", "license": "LGPL-2.1-or-later (libintl)", "home": "https://www.gnu.org/software/gettext/", "dlls": [ "libintl-8.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-lz4", "version": "1.10.0-1", "sha256": "00a807df81a4b7e82445178b8625962ed592cf1f0a08a8e04c8b9338c4362638", "license": "BSD-2-Clause (библиотека)", "home": "https://lz4.github.io/lz4/", "dlls": [ "liblz4.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-p11-kit", "version": "0.26.5-1", "sha256": "6e1645f0afa669f3e3325abb891d79c58dacf0bb5f9bb1ea719d22da1d754e62", "license": "BSD-3-Clause", "home": "https://p11-glue.freedesktop.org/p11-kit.html", "dlls": [ "libp11-kit-0.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libtasn1", "version": "4.21.0-1", "sha256": "d098b27834c3b25142b6f5aa9a0ca5731a8e4334c232786406cb149dd8bde2ba", "license": "LGPL-2.1-or-later (библиотека)", "home": "https://www.gnu.org/software/libtasn1/", "dlls": [ "libtasn1-6.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libunistring", "version": "1.4.2-1", "sha256": "e784273da19bbdcc91cbb510b5e27c3ac021b026140734eefcce5ccbd878bd97", "license": "LGPL-3.0-or-later OR GPL-3.0-or-later", "home": "https://www.gnu.org/software/libunistring", "dlls": [ "libunistring-5.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libwinpthread", "version": "14.0.0.r375.g9c1abbbf5-1", "sha256": "61d340fe8eebc77ee821badca246827fe90545e99685e503bdea16a8d25df512", "license": "MIT AND BSD-3-Clause-Clear", "home": "https://www.mingw-w64.org/", "dlls": [ "libwinpthread-1.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-libxml2", "version": "2.15.4-1", "sha256": "ea6b8e7ee24d8674e719f1f0a1b3747a72158ab786dfc5392ccb9f8edd09582a", "license": "MIT", "home": "https://gitlab.gnome.org/GNOME/libxml2", "dlls": [ "libxml2-16.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-zstd", "version": "1.5.7-2", "sha256": "dbdb8427280046a2b41697780aa4c52983b708082b0da4755951dc3bea96ca89", "license": "BSD-3-Clause", "home": "https://facebook.github.io/zstd/", "dlls": [ "libzstd.dll" ] },
+    { "name": "mingw-w64-ucrt-x86_64-zlib", "version": "1.3.2-2", "sha256": "841401182976d2f9e17e5c0ebaac51f2a8014140ea53d67625e91c8fb3c85ea0", "license": "Zlib", "home": "https://www.zlib.net/", "dlls": [ "zlib1.dll" ] }
+  ]
+}
