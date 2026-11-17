@@ -6,7 +6,8 @@ namespace SplitVpn.Service.Tests;
 /// <summary>Настоящие Windows API, только отдельная временная телефонная книга; дозвон не выполняется.</summary>
 public sealed class RasProtocolTests
 {
-    public static IEnumerable<object[]> Profiles() => Enum.GetValues<VpnProtocol>()
+    // «VPN поверх SSH» записи телефонной книги не имеет: туннель поднимает процесс движка, а не RAS.
+    public static IEnumerable<object[]> Profiles() => Enum.GetValues<VpnProtocol>().Where(p => p != VpnProtocol.SshVpn)
         .SelectMany(p => Enum.GetValues<AuthMethod>().Where(a => VpnProtocols.Supports(p, a)).Select(a => new object[] { p, a }));
 
     [Theory]

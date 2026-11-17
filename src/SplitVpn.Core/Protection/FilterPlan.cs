@@ -101,6 +101,12 @@ public sealed record RemoteRangesV4 : FilterCondition
     }
 }
 
+/// <summary>
+/// Удалённый адрес IPv4 не равен заданному. Только один адрес на фильтр: условия одного поля WFP объединяет
+/// через «или», и «не равно A или не равно B» совпало бы с любым адресом.
+/// </summary>
+public sealed record RemoteAddressNotV4(uint Address) : FilterCondition;
+
 public sealed record RemotePrefixV6(IPNetwork Network) : FilterCondition;
 
 public sealed record RemotePortCondition(ushort Port, bool NotEqual = false) : FilterCondition;
@@ -108,7 +114,7 @@ public sealed record RemotePortCondition(ushort Port, bool NotEqual = false) : F
 /// <summary>Локальный порт; для ICMP на слоях ALE здесь хранится тип сообщения.</summary>
 public sealed record LocalPortRange(ushort Low, ushort High) : FilterCondition;
 
-public sealed record ProtocolCondition(byte Protocol) : FilterCondition;
+public sealed record ProtocolCondition(byte Protocol, bool NotEqual = false) : FilterCondition;
 
 public sealed record LocalInterfaceCondition(ulong Luid, bool NotEqual) : FilterCondition;
 
@@ -157,6 +163,12 @@ public sealed record TunnelInput
 
     /// <summary>DNS этого туннеля: посреднику нужен доступ даже вне его адресных назначений.</summary>
     public IReadOnlyList<uint> DnsAddresses { get; init; } = [];
+
+    /// <summary>
+    /// «VPN поверх SSH»: единственный адрес сервера, на который настроен процесс движка в этом сеансе;
+    /// null - сеанса нет, движку закрыто всё.
+    /// </summary>
+    public uint? EngineServerAddress { get; init; }
 }
 
 /// <summary>Адрес и порт TCP узла проверки отзыва сертификата сервера (ссылка http из CRL или AIA).</summary>
@@ -184,6 +196,12 @@ public sealed record ProtectionInputs
     public IReadOnlyList<uint> ServiceDnsAddresses { get; init; } = [];
 
     public string ServiceExecutablePath { get; init; } = "";
+
+    /// <summary>
+    /// Путь к программе движка «VPN поверх SSH»; пусто - файла нет (тогда фильтры по приложению не строятся:
+    /// WFP не выдаёт идентификатор отсутствующего файла, а служба движок не запускает).
+    /// </summary>
+    public string SshEngineExecutablePath { get; init; } = "";
 
     public IReadOnlyList<Ipv4Cidr> OnLinkPrefixes { get; init; } = [];
 
@@ -213,6 +231,13 @@ public sealed record ProtectionInputs
 public static class FilterPlanBuilder
 {
     public const byte WeightLoopback = 15;
+
+    /// <summary>
+    /// Ограничения движка «VPN поверх SSH» и запрет UDP в его туннеле: высший вес, выше разрешений для доменов
+    /// и служебных узлов. Вес общий с петлевым разрешением, порядок между ними не определён: движок настроен
+    /// без локальных слушателей и петлевой интерфейс не использует.
+    /// </summary>
+    public const byte WeightEngineGuard = 15;
     public const byte WeightDomain = 14;
     public const byte WeightUserBlock = 13;
     public const byte WeightInfrastructure = 12;
@@ -480,6 +505,7 @@ public static class FilterPlanBuilder
         AddServerTransport(inputs, filters);
         AddServiceDns(inputs, filters);
         AddTunnelsAndOutage(inputs, filters);
+        AddSshEngineGuard(inputs, filters);
 
         if (inputs.LocalAccess)
         {
@@ -560,6 +586,49 @@ public static class FilterPlanBuilder
         }
     }
 
+    /// <summary>
+    /// «VPN поверх SSH». Процессу движка разрешён один путь: TCP на адрес и порт своего сервера через основной
+    /// адаптер. Всё остальное блокируется с высшим весом - даже то, что другим программам открывают правила
+    /// «напрямую», домены и служебные узлы: ошибка в настройках движка или в маршрутах не станет выходом мимо
+    /// туннеля и не замкнёт движок на собственный адаптер. Каждый фильтр несёт одно условие «не равно»; пакет
+    /// проходит, только если не совпал ни с одним. В самом туннеле блокируется UDP: SSH его не переносит, и
+    /// программа получает отказ сразу, а не ждёт ответа (браузер переходит с QUIC на TCP).
+    /// </summary>
+    private static void AddSshEngineGuard(ProtectionInputs inputs, List<FilterSpec> filters)
+    {
+        foreach (var tunnel in inputs.Tunnels.Where(t => t.Protocol == VpnProtocol.SshVpn))
+        {
+            if (tunnel.Luid is { } luid)
+            {
+                filters.Add(Spec("Туннель " + Describe(tunnel) + ": без UDP", FilterGroup.Runtime, FilterFamily.Both, WeightEngineGuard,
+                    FilterAction.Block, new ProtocolCondition(ProtocolUdp), new LocalInterfaceCondition(luid, NotEqual: false)));
+            }
+
+            if (string.IsNullOrEmpty(inputs.SshEngineExecutablePath))
+            {
+                continue;
+            }
+
+            var app = new AppIdCondition(inputs.SshEngineExecutablePath);
+            var name = "Движок SSH " + Describe(tunnel) + ": ";
+            if (inputs.PrimaryLuid is not { } primary || tunnel.EngineServerAddress is not { } server)
+            {
+                filters.Add(Spec(name + "нет сеанса", FilterGroup.Runtime, FilterFamily.Both, WeightEngineGuard, FilterAction.Block, app));
+                continue;
+            }
+
+            filters.Add(Spec(name + "только сервер", FilterGroup.Runtime, FilterFamily.V4, WeightEngineGuard, FilterAction.Block,
+                app, new RemoteAddressNotV4(server)));
+            filters.Add(Spec(name + "только порт сервера", FilterGroup.Runtime, FilterFamily.V4, WeightEngineGuard, FilterAction.Block,
+                app, new RemotePortCondition(tunnel.ServerPort, NotEqual: true)));
+            filters.Add(Spec(name + "только TCP", FilterGroup.Runtime, FilterFamily.V4, WeightEngineGuard, FilterAction.Block,
+                app, new ProtocolCondition(ProtocolTcp, NotEqual: true)));
+            filters.Add(Spec(name + "только основной адаптер", FilterGroup.Runtime, FilterFamily.V4, WeightEngineGuard, FilterAction.Block,
+                app, new LocalInterfaceCondition(primary, NotEqual: true)));
+            filters.Add(Spec(name + "без IPv6", FilterGroup.Runtime, FilterFamily.V6, WeightEngineGuard, FilterAction.Block, app));
+        }
+    }
+
     /// <summary>Какие пакеты пропустить к серверу: у каждого протокола свой транспорт.</summary>
     private static (byte Protocol, ushort? Port)[] Transports(TunnelInput tunnel) => tunnel.Protocol switch
     {
@@ -572,6 +641,7 @@ public static class FilterPlanBuilder
         VpnProtocol.AnyConnect => [
             .. tunnel.GatewayTcpPorts.Prepend(tunnel.ServerPort).Distinct().Select(p => (ProtocolTcp, (ushort?)p)),
             .. tunnel.GatewayUdpPorts.Prepend(tunnel.ServerPort).Distinct().Select(p => (ProtocolUdp, (ushort?)p))],
+        VpnProtocol.SshVpn => [(ProtocolTcp, tunnel.ServerPort)],
         _ => throw new InvalidOperationException("Неподдерживаемый протокол VPN."),
     };
 

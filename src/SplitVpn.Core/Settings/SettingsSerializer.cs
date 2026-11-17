@@ -161,6 +161,7 @@ public static class SettingsSerializer
         UserName = Text(profile.UserName),
         Eap = NormalizeEap(profile.Eap),
         AnyConnect = NormalizeAnyConnect(profile.AnyConnect),
+        SshVpn = (profile.SshVpn ?? new SshVpnSettings()) with { HostKey = Text(profile.SshVpn?.HostKey) },
         Retry = profile.Retry ?? new RetrySettings(),
     };
 

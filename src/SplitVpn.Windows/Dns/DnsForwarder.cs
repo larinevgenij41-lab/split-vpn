@@ -6,23 +6,47 @@ using SplitVpn.Core.Dns;
 
 namespace SplitVpn.Windows.Dns;
 
-/// <summary>Пересылка одного DNS-запроса upstream-серверу: UDP, при усечении — TCP.</summary>
+/// <summary>
+/// Пересылка одного DNS-запроса upstream-серверу: UDP, при усечении — TCP. Для пути, который UDP не переносит
+/// («VPN поверх SSH»), — сразу TCP.
+/// </summary>
 public static class DnsForwarder
 {
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(2);
 
+    /// <summary>Срок для пути «только TCP»: каждое обращение - новое соединение через туннель, это дольше UDP.</summary>
+    public static readonly TimeSpan TcpOnlyTimeout = TimeSpan.FromSeconds(4);
+
+    /// <summary>Срок запроса по пути: у пути «только TCP» он длиннее.</summary>
+    public static TimeSpan TimeoutFor(DnsRoute route) => (route ?? throw new ArgumentNullException(nameof(route))).TcpOnly ? TcpOnlyTimeout : DefaultTimeout;
+
     private const int MaxUdpDatagram = 65535;
 
-    public static async Task<byte[]?> ForwardAsync(byte[] query, IReadOnlyList<IPEndPoint> upstreams, uint? interfaceIndex, TimeSpan timeout, CancellationToken cancellationToken)
+    public static Task<byte[]?> ForwardAsync(byte[] query, IReadOnlyList<IPEndPoint> upstreams, uint? interfaceIndex, TimeSpan timeout, CancellationToken cancellationToken) =>
+        ForwardAsync(query, upstreams, interfaceIndex, timeout, tcpOnly: false, cancellationToken);
+
+    /// <param name="tcpOnly">
+    /// Не пробовать UDP вовсе. Без этого запрос через путь без UDP ждал бы весь срок и кончался отказом:
+    /// на TCP пересылка переходит только после усечённого ответа по UDP, а ответа не будет.
+    /// </param>
+    public static async Task<byte[]?> ForwardAsync(byte[] query, IReadOnlyList<IPEndPoint> upstreams, uint? interfaceIndex, TimeSpan timeout, bool tcpOnly, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(query);
         ArgumentNullException.ThrowIfNull(upstreams);
         foreach (var upstream in upstreams)
         {
-            var response = await TryUdpAsync(query, upstream, interfaceIndex, timeout, cancellationToken);
-            if (response is not null && DnsMessage.IsTruncated(response))
+            byte[]? response;
+            if (tcpOnly)
             {
-                response = await TryTcpAsync(query, upstream, interfaceIndex, timeout, cancellationToken) ?? response;
+                response = await TryTcpAsync(query, upstream, interfaceIndex, timeout, cancellationToken);
+            }
+            else
+            {
+                response = await TryUdpAsync(query, upstream, interfaceIndex, timeout, cancellationToken);
+                if (response is not null && DnsMessage.IsTruncated(response))
+                {
+                    response = await TryTcpAsync(query, upstream, interfaceIndex, timeout, cancellationToken) ?? response;
+                }
             }
 
             // SERVFAIL — временная ошибка сервера, а не окончательный ответ об имени.

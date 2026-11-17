@@ -12,7 +12,10 @@ public readonly record struct ServerAddress(string Host, ushort Port)
     /// <summary>Строка для поля RASENTRY: порт указывается, только если он нестандартный.</summary>
     public string ForPhonebook => Port == DefaultPort ? Host : string.Create(CultureInfo.InvariantCulture, $"{Host}:{Port}");
 
-    public static bool TryParse(string? text, out ServerAddress address)
+    public static bool TryParse(string? text, out ServerAddress address) => TryParse(text, DefaultPort, out address);
+
+    /// <summary>Разбор с портом по умолчанию своего протокола (например, 22 для SSH).</summary>
+    public static bool TryParse(string? text, ushort defaultPort, out ServerAddress address)
     {
         address = default;
         if (string.IsNullOrWhiteSpace(text))
@@ -24,7 +27,7 @@ public readonly record struct ServerAddress(string Host, ushort Port)
         var colon = trimmed.LastIndexOf(':');
         if (colon < 0)
         {
-            return IsHost(trimmed) && Assign(trimmed, DefaultPort, out address);
+            return IsHost(trimmed) && Assign(trimmed, defaultPort, out address);
         }
 
         var host = trimmed[..colon];

@@ -1640,7 +1640,9 @@ public sealed partial class Coordinator
         // У AnyConnect свои DNS шлюза: общий «DNS через VPN» из настроек к ним не относится.
         var upstream = tunnel.Protocol == VpnProtocol.AnyConnect ? [] : UpstreamDnsAddresses();
         var servers = upstream.Count > 0 ? upstream : tunnel.VpnDns.Count > 0 ? [.. tunnel.VpnDns] : FallbackUpstreams.ToList();
-        return new DnsRoute(servers.Select(Endpoint).ToList(), adapter.InterfaceIndex);
+
+        // «VPN поверх SSH» не переносит UDP: запросы к DNS через этот туннель идут сразу по TCP.
+        return new DnsRoute(servers.Select(Endpoint).ToList(), adapter.InterfaceIndex, TcpOnly: tunnel.Protocol == VpnProtocol.SshVpn);
     }
 
     /// <summary>Правила для доменов: имя разрешается по тому же пути, по которому пойдёт трафик.</summary>
@@ -1744,7 +1746,8 @@ public sealed partial class Coordinator
         && Describe(a.Local) == Describe(b.Local) && a.LocalSuffixes.SequenceEqual(b.LocalSuffixes)
         && DescribeDomains(a) == DescribeDomains(b);
 
-    private static string Describe(DnsRoute? route) => route is null ? "" : route.InterfaceIndex + ":" + string.Join(",", route.Servers);
+    private static string Describe(DnsRoute? route) =>
+        route is null ? "" : route.InterfaceIndex + ":" + string.Join(",", route.Servers) + (route.TcpOnly ? ":tcp" : "");
 
     private static string DescribeDomains(DnsProxyConfiguration configuration) =>
         string.Join("|", configuration.DomainRoutes.Select(d => d.Suffix + ">" + d.Target + ">" + d.PinAddresses + ">" + d.Unavailable + ">" + d.ExactName + ">" + d.PinContext + ">" + Describe(d.Route)));

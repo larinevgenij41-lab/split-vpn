@@ -18,6 +18,9 @@ public enum AuthMethod
 
     /// <summary>Вход по формам шлюза AnyConnect: SSO во встроенном браузере, пароль или сертификат — как решит сервер.</summary>
     GatewayForm,
+
+    /// <summary>Вход по закрытому ключу SSH, который хранит служба; пароль не нужен.</summary>
+    SshKey,
 }
 
 public enum IpsecAuthentication
@@ -58,6 +61,13 @@ public sealed record AnyConnectSettings
     /// <summary>Ручные правила важнее сетей шлюза: адрес под правилом пользователя не уходит в туннель шлюза,
     /// даже если шлюз прислал охватывающую сеть; по умолчанию включено.</summary>
     public bool UserRulesOverrideServerNetworks { get; init; } = true;
+}
+
+/// <summary>Параметры подключения «VPN поверх SSH» (движок запускается отдельным процессом службы).</summary>
+public sealed record SshVpnSettings
+{
+    /// <summary>Закреплённый открытый ключ сервера в виде «тип base64»; обязателен, без него подключение не поднимается.</summary>
+    public string HostKey { get; init; } = "";
 }
 
 public enum AdapterSelection
@@ -143,6 +153,8 @@ public sealed record ConnectionProfile
     public EapSettings Eap { get; init; } = new();
 
     public AnyConnectSettings AnyConnect { get; init; } = new();
+
+    public SshVpnSettings SshVpn { get; init; } = new();
 
     public bool SavePassword { get; init; } = true;
 

@@ -21,7 +21,8 @@ public enum DnsProxyMode
 }
 
 /// <summary>Маршрут пересылки: список серверов и интерфейс, через который им отправлять запросы.</summary>
-public sealed record DnsRoute(IReadOnlyList<IPEndPoint> Servers, uint? InterfaceIndex);
+/// <param name="TcpOnly">Путь не переносит UDP («VPN поверх SSH»): запросы идут сразу по TCP.</param>
+public sealed record DnsRoute(IReadOnlyList<IPEndPoint> Servers, uint? InterfaceIndex, bool TcpOnly = false);
 
 /// <summary>
 /// Правило для домена: имена под этим суффиксом разрешаются по своему пути, а полученные адреса
@@ -975,7 +976,7 @@ public sealed class DnsProxyServer : IAsyncDisposable
             byte[]? result = null;
             try
             {
-                result = await DnsForwarder.ForwardAsync(query, route.Servers, route.InterfaceIndex, DnsForwarder.DefaultTimeout, _stop.Token);
+                result = await DnsForwarder.ForwardAsync(query, route.Servers, route.InterfaceIndex, DnsForwarder.TimeoutFor(route), route.TcpOnly, _stop.Token);
             }
             catch (Exception ex) when (ex is OperationCanceledException or SocketException or IOException or ObjectDisposedException)
             {

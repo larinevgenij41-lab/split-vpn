@@ -49,6 +49,7 @@ public static class SettingsValidator
         ValidateRoutingFolders(model, errors);
         ValidateTargets(model, errors, warnings);
         ValidateAnyConnect(model, errors);
+        ValidateSshVpn(model, errors);
         ValidateDomainRules(model, errors);
         ValidateLocalSuffixes(model, errors);
 
@@ -432,6 +433,24 @@ public static class SettingsValidator
             {
                 errors.Add(Text($"Сети шлюза «{profile.Name}» нельзя направить в группу подключений."));
             }
+        }
+    }
+
+    /// <summary>
+    /// «VPN поверх SSH» в первой версии: одновременно поднимается одно такое подключение (у движка один адаптер
+    /// с постоянным адресом) и оно не входит в группы - распределение по блокам адресов рассчитано на туннели с UDP.
+    /// </summary>
+    private static void ValidateSshVpn(AppSettings settings, List<string> errors)
+    {
+        var profiles = settings.Profiles.Where(p => p.Protocol == VpnProtocol.SshVpn).ToList();
+        if (profiles.Count(p => p.Role != ProfileRole.Off) > 1)
+        {
+            errors.Add("Одновременно можно включить только одно подключение «VPN поверх SSH»: остальные выключите.");
+        }
+
+        foreach (var profile in profiles.Where(p => settings.Groups.Any(g => g.Members.Contains(p.Id))))
+        {
+            errors.Add(Text($"Подключение «VPN поверх SSH» «{profile.Name}» не может входить в группу подключений."));
         }
     }
 

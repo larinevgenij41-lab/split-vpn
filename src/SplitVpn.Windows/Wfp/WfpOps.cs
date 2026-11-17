@@ -269,11 +269,12 @@ public static unsafe class WfpOps
         LoopbackCondition => Uint32(PInvoke.FWPM_CONDITION_FLAGS, FWP_MATCH_TYPE.FWP_MATCH_FLAGS_ALL_SET, ConditionFlagIsLoopback),
         RemoteRangeV4 r when r.Start == r.End => Uint32(PInvoke.FWPM_CONDITION_IP_REMOTE_ADDRESS, FWP_MATCH_TYPE.FWP_MATCH_EQUAL, r.Start),
         RemoteRangeV4 r => Range32(PInvoke.FWPM_CONDITION_IP_REMOTE_ADDRESS, r.Start, r.End, arena),
+        RemoteAddressNotV4 n => Uint32(PInvoke.FWPM_CONDITION_IP_REMOTE_ADDRESS, FWP_MATCH_TYPE.FWP_MATCH_NOT_EQUAL, n.Address),
         RemotePrefixV6 p => PrefixV6(p, arena),
         RemotePortCondition p => Uint16(PInvoke.FWPM_CONDITION_IP_REMOTE_PORT, p.Port, p.NotEqual),
         LocalPortRange p when p.Low == p.High => Uint16(PInvoke.FWPM_CONDITION_IP_LOCAL_PORT, p.Low),
         LocalPortRange p => Range16(PInvoke.FWPM_CONDITION_IP_LOCAL_PORT, p.Low, p.High, arena),
-        ProtocolCondition p => Uint8(PInvoke.FWPM_CONDITION_IP_PROTOCOL, p.Protocol),
+        ProtocolCondition p => Uint8(PInvoke.FWPM_CONDITION_IP_PROTOCOL, p.Protocol, p.NotEqual),
         LocalInterfaceCondition i => Interface(i, arena),
         AppIdCondition a => Blob(PInvoke.FWPM_CONDITION_ALE_APP_ID, FWP_DATA_TYPE.FWP_BYTE_BLOB_TYPE, cache.AppId(a.ExecutablePath)),
         LocalSystemUserCondition => Blob(PInvoke.FWPM_CONDITION_ALE_USER_ID, FWP_DATA_TYPE.FWP_SECURITY_DESCRIPTOR_TYPE, cache.SystemOnlyDescriptor()),
@@ -296,9 +297,9 @@ public static unsafe class WfpOps
         return condition;
     }
 
-    private static FWPM_FILTER_CONDITION0 Uint8(Guid field, byte value)
+    private static FWPM_FILTER_CONDITION0 Uint8(Guid field, byte value, bool notEqual = false)
     {
-        var condition = new FWPM_FILTER_CONDITION0 { fieldKey = field, matchType = FWP_MATCH_TYPE.FWP_MATCH_EQUAL };
+        var condition = new FWPM_FILTER_CONDITION0 { fieldKey = field, matchType = notEqual ? FWP_MATCH_TYPE.FWP_MATCH_NOT_EQUAL : FWP_MATCH_TYPE.FWP_MATCH_EQUAL };
         condition.conditionValue.type = FWP_DATA_TYPE.FWP_UINT8;
         condition.conditionValue.uint8 = value;
         return condition;
