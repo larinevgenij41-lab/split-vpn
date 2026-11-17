@@ -1,0 +1,38 @@
+using System.Diagnostics;
+using System.Net.NetworkInformation;
+using SplitVpn.Core.SshTunnel;
+using SplitVpn.Windows.SshTunnel;
+
+namespace SplitVpn.Service.Tests;
+
+public sealed class SshEngineStartupTests
+{
+    [Fact]
+    public void OccupiedAdapterNameIsRejectedBeforeConfiguration()
+    {
+        var adapter = NetworkInterface.GetAllNetworkInterfaces().First();
+        Assert.Throws<IOException>(() => SystemSshTunnelOps.EnsureAliasAvailable(adapter.Name));
+    }
+
+    [Fact]
+    public async Task UnresponsiveChildIsStoppedAndConfigurationIsCleared()
+    {
+        var start = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"))
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            ArgumentList = { "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60" },
+        };
+        using var process = Process.Start(start)!;
+        var config = new byte[1024 * 1024];
+        Array.Fill(config, (byte)1);
+        var parameters = new SingBoxParameters
+        {
+            InterfaceName = Guid.NewGuid().ToString(), Server = 0, Port = 22, User = "test",
+            HostKey = new SshHostKey("ssh-ed25519", ""),
+        };
+        using var session = new SystemSshTunnelOps.Session(process, parameters, _ => { }, config, config.Length, TimeSpan.FromMilliseconds(300));
+        await session.Exited.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        Assert.False(config.AsSpan().ContainsAnyExcept((byte)0));
+    }
+}

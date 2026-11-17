@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.17.0",
+  "tag": "v0.17.0",
+  "releasedUtc": "2026-11-17T19:31:08Z",
+  "expiresUtc": "2027-01-16T19:31:08Z",
+  "package": {
+    "fileName": "SplitVpn-0.17.0.msi",
+    "size": 75149402,
+    "sha256": "04351e5f5fc5e9202c8a2b2178f284fcec9ea76bb5a37a703326725b1f48ae14",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.17.0/SplitVpn-0.17.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.17.0.msi"
+    ]
+  },
+  "notes": "На странице \"Маршрутизация\" появился поиск по сети, домену, папке и подключению. Папкам и отдельным правилам можно назначить низкий, обычный или высокий приоритет.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.17.0",
+  "kid": "sv-2026-09-2"
+}
