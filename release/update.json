@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.15.20",
+  "tag": "v0.15.20",
+  "releasedUtc": "2026-11-17T05:46:26Z",
+  "expiresUtc": "2027-01-16T05:46:26Z",
+  "package": {
+    "fileName": "SplitVpn-0.15.20.msi",
+    "size": 64282455,
+    "sha256": "0b8a55aa610300c680c84a910a8bdb0f2ac0fc1db430ebb6720e01cd0a61f8f6",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.15.20/SplitVpn-0.15.20.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.15.20.msi"
+    ]
+  },
+  "notes": "Исправлены ошибки, найденные проверкой кода выпусков 0.15.9-0.15.18. Версия 0.15.19 не выпускалась: её исправления входят в этот выпуск.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.15.20",
+  "kid": "sv-2026-09-2"
+}
