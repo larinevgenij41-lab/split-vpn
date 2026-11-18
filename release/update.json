@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.17.7",
+  "tag": "v0.17.7",
+  "releasedUtc": "2026-11-18T10:56:27Z",
+  "expiresUtc": "2027-01-17T10:56:27Z",
+  "package": {
+    "fileName": "SplitVpn-0.17.7.msi",
+    "size": 75169882,
+    "sha256": "8af48f8589f00237ecfb088bb458d87efe15f5482f790579294e805d5300b33c",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.17.7/SplitVpn-0.17.7.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.17.7.msi"
+    ]
+  },
+  "notes": "Исправлен отказ разрешения имён на всём компьютере, когда один из туннелей перестаёт отвечать. Зависший туннель держал запросы DNS по своим правилам до тайм-аута, и они занимали посредник программы целиком: не открывались и сайты, которые к этому туннелю не относятся. Теперь у каждого пути DNS своя доля запросов, лишние запросы к зависшему пути получают отказ сразу.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.17.7",
+  "kid": "sv-2026-09-2"
+}
