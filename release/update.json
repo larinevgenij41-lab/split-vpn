@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.17.5",
+  "tag": "v0.17.5",
+  "releasedUtc": "2026-11-18T10:04:33Z",
+  "expiresUtc": "2027-01-17T10:04:33Z",
+  "package": {
+    "fileName": "SplitVpn-0.17.5.msi",
+    "size": 75194458,
+    "sha256": "228a75dcb135feeee1004b807559150b9971728eb52d541fecb8e74fb9141c4a",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.17.5/SplitVpn-0.17.5.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.17.5.msi"
+    ]
+  },
+  "notes": "Программа больше не показывает ложные предупреждения о \"чужих маршрутах\" на туннелях: служебные маршруты Windows к собственному адресу адаптера и к широковещательным адресам подсетей конфликтом не считаются.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.17.5",
+  "kid": "sv-2026-09-2"
+}
