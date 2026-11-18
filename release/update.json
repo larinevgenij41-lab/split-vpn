@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.17.1",
+  "tag": "v0.17.1",
+  "releasedUtc": "2026-11-18T04:44:33Z",
+  "expiresUtc": "2027-01-17T04:44:33Z",
+  "package": {
+    "fileName": "SplitVpn-0.17.1.msi",
+    "size": 75157594,
+    "sha256": "569b33fb216f786e65fadce502c3e3c8f6279d9745f78237bd57bc49535475db",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.17.1/SplitVpn-0.17.1.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.17.1.msi"
+    ]
+  },
+  "notes": "Исправлен повторный запуск VPN поверх SSH после перезапуска службы. Если имя адаптера осталось занято устройством Wintun от предыдущего сеанса, служба сама запускает очистку и ждёт освобождения имени в фоне. Подключение возобновляется без запуска второго VPN-профиля для очистки адаптера.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.17.1",
+  "kid": "sv-2026-09-2"
+}
