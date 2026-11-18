@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.17.2",
+  "tag": "v0.17.2",
+  "releasedUtc": "2026-11-18T07:09:43Z",
+  "expiresUtc": "2027-01-17T07:09:43Z",
+  "package": {
+    "fileName": "SplitVpn-0.17.2.msi",
+    "size": 75194458,
+    "sha256": "8de3c6f9772de3da29783772cb8e4bff5c04a0ef281abbe3c03cedcc8488e2ca",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.17.2/SplitVpn-0.17.2.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.17.2.msi"
+    ]
+  },
+  "notes": "Исправлено восстановление подключения после обрыва и смены сети. Таймаут DNS больше не обрывает рабочие TCP-соединения через SSH. Служба точнее выбирает интерфейс RAS и проверяет работоспособность резервного пути. Обновление доменных правил требует меньше времени и памяти.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.17.2",
+  "kid": "sv-2026-09-2"
+}
