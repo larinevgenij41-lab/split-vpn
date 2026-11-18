@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.17.3",
+  "tag": "v0.17.3",
+  "releasedUtc": "2026-11-18T09:00:15Z",
+  "expiresUtc": "2027-01-17T09:00:15Z",
+  "package": {
+    "fileName": "SplitVpn-0.17.3.msi",
+    "size": 75169882,
+    "sha256": "df5f7bbf8a8ca257c61bacfc056b9f962e4ed454c5273ee503c6830822b3d207",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.17.3/SplitVpn-0.17.3.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.17.3.msi"
+    ]
+  },
+  "notes": "Исправлена ошибка Windows Filtering Platform (WFP), из-за которой в версии 0.17.2 могли перестать работать подключение к VPN и восстановление обычной сети. Команда «Восстановить сеть» теперь проверяет оставшиеся фильтры и маршруты Windows и сообщает, если очистка завершилась частично.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.17.3",
+  "kid": "sv-2026-09"
+}
