@@ -1,0 +1,20 @@
+{
+  "comment": "Движок подключения «VPN поверх SSH»: официальная сборка sing-box для Windows x64, без изменений. Программа запускается службой как отдельный процесс. Файл в git не хранится: scripts\\fetch-sing-box.ps1 скачивает архив выпуска, сверяет SHA-256 архива и программы с этим файлом и кладёт программу в third_party\\sing-box\\bin. scripts\\build-installer.ps1 сверяет хеш программы повторно. Пустой хеш означает, что версия ещё не закреплена: закрепление - fetch-sing-box.ps1 -Pin, отдельным коммитом после проверки файла.",
+  "version": "1.12.17",
+  "license": "GPL-3.0-or-later",
+  "homepage": "https://github.com/SagerNet/sing-box",
+  "archive": {
+    "name": "sing-box-1.12.17-windows-amd64.zip",
+    "url": "https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-windows-amd64.zip",
+    "sha256": "214623c436d4ad5bb513568e098a9e039d004641672a8fbc795d31d3b3e28b0a"
+  },
+  "executable": {
+    "name": "sing-box.exe",
+    "sha256": "94166c7c4142e4eb8df6ced07208ef286dd700155b9c70024c14f7c57b09149f"
+  },
+  "source": {
+    "name": "sing-box-1.12.17-source.tar.gz",
+    "url": "https://github.com/SagerNet/sing-box/archive/refs/tags/v1.12.17.tar.gz",
+    "sha256": "37188348531f669ead897afc8a2e96806f2f94150e48a78d2b24edacfd4f93f0"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.17.8",
+  "tag": "v0.17.8",
+  "releasedUtc": "2026-11-18T15:05:41Z",
+  "expiresUtc": "2027-01-17T15:05:41Z",
+  "package": {
+    "fileName": "SplitVpn-0.17.8.msi",
+    "size": 75198554,
+    "sha256": "514148fd552ea7d2d55d7745c2b1cacce36a9f96c67e89b23dec7df5b06c8011",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.17.8/SplitVpn-0.17.8.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.17.8.msi"
+    ]
+  },
+  "notes": "Зависшее подключение SSTP, IKEv2 или L2TP теперь обнаруживается за 10-15 секунд, а не за 60-75. Соединение с сервером может перестать пропускать данные, не разрываясь: так бывает при сбоях у провайдера. Windows замечает это только через минуту с лишним (код 829), и всё это время трафик через VPN стоит. Теперь служба сама следит за подключением: если от сервера перестали приходить данные и две пробы через туннель подряд остались без ответа, подключение разрывается и сразу поднимается заново.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.17.8",
+  "kid": "sv-2026-09-2"
+}
