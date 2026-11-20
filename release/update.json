@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.17.9",
+  "tag": "v0.17.9",
+  "releasedUtc": "2026-11-20T09:51:31Z",
+  "expiresUtc": "2027-01-19T09:51:31Z",
+  "package": {
+    "fileName": "SplitVpn-0.17.9.msi",
+    "size": 75206746,
+    "sha256": "5f7a60f08ebe859988749cd3e9b0ae490576b223d3b6f27c3047ac260cbafcd5",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.17.9/SplitVpn-0.17.9.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.17.9.msi"
+    ]
+  },
+  "notes": "Windows теперь может сама проверить интернет на основном адаптере при включённой защите. Раньше эта проверка не проходила никогда: Windows отправляет её запрос DNS с привязкой к адаптеру, а программа ставила адаптеру сервер DNS 127.0.0.1, до которого такой запрос не доходит (ошибка 10049). Проверка зависала на 30-35 секунд и повторялась по кругу. Вероятное следствие: после загрузки служба автонастройки WLAN считала подключение Wi-Fi ограниченным, на 32-й секунде перезапускала драйвер адаптера, а через минуту отключала Wi-Fi ещё на полминуты (событие 4003 в журнале \"Система\"). Оба раза обрыв…",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.17.9",
+  "kid": "sv-2026-09-2"
+}
