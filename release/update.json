@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.17.11",
+  "tag": "v0.17.11",
+  "releasedUtc": "2026-11-21T21:23:01Z",
+  "expiresUtc": "2027-01-20T21:23:01Z",
+  "package": {
+    "fileName": "SplitVpn-0.17.11.msi",
+    "size": 75198556,
+    "sha256": "08421a41740e8caab86c6d54f3fb7a5d9bc445161d739afcc8f9b2f177395c1a",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.17.11/SplitVpn-0.17.11.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.17.11.msi"
+    ]
+  },
+  "notes": "Исправлена вероятная причина перезапуска адаптера Wi-Fi после загрузки Windows. На части компьютеров Windows через 16 секунд после подключения Wi-Fi повторяла проверку безопасности, ещё через 16 перезапускала драйвер адаптера (событие 4003 в журнале \"Система\"), а через минуту отключала Wi-Fi ещё на минуту. Все подключения VPN при этом рвались. Запись загрузки показала: Windows начинает проверку интернета через сотую долю секунды после появления сети, а программа открывала для неё путь на полсекунды позже, и DNS-посредник в этот промежуток отвечал отказом сразу. Такой отказ Windows не повтор…",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.17.11",
+  "kid": "sv-2026-09-2"
+}
