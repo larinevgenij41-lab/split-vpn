@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.17.12",
+  "tag": "v0.17.12",
+  "releasedUtc": "2026-11-22T18:14:14Z",
+  "expiresUtc": "2027-01-21T18:14:14Z",
+  "package": {
+    "fileName": "SplitVpn-0.17.12.msi",
+    "size": 75194460,
+    "sha256": "864c942c05cf47768b57df758013f72ed4ce8fb30418a3ccdce915b5a0f68c4c",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.17.12/SplitVpn-0.17.12.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.17.12.msi"
+    ]
+  },
+  "notes": "Служба сама отключает в Windows автоматическое переподключение Wi-Fi при \"ограниченной связи\". На части компьютеров Windows под защитой программы после загрузки считала связь Wi-Fi плохой и восстанавливала адаптер: через 16 секунд после подключения повторяла проверку безопасности, ещё через 16 перезапускала драйвер (событие 4003 в журнале \"Система\"), а через минуту отключала Wi-Fi ещё на минуту. Все подключения VPN при этом рвались. Исправления 0.17.9 и 0.17.11 это не устранили.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.17.12",
+  "kid": "sv-2026-09-2"
+}
