@@ -19,6 +19,11 @@ internal static class ScaleScenario
     public static async Task<int> RunAsync(CliArgs args)
     {
         var report = new ScenarioReport("s1-scale");
+        if (!ProtoContext.RequireServiceStopped(report))
+        {
+            return await report.SaveAsync(args, []);
+        }
+
         try
         {
             var snapshot = NetInventory.Capture();

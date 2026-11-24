@@ -20,6 +20,11 @@ internal static class PersistScenario
     public static async Task<int> ApplyAsync(CliArgs args)
     {
         var report = new ScenarioReport("s5-apply");
+        if (!ProtoContext.RequireServiceStopped(report))
+        {
+            return await report.SaveAsync(args, []);
+        }
+
         try
         {
             var snapshot = NetInventory.Capture();
@@ -85,6 +90,12 @@ internal static class PersistScenario
     public static async Task<int> CheckAsync(CliArgs args)
     {
         var report = new ScenarioReport("s5-check");
+        // Восстановление снимает все маршруты с меткой, в том числе маршруты работающей службы.
+        if (!ProtoContext.RequireServiceStopped(report))
+        {
+            return await report.SaveAsync(args, []);
+        }
+
         var recovered = false;
         try
         {

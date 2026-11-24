@@ -48,18 +48,24 @@ internal static class DevCommands
         {
             var needles = new[] { Encoding.UTF8.GetBytes(password), Encoding.Unicode.GetBytes(password) };
             var roots = args.Values("--path");
-            var (files, hits) = (0, new List<string>());
+            var (files, hits, skipped) = (0, new List<string>(), new List<string>());
             foreach (var file in roots.SelectMany(Enumerate))
             {
                 files++;
-                if (Contains(file, needles))
+                switch (Contains(file, needles, out var problem))
                 {
-                    hits.Add(file);
+                    case true:
+                        hits.Add(file);
+                        break;
+                    case null:
+                        skipped.Add($"{file} ({problem})");
+                        break;
                 }
             }
 
-            Console.WriteLine($"Просмотрено файлов: {files}; совпадений: {hits.Count}");
+            Console.WriteLine($"Просмотрено файлов: {files}; совпадений: {hits.Count}; пропущено (не прочитаны): {skipped.Count}");
             hits.ForEach(h => Console.WriteLine("  СОВПАДЕНИЕ: " + h));
+            skipped.ForEach(s => Console.WriteLine("  ПРОПУЩЕН: " + s));
             foreach (var needle in needles)
             {
                 Array.Clear(needle);
@@ -78,24 +84,65 @@ internal static class DevCommands
         : Directory.Exists(root) ? Directory.EnumerateFiles(root, "*", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true })
         : [];
 
-    private static bool Contains(string file, byte[][] needles)
+    /// <summary>Есть ли в файле одна из игл; null — файл не прочитан (причина в <paramref name="problem"/>).</summary>
+    private static bool? Contains(string file, byte[][] needles, out string? problem)
     {
-        byte[] content;
+        problem = null;
         try
         {
             using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            content = new byte[stream.Length];
-            stream.ReadExactly(content);
+            return StreamContains(stream, needles);
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return false;
+            problem = ex.Message;
+            return null;
         }
-        catch (UnauthorizedAccessException)
+    }
+
+    /// <summary>
+    /// Потоковый поиск игл блоками: файл любого размера не читается в память целиком. Между блоками сохраняется
+    /// хвост длиной (самая длинная игла − 1), чтобы не пропустить совпадение на границе. Буфер с фрагментами
+    /// пароля стирается.
+    /// </summary>
+    internal static bool StreamContains(Stream stream, IReadOnlyList<byte[]> needles, int blockSize = 1 << 20)
+    {
+        var active = needles.Where(n => n.Length > 0).ToList();
+        if (active.Count == 0)
         {
             return false;
         }
 
-        return needles.Any(n => n.Length > 0 && content.AsSpan().IndexOf(n) >= 0);
+        var overlap = active.Max(n => n.Length) - 1;
+        var buffer = new byte[overlap + blockSize];
+        try
+        {
+            var kept = 0;
+            while (true)
+            {
+                var read = stream.Read(buffer, kept, blockSize);
+                if (read == 0)
+                {
+                    return false;
+                }
+
+                var length = kept + read;
+                var window = buffer.AsSpan(0, length);
+                foreach (var needle in active)
+                {
+                    if (window.IndexOf(needle) >= 0)
+                    {
+                        return true;
+                    }
+                }
+
+                kept = Math.Min(overlap, length);
+                buffer.AsSpan(length - kept, kept).CopyTo(buffer);
+            }
+        }
+        finally
+        {
+            Array.Clear(buffer);
+        }
     }
 }

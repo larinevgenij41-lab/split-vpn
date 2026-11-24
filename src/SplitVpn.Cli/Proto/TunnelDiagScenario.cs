@@ -24,6 +24,11 @@ internal static class TunnelDiagScenario
     {
         var report = new ScenarioReport("s0-tunnel");
         var profile = ProtoContext.LoadProfile();
+        if (!ProtoContext.RequireServiceStopped(report))
+        {
+            return await report.SaveAsync(args, [profile.UserName, profile.Server]);
+        }
+
         var password = ProtoContext.LoadPassword();
         RasConnectionHandle? connection = null;
         try
@@ -64,11 +69,27 @@ internal static class TunnelDiagScenario
         {
             report.BeginCleanup();
             Array.Clear(password);
-            var cleanup = RouteOps.RemoveAllMarked();
-            report.Measure("cleanupRoutesRemoved", cleanup.Removed);
+            // Шаги очистки независимы: сбой снятия маршрутов не оставляет соединение поднятым.
+            try
+            {
+                var cleanup = RouteOps.RemoveAllMarked();
+                report.Measure("cleanupRoutesRemoved", cleanup.Removed);
+            }
+            catch (Exception ex)
+            {
+                report.Fail("Снятие маршрутов", ex);
+            }
+
             if (connection is { } handle)
             {
-                await RasClient.HangUpAsync(handle, CancellationToken.None);
+                try
+                {
+                    await RasClient.HangUpAsync(handle, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    report.Fail("Разрыв соединения", ex);
+                }
             }
         }
 

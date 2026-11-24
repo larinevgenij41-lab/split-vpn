@@ -86,6 +86,28 @@ public sealed partial class RoutingViewModel : PageViewModel
     /// <summary>Доска хоть раз загружена из службы: до этого правки не на чем основывать.</summary>
     private bool _loaded;
 
+    /// <summary>Идёт сохранение доски: перечитывать её нельзя, служба может ответить ещё прежними настройками.</summary>
+    private int _saving;
+
+    /// <summary>Идёт загрузка доски: сохранять нельзя, загрузка перерисует доску после сохранения.</summary>
+    private int _loading;
+
+    /// <summary>
+    /// Растёт при начале и конце каждого сохранения. Ответ загрузки, начатой до конца сохранения, отбрасывается:
+    /// после сохранения доска остаётся ровно той, что сохранена.
+    /// </summary>
+    private int _saveGeneration;
+
+    private bool CanSave => _loading == 0;
+
+    private bool CanReload => _saving == 0;
+
+    private void RefreshBoardCommands()
+    {
+        SaveCommand.NotifyCanExecuteChanged();
+        ReloadCommand.NotifyCanExecuteChanged();
+    }
+
     /// <summary>Есть несохранённые правки доски. Каждая отметка правки увеличивает счётчик правок страницы.</summary>
     public bool Dirty
     {
@@ -181,7 +203,28 @@ public sealed partial class RoutingViewModel : PageViewModel
     private async Task<bool> LoadAsync()
     {
         var edits = EditGeneration;
-        var settings = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
+        var saves = _saveGeneration;
+        AppSettings settings;
+        _loading++;
+        RefreshBoardCommands();
+        try
+        {
+            settings = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
+        }
+        finally
+        {
+            _loading--;
+            RefreshBoardCommands();
+        }
+
+        if (saves != _saveGeneration || _saving > 0)
+        {
+            // Служба могла ответить ещё прежними настройками: такой ответ вернул бы доску к виду до сохранения,
+            // и следующее «Сохранить» молча записало бы его поверх.
+            ShowMessage("Доска не перечитана: одновременно шло сохранение. Нажмите «Отменить изменения» ещё раз, если нужно.", isError: false);
+            return false;
+        }
+
         if (edits != EditGeneration)
         {
             ShowMessage("Доска не перечитана: пока шла загрузка, вы её изменили. «Отменить изменения» загрузит сохранённый вид.", isError: false);
@@ -214,15 +257,7 @@ public sealed partial class RoutingViewModel : PageViewModel
             _cards.Add(new BoardCard(this, CardKind.Domain, rule.Suffix, rule.Comment, rule.Target) { FolderId = rule.FolderId, Priority = rule.Priority });
         }
 
-        foreach (var profile in _settings.Profiles.Where(p => p is { Protocol: VpnProtocol.AnyConnect } && p.Role != ProfileRole.Off))
-        {
-            var status = Main.Status?.Tunnels.FirstOrDefault(t => t.ProfileId == profile.Id)?.ServerNetworks;
-            _cards.Add(new BoardCard(this, CardKind.ServerNetworks, $"Сети шлюза «{profile.Name}»", GatewaySummary(status),
-                AppSettings.ServerNetworksTarget(profile), profile.AnyConnect.UserRulesOverrideServerNetworks)
-            {
-                ProfileId = profile.Id,
-            });
-        }
+        _cards.AddRange(_settings.Profiles.Where(p => p is { Protocol: VpnProtocol.AnyConnect } && p.Role != ProfileRole.Off).Select(GatewayCard));
 
         Groups.Clear();
         foreach (var group in _settings.Groups)
@@ -240,6 +275,17 @@ public sealed partial class RoutingViewModel : PageViewModel
         }
 
         return true;
+    }
+
+    /// <summary>Карточка сетей, которые назначает шлюз AnyConnect.</summary>
+    private BoardCard GatewayCard(ConnectionProfile profile)
+    {
+        var status = Main.Status?.Tunnels.FirstOrDefault(t => t.ProfileId == profile.Id)?.ServerNetworks;
+        return new BoardCard(this, CardKind.ServerNetworks, $"Сети шлюза «{profile.Name}»", GatewaySummary(status),
+            AppSettings.ServerNetworksTarget(profile), profile.AnyConnect.UserRulesOverrideServerNetworks)
+        {
+            ProfileId = profile.Id,
+        };
     }
 
     /// <summary>Пересобирает колонки: напрямую, по одной на подключение и группу, блокировать.</summary>
@@ -551,15 +597,16 @@ public sealed partial class RoutingViewModel : PageViewModel
 
     private void Add(RouteTarget target, string text, BoardColumn? column, BoardFolder? folder)
     {
-        var value = (text ?? "").Trim();
-        if (value.Length == 0)
+        var input = (text ?? "").Trim();
+        if (input.Length == 0)
         {
             return;
         }
 
-        if (value.Contains(':', StringComparison.Ordinal))
+        var value = BoardInput(input, out var ipv6);
+        if (ipv6)
         {
-            ShowMessage($"«{value}»: IPv6-адреса на доску не добавляются — публичный IPv6 блокируется, пока включена защита.", isError: true);
+            ShowMessage($"«{input}»: IPv6-адреса на доску не добавляются — публичный IPv6 блокируется, пока включена защита.", isError: true);
             return;
         }
 
@@ -610,6 +657,50 @@ public sealed partial class RoutingViewModel : PageViewModel
         }
 
         AddCard(new BoardCard(this, CardKind.Domain, suffix, null, target), column, folder);
+    }
+
+    /// <summary>
+    /// Приводит вставленный текст к адресу, сети или домену: из ссылки http/https берётся имя узла, у «узел:порт»
+    /// отрезается порт. <paramref name="ipv6"/> — введён IPv6-адрес или сеть (в том числе в квадратных скобках).
+    /// </summary>
+    internal static string BoardInput(string value, out bool ipv6)
+    {
+        ipv6 = false;
+        if (Uri.TryCreate(value, UriKind.Absolute, out var uri) && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+        {
+            value = uri.Host;
+        }
+
+        if (value.StartsWith('[') && value.IndexOf(']', StringComparison.Ordinal) is var close and > 0)
+        {
+            // [2001:db8::1] или [2001:db8::1]:443.
+            ipv6 = IsIpv6(value[1..close]);
+            return ipv6 ? value : value[1..close];
+        }
+
+        var slash = value.IndexOf('/', StringComparison.Ordinal);
+        if (IsIpv6(slash < 0 ? value : value[..slash]))
+        {
+            ipv6 = true;
+            return value;
+        }
+
+        var colon = value.IndexOf(':', StringComparison.Ordinal);
+        if (colon > 0 && colon == value.LastIndexOf(':'))
+        {
+            var port = value[(colon + 1)..];
+            var end = port.IndexOf('/', StringComparison.Ordinal);
+            port = end < 0 ? port : port[..end];
+            if (port.Length is > 0 and <= 5 && port.All(char.IsAsciiDigit))
+            {
+                return value[..colon];
+            }
+        }
+
+        return value;
+
+        static bool IsIpv6(string text) => System.Net.IPAddress.TryParse(text, out var address)
+            && address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
     }
 
     private void AddCard(BoardCard card, BoardColumn? column, BoardFolder? folder)
@@ -670,7 +761,7 @@ public sealed partial class RoutingViewModel : PageViewModel
     }
 
     /// <summary>Сохранение с проверкой службой: конфликты правил объясняются текстом ошибки.</summary>
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanSave))]
     private Task SaveAsync() => RunAsync(async () =>
     {
         // Доска сохраняется целиком: без загрузки на ней нет ни карточек, ни правил, и сохранение отправило бы
@@ -681,16 +772,36 @@ public sealed partial class RoutingViewModel : PageViewModel
             return null;
         }
 
+        _saving++;
+        _saveGeneration++;
+        RefreshBoardCommands();
+        try
+        {
+            return await SaveBoardAsync();
+        }
+        finally
+        {
+            _saving--;
+            _saveGeneration++;
+            RefreshBoardCommands();
+        }
+    });
+
+    private async Task<string?> SaveBoardAsync()
+    {
         var fresh = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
         if (RoutingPart(fresh) != RoutingPart(_settings))
         {
             // Маршрутизацию поменяли в другом месте после загрузки доски («Подключить» назначило опорное подключение,
             // мастер, «Выключить совсем»): доска сохраняется целиком и молча вернула бы прежнее. Второе нажатие
-            // записывает доску поверх осознанно: прежний снимок заменён свежим.
+            // записывает доску поверх осознанно: прежний снимок заменён свежим, а колонки, группы и карточки сетей
+            // шлюза пересобраны под него — иначе карточки выключенного подключения служба отклоняла бы всегда.
             _settings = fresh;
+            var moved = AdoptProfiles(fresh);
             ShowMessage("Маршрутизация изменилась в другом месте после открытия этой страницы (например, кнопка «Подключить» назначила опорное "
-                + "подключение или подключение выключено). Нажмите «Сохранить» ещё раз, чтобы записать доску поверх, или «Отменить изменения», "
-                + "чтобы загрузить актуальную.", isError: true);
+                + "подключение или подключение выключено). "
+                + (moved ? "Часть карточек вела в выключенное подключение или удалённую группу и перенесена в «Напрямую». " : "")
+                + "Нажмите «Сохранить» ещё раз, чтобы записать доску поверх, или «Отменить изменения», чтобы загрузить актуальную.", isError: true);
             return null;
         }
 
@@ -730,7 +841,29 @@ public sealed partial class RoutingViewModel : PageViewModel
 
         var warnings = response.ResultAs<List<string>>() ?? [];
         return warnings.Count > 0 ? "Сохранено. " + string.Join(" ", warnings) : "Сохранено и применено.";
-    });
+    }
+
+    /// <summary>
+    /// Пересобирает доску под подключения свежих настроек, сохраняя правки пользователя: состав групп,
+    /// карточки сетей шлюза и колонки. Карточки, чья цель исчезла, уходят в «Напрямую» с отметкой правки.
+    /// Возвращает, пришлось ли что-то перенести.
+    /// </summary>
+    private bool AdoptProfiles(AppSettings fresh)
+    {
+        var edits = EditGeneration;
+        var groups = Groups.Select(g => g.ToSetting()).ToList();
+        Groups.Clear();
+        foreach (var group in groups)
+        {
+            Groups.Add(GroupItem.From(group, fresh.Profiles, MarkDirty));
+        }
+
+        var gateways = fresh.Profiles.Where(p => p is { Protocol: VpnProtocol.AnyConnect } && p.Role != ProfileRole.Off).ToList();
+        _cards.RemoveAll(c => c.Kind == CardKind.ServerNetworks && !gateways.Exists(p => p.Id == c.ProfileId));
+        _cards.AddRange(gateways.Where(p => !_cards.Exists(c => c.Kind == CardKind.ServerNetworks && c.ProfileId == p.Id)).Select(GatewayCard));
+        RebuildColumns();
+        return edits != EditGeneration;
+    }
 
     private RouteTarget TargetOf(CardKind kind) => _cards.Find(c => c.Kind == kind)?.Target ?? RouteTarget.Direct;
 
@@ -758,7 +891,7 @@ public sealed partial class RoutingViewModel : PageViewModel
         return _settings.BypassTarget is null && bypass == TargetOf(CardKind.Default) ? null : bypass;
     }
 
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanReload))]
     private Task ReloadAsync() => RunAsync(async () => await LoadAsync() ? "Доска возвращена к сохранённому виду." : null);
 
     /// <summary>Сводка второго списка. Служба присылает её одной записью — плоские поля остались за RU-базой.</summary>

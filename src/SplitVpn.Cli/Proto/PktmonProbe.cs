@@ -33,19 +33,63 @@ internal sealed class PktmonProbe : IDisposable
 
     public static void Reset() => Run("reset");
 
+    /// <summary>Почему последний снимок пуст (pktmon не ответил, вывод не разобран); null — снимок получен.</summary>
+    public string? LastProblem { get; private set; }
+
     public IReadOnlyList<PktmonGroupCount> Snapshot()
     {
-        LastRawJson = Run("counters --json");
         try
         {
-            using var document = JsonDocument.Parse(LastRawJson);
-            return document.RootElement.EnumerateArray().Select(ReadGroup).ToList();
+            LastRawJson = Run("counters --json");
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
         {
+            LastRawJson = null;
+            LastProblem = "pktmon не запустился: " + ex.Message;
+            return [];
+        }
+
+        if (LastRawJson is null)
+        {
+            LastProblem = "pktmon не ответил за отведённое время";
+            return [];
+        }
+
+        var groups = Parse(LastRawJson, out var problem);
+        LastProblem = problem;
+        return groups;
+    }
+
+    /// <summary>
+    /// Разбор «pktmon counters --json». Формат не документирован и меняется между сборками Windows: отсутствующие
+    /// поля и значения не того типа пропускаются, а невалидный JSON или корень не-массив дают пустой список
+    /// с объяснением в <paramref name="problem"/>.
+    /// </summary>
+    internal static IReadOnlyList<PktmonGroupCount> Parse(string json, out string? problem)
+    {
+        problem = null;
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                problem = "вывод pktmon не является массивом групп";
+                return [];
+            }
+
+            return document.RootElement.EnumerateArray().Where(g => g.ValueKind == JsonValueKind.Object).Select(ReadGroup).ToList();
+        }
+        catch (JsonException ex)
+        {
+            problem = "вывод pktmon не разобран: " + ex.Message;
             return [];
         }
     }
+
+    private static JsonElement[] Items(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var items) && items.ValueKind == JsonValueKind.Array
+            ? [.. items.EnumerateArray()]
+            : [];
 
     public void Dispose()
     {
@@ -63,9 +107,9 @@ internal sealed class PktmonProbe : IDisposable
     private static PktmonGroupCount ReadGroup(JsonElement group)
     {
         long outFlow = 0, inFlow = 0, outDrop = 0, inDrop = 0;
-        foreach (var component in group.GetProperty("Components").EnumerateArray())
+        foreach (var component in Items(group, "Components"))
         {
-            foreach (var counter in component.GetProperty("Counters").EnumerateArray())
+            foreach (var counter in Items(component, "Counters"))
             {
                 var outbound = Packets(counter, "Outbound", out var outIsDrop);
                 var inbound = Packets(counter, "Inbound", out var inIsDrop);
@@ -82,22 +126,29 @@ internal sealed class PktmonProbe : IDisposable
             }
         }
 
-        return new PktmonGroupCount(group.GetProperty("Group").GetString() ?? "", outFlow, inFlow, outDrop, inDrop);
+        var name = group.TryGetProperty("Group", out var title) && title.ValueKind == JsonValueKind.String ? title.GetString() ?? "" : "";
+        return new PktmonGroupCount(name, outFlow, inFlow, outDrop, inDrop);
     }
 
     private static long Packets(JsonElement counter, string direction, out bool isDrop)
     {
         isDrop = false;
-        if (!counter.TryGetProperty(direction, out var value))
+        if (counter.ValueKind != JsonValueKind.Object || !counter.TryGetProperty(direction, out var value) || value.ValueKind != JsonValueKind.Object)
         {
             return 0;
         }
 
         isDrop = value.TryGetProperty("Last Drop Reason", out _);
-        return value.TryGetProperty("Packets", out var packets) ? packets.GetInt64() : 0;
+        return value.TryGetProperty("Packets", out var packets) && packets.ValueKind == JsonValueKind.Number && packets.TryGetInt64(out var count) ? count : 0;
     }
 
-    private static string Run(string arguments)
+    private static readonly TimeSpan RunTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Запуск pktmon. Оба потока читаются асинхронно: заполненный буфер stderr не блокирует процесс. По таймауту
+    /// процесс убивается, результат — null.
+    /// </summary>
+    private static string? Run(string arguments)
     {
         using var process = Process.Start(new ProcessStartInfo("pktmon.exe", arguments)
         {
@@ -106,8 +157,23 @@ internal sealed class PktmonProbe : IDisposable
             UseShellExecute = false,
             CreateNoWindow = true,
         })!;
-        var output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit(30_000);
-        return output;
+        var output = process.StandardOutput.ReadToEndAsync();
+        var errors = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(RunTimeout))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+            {
+                // Процесс успел завершиться сам.
+            }
+
+            return null;
+        }
+
+        _ = errors.GetAwaiter().GetResult();
+        return output.GetAwaiter().GetResult();
     }
 }

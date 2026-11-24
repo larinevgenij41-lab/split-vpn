@@ -24,10 +24,8 @@ internal static class MultiTunnelScenario
         var first = ProtoContext.LoadProfile(1);
         var second = ProtoContext.LoadProfile(2);
         var secrets = new[] { first.UserName, first.Server, second.UserName, second.Server };
-        if (SystemMetrics.ServiceStatus("SplitVpn").ProcessId != 0)
+        if (!ProtoContext.RequireServiceStopped(report))
         {
-            report.Fail("Служба SplitVpn остановлена", new InvalidOperationException(
-                "Остановите службу перед спайком: она снимает чужие маршруты с меткой при каждой сверке."));
             return await report.SaveAsync(args, secrets);
         }
 
@@ -36,6 +34,18 @@ internal static class MultiTunnelScenario
         // Соединение, уже набранное, но ещё не попавшее в список: его тоже нужно разорвать при сбое или Ctrl+C.
         RasConnectionHandle? pending = null;
         try
+        {
+            await RunStepsAsync();
+        }
+        catch (Exception ex)
+        {
+            report.Fail("Спайк двух туннелей", ex);
+        }
+
+        // Очистка ровно один раз — и после ранней остановки, и после сбоя.
+        return await FinishAsync(report, args, connections, secrets, pending);
+
+        async Task RunStepsAsync()
         {
             foreach (var (profile, slot) in new[] { (first, 1), (second, 2) })
             {
@@ -56,7 +66,7 @@ internal static class MultiTunnelScenario
                 report.Check($"Туннель {slot} подключён", result.Success, result.ErrorText + " код " + result.ErrorCode);
                 if (!result.Success || result.Handle is not { } handle)
                 {
-                    return await FinishAsync(report, args, connections, secrets, pending);
+                    return;
                 }
 
                 var projection = RasClient.GetProjection(handle);
@@ -64,7 +74,7 @@ internal static class MultiTunnelScenario
                 report.Check($"Интерфейс туннеля {slot} найден", adapter is not null, Ipv4.Format(projection.ClientAddress));
                 if (adapter is null)
                 {
-                    return await FinishAsync(report, args, connections, secrets, pending);
+                    return;
                 }
 
                 connections.Add((entry, handle, adapter));
@@ -77,12 +87,6 @@ internal static class MultiTunnelScenario
             await ProbeEachAsync(report, connections, target);
             CheckAdoption(report, connections);
         }
-        catch (Exception ex)
-        {
-            report.Fail("Спайк двух туннелей", ex);
-        }
-
-        return await FinishAsync(report, args, connections, secrets, pending);
     }
 
     /// <summary>Проба цели через каждый туннель: временный маршрут /32 и сокет, привязанный к его адресу.</summary>
@@ -129,28 +133,47 @@ internal static class MultiTunnelScenario
         string[] secrets,
         RasConnectionHandle? pending = null)
     {
-        // Спайк всегда заканчивается снятыми маршрутами и разорванными соединениями.
+        // Спайк всегда заканчивается снятыми маршрутами и разорванными соединениями. Каждый шаг очистки
+        // защищён отдельно: сбой одного не отменяет остальные.
         report.BeginCleanup();
+        var clean = true;
         try
         {
             RouteOps.Reconcile([]);
         }
-        catch (Exception ex) when (ex is Windows.Native.NativeCallException or InvalidOperationException)
+        catch (Exception ex)
         {
-            report.Note("маршруты пробы снять не удалось: " + ex.Message);
+            clean = false;
+            report.Fail("Снятие маршрутов пробы", ex);
         }
 
         foreach (var handle in connections.Select(c => c.Handle).Concat(pending is { } dialed ? [dialed] : []))
         {
-            await RasClient.HangUpAsync(handle, CancellationToken.None);
+            try
+            {
+                await RasClient.HangUpAsync(handle, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                clean = false;
+                report.Fail("Разрыв соединения", ex);
+            }
         }
 
         foreach (var slot in new[] { 1, 2 })
         {
-            RasPhonebook.Delete(ProtoContext.Phonebook, ProtoContext.EntryNameFor(slot));
+            try
+            {
+                RasPhonebook.Delete(ProtoContext.Phonebook, ProtoContext.EntryNameFor(slot));
+            }
+            catch (Exception ex)
+            {
+                clean = false;
+                report.Fail($"Удаление записи {slot}", ex);
+            }
         }
 
-        report.Note("соединения разорваны, записи удалены, маршруты сняты");
+        report.Note(clean ? "соединения разорваны, записи удалены, маршруты сняты" : "очистка выполнена не полностью — см. ошибки");
         return await report.SaveAsync(args, secrets);
     }
 

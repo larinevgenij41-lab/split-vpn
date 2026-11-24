@@ -22,6 +22,7 @@ internal static class ReleaseCommands
             return Task.FromResult(2);
         }
 
+        RequirePasswordFile(args);
         if (File.Exists(path))
         {
             Console.Error.WriteLine($"Файл {path} уже существует: перезаписывать ключ выпуска нельзя.");
@@ -54,11 +55,39 @@ internal static class ReleaseCommands
         return Task.FromResult(0);
     }
 
+    /// <summary>
+    /// Записывает ключ во временный файл рядом и переносит его на место без перезаписи: сбой записи не оставляет
+    /// обрезанный ключ, из-за которого повтор отказал бы «файл уже существует». Существующий ключ не заменяется
+    /// (IOException). Временный файл создаётся в том же каталоге и получает те же унаследованные права.
+    /// </summary>
     internal static void WriteNewKey(string path, string encrypted)
     {
-        using var keyFile = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-        using var writer = new StreamWriter(keyFile);
-        writer.Write(encrypted);
+        var full = Path.GetFullPath(path);
+        var temporary = Path.Combine(Path.GetDirectoryName(full)!, $".{Path.GetFileName(full)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var keyFile = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var writer = new StreamWriter(keyFile))
+            {
+                writer.Write(encrypted);
+                writer.Flush();
+                keyFile.Flush(flushToDisk: true);
+            }
+
+            File.Move(temporary, full, overwrite: false);
+        }
+        finally
+        {
+            // После успешного переноса временного файла уже нет; после сбоя он удаляется, не заслоняя исходную ошибку.
+            try
+            {
+                File.Delete(temporary);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Console.Error.WriteLine($"Не удалось удалить временный файл {temporary}: {ex.Message}");
+            }
+        }
     }
 
     /// <summary>release-sign --manifest &lt;update.json&gt; --key &lt;файл&gt; [--out &lt;update.json.sig&gt;]</summary>
@@ -72,6 +101,7 @@ internal static class ReleaseCommands
             return Task.FromResult(2);
         }
 
+        RequirePasswordFile(args);
         var manifest = File.ReadAllBytes(manifestPath);
         var parsed = UpdateManifestParser.Parse(manifest);
         if (parsed.Release is not { } release)
@@ -176,14 +206,37 @@ internal static class ReleaseCommands
     /// </summary>
     private static string? Supplied(CliArgs args)
     {
-        if (args.Option("--password-file") is { } file && File.Exists(file))
+        RequirePasswordFile(args);
+        if (args.Option("--password-file") is { } file)
         {
+            string text;
+            try
+            {
+                text = File.ReadAllText(file);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw new InputFileException(file, ex);
+            }
+
             Console.Error.WriteLine($"Внимание: пароль ключа выпуска прочитан из открытого файла {file}.");
-            return File.ReadAllText(file).Trim();
+            return text.Trim();
         }
 
         var variable = Environment.GetEnvironmentVariable(PasswordVariable);
         return string.IsNullOrEmpty(variable) ? null : variable;
+    }
+
+    /// <summary>
+    /// Указанный, но отсутствующий --password-file — ошибка использования (код 2). Прежде такой файл молча
+    /// пропускался, и команда уходила в ввод пароля с консоли — в неинтерактивном запуске это зависание или сбой.
+    /// </summary>
+    internal static void RequirePasswordFile(CliArgs args)
+    {
+        if (args.Option("--password-file") is { } file && !File.Exists(file))
+        {
+            throw new InputFileException(file, new FileNotFoundException("файл пароля не найден", file));
+        }
     }
 
     /// <summary>Ввод пароля без эха; повторный ввод — при создании ключа.</summary>

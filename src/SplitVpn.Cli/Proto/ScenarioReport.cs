@@ -104,16 +104,27 @@ internal sealed class ScenarioReport
             Measurements,
             Log,
         }, JsonDefaults.Options);
-        // IP-адреса нужны для разбора маршрутов, поэтому скрываются только имя пользователя и имя сервера.
-        foreach (var secret in secrets.Where(s => !string.IsNullOrWhiteSpace(s)))
-        {
-            json = json.Replace(secret!, "<скрыто>", StringComparison.OrdinalIgnoreCase);
-        }
-
+        json = Mask(json, secrets);
         await File.WriteAllTextAsync(path, json);
         Console.WriteLine();
         Console.WriteLine($"Итог {Scenario}: {(Passed ? "ПРОЙДЕН" : "НЕ ПРОЙДЕН")}; проверок {Checks.Count}, сбоев {Checks.Count(c => !c.Passed)}, ошибок {Errors.Count}");
         Console.WriteLine("Отчёт: " + path);
         return Passed ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Скрывает значения в готовом JSON отчёта. IP-адреса нужны для разбора маршрутов, поэтому скрываются только
+    /// имя пользователя и имя сервера. Ищется форма значения так, как её записал сериализатор (тем же кодировщиком):
+    /// «corp\ivan» в JSON лежит как «corp\\ivan», и простая замена исходной строки его бы пропустила.
+    /// </summary>
+    internal static string Mask(string json, IEnumerable<string?> secrets)
+    {
+        foreach (var secret in secrets.Where(s => !string.IsNullOrWhiteSpace(s)).OrderByDescending(s => s!.Length))
+        {
+            var encoded = JsonSerializer.Serialize(secret, JsonDefaults.Options)[1..^1];
+            json = json.Replace(encoded, "<скрыто>", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return json;
     }
 }

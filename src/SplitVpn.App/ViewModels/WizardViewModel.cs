@@ -32,6 +32,9 @@ public sealed partial class WizardViewModel : ObservableObject
     private ConnectionProfile? _acceptedProfile;
     private Task? _adapterLoad;
 
+    /// <summary>«Готово» отправило службе ConnectRequest: намерение «подключено» и защита уже у службы.</summary>
+    private bool _connectSent;
+
     /// <param name="main">Главная модель.</param>
     /// <param name="loadAdapters">Запросить адаптеры у службы; самопроверка разметки обходится без службы.</param>
     public WizardViewModel(MainViewModel main, bool loadAdapters = true)
@@ -164,6 +167,16 @@ public sealed partial class WizardViewModel : ObservableObject
             return;
         }
 
+        if (Step == 0)
+        {
+            // Занятое название выясняется сразу, а не после «Готово» на последнем шаге.
+            Error = await NameProblemAsync();
+            if (Error is not null)
+            {
+                return;
+            }
+        }
+
         if (Step == LastStep - 1)
         {
             Step = LastStep;
@@ -178,11 +191,40 @@ public sealed partial class WizardViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// «Отмена». Если «Готово» уже отправило службе подключение, а оно не удалось, служба держит намерение
+    /// «подключено» и защиту — трафик заблокирован. Тогда VPN отключается со снятием защиты; профиль остаётся,
+    /// его можно исправить в «Подключениях». Пока отключение не прошло, мастер не закрывается.
+    /// </summary>
     [RelayCommand]
-    private void Cancel()
+    private async Task CancelAsync()
     {
         Password = "";
         Security.ClearSecrets();
+        if (_connectSent)
+        {
+            IsBusy = true;
+            Progress = "Отключение VPN и снятие защиты…";
+            try
+            {
+                if (!await _main.RunCommandAsync(new DisconnectRequest(KeepProtection: false)))
+                {
+                    Error = "Не удалось отключить VPN и снять защиту. Повторите «Отмена» или нажмите «Отключить VPN и восстановить интернет» на главной странице.";
+                    return;
+                }
+
+                _connectSent = false;
+            }
+            finally
+            {
+                IsBusy = false;
+            }
+
+            // Профиль уже сохранён: мастер сам больше не откроется, запоминать отказ от него не нужно.
+            _main.CloseWizard(dismissForever: false);
+            return;
+        }
+
         _main.CloseWizard(dismissForever: true);
     }
 
@@ -216,6 +258,30 @@ public sealed partial class WizardViewModel : ObservableObject
         if (canKeep) { return null; }
         if (Security.NeedsPassword && Password.Length == 0) { return "Введите пароль."; }
         return Security.NeedsPsk && Security.PreSharedKey.Length == 0 ? "Введите общий ключ IPsec (PSK)." : null;
+    }
+
+    private const string NameTaken = "Название уже занято. Укажите другое название подключения.";
+
+    private static bool IsNameTaken(AppSettings settings, Guid profileId, string name) =>
+        settings.Profiles.Any(p => p.Id != profileId && string.Equals(p.Name, name.Trim(), StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Проверка названия на шаге «Сервер и вход»: null — название свободно.</summary>
+    private async Task<string?> NameProblemAsync()
+    {
+        IsBusy = true;
+        try
+        {
+            var settings = await _main.Service.RequestAsync<AppSettings>(new GetSettingsRequest());
+            return IsNameTaken(settings, _profileId, Name) ? NameTaken : null;
+        }
+        catch (Exception ex) when (ex is ServiceUnavailableException or Services.ServiceCommandException)
+        {
+            return ex.Message;
+        }
+        finally
+        {
+            IsBusy = false;
+        }
     }
 
     private bool CanKeepCredentials(ConnectionProfile? profile) =>
@@ -267,6 +333,8 @@ public sealed partial class WizardViewModel : ObservableObject
                 }
 
                 Progress = "Подключение…";
+                // Отметка ставится до отправки: служба могла принять команду, даже если ответ не дошёл.
+                _connectSent = true;
                 await _main.Service.CommandAsync(new ConnectRequest(_profileId, null));
                 var status = await WaitConnectedAsync();
                 if (status?.State != ConnectionState.Connected)
@@ -275,11 +343,14 @@ public sealed partial class WizardViewModel : ObservableObject
                     {
                         _acceptedProfile = null;
                     }
-                    Error = $"Подключение не завершено: {StatusText.StateName(status?.State ?? ConnectionState.Error)}. {status?.ErrorText}";
+                    Error = $"Подключение не завершено: {StatusText.StateName(status?.State ?? ConnectionState.Error)}. {status?.ErrorText} "
+                        + "Исправьте данные и нажмите «Далее» — или «Отмена»: VPN отключится, защита снимется, подключение останется в «Подключениях».";
                     Step = 0;
                     return;
                 }
 
+                // Подключение работает: «Отмена» после следующей ошибки его не разрывает.
+                _connectSent = false;
                 if (viaTunnel)
                 {
                     Progress = "Загрузка RU-базы через VPN…";
@@ -313,9 +384,12 @@ public sealed partial class WizardViewModel : ObservableObject
         Progress = "Сохранение подключения…";
         var settings = await _main.Service.RequestAsync<AppSettings>(new GetSettingsRequest());
         var existing = settings.Profiles.FirstOrDefault(p => p.Id == _profileId);
-        if (settings.Profiles.Any(p => p.Id != _profileId && string.Equals(p.Name, Name.Trim(), StringComparison.OrdinalIgnoreCase)))
+        if (IsNameTaken(settings, _profileId, Name))
         {
-            throw new Services.ServiceCommandException("Название уже занято. Укажите другое название подключения.");
+            // Название поменяли в другом месте после шага «Сервер и вход»: исправлять его там же.
+            Error = NameTaken;
+            Step = 0;
+            return false;
         }
 
         var profile = BuildProfile(existing);

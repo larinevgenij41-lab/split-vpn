@@ -16,6 +16,11 @@ internal static class DnsScenario
     {
         var report = new ScenarioReport("s4-dns");
         var profile = ProtoContext.LoadProfile();
+        if (!ProtoContext.RequireServiceStopped(report))
+        {
+            return await report.SaveAsync(args, [profile.UserName, profile.Server]);
+        }
+
         var password = ProtoContext.LoadPassword();
         var primary = ProtoNet.PrimaryAdapter(NetInventory.Capture());
         var store = new DnsBackupStore(ProtoContext.DnsBackupPath);
@@ -60,15 +65,38 @@ internal static class DnsScenario
             report.BeginCleanup();
             Array.Clear(password);
             RestoreDns(report, primary, store);
-            RouteOps.RemoveAllMarked();
+            // Шаги очистки независимы: сбой одного не оставляет поднятыми соединение и посредник.
+            try
+            {
+                RouteOps.RemoveAllMarked();
+            }
+            catch (Exception ex)
+            {
+                report.Fail("Снятие маршрутов", ex);
+            }
+
             if (connection is { } handle)
             {
-                await RasClient.HangUpAsync(handle, CancellationToken.None);
+                try
+                {
+                    await RasClient.HangUpAsync(handle, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    report.Fail("Разрыв соединения", ex);
+                }
             }
 
             if (proxy is not null)
             {
-                await proxy.DisposeAsync();
+                try
+                {
+                    await proxy.DisposeAsync();
+                }
+                catch (Exception ex)
+                {
+                    report.Fail("Остановка DNS-посредника", ex);
+                }
             }
         }
 

@@ -1,5 +1,7 @@
 using System.Text.Json;
 using SplitVpn.Core.Settings;
+using SplitVpn.Windows.Diagnostics;
+using SplitVpn.Windows.Native;
 using SplitVpn.Windows.Security;
 
 namespace SplitVpn.Cli.Proto;
@@ -83,4 +85,52 @@ internal static class ProtoContext
         Directory.CreateDirectory(Root);
         SecretStore.RestrictToSystemAndAdministrators(Root);
     }
+
+    /// <summary>Служба не установлена (ERROR_SERVICE_DOES_NOT_EXIST): её маршрутам ничто не грозит.</summary>
+    private const uint ErrorServiceDoesNotExist = 1060;
+
+    /// <summary>
+    /// Сценарии, меняющие маршруты, DNS или WFP, работают только при остановленной службе SplitVpn: маршруты
+    /// прототипа ставятся с той же меткой-метрикой, что у службы, и очистка сценария удалила бы её маршруты,
+    /// а служба при сверке — маршруты сценария. Возвращает false (с ошибкой в отчёте), если служба работает
+    /// или её состояние не удалось узнать.
+    /// </summary>
+    public static bool RequireServiceStopped(ScenarioReport report)
+    {
+        uint? processId;
+        string? queryError = null;
+        try
+        {
+            processId = SystemMetrics.ServiceStatus("SplitVpn").ProcessId;
+        }
+        catch (NativeCallException ex) when (ex.Code == ErrorServiceDoesNotExist)
+        {
+            processId = 0;
+        }
+        catch (NativeCallException ex)
+        {
+            processId = null;
+            queryError = ex.Message;
+        }
+
+        if (ServiceRunningProblem(processId, queryError) is not { } problem)
+        {
+            return true;
+        }
+
+        report.Fail("Служба SplitVpn остановлена", new InvalidOperationException(problem));
+        return false;
+    }
+
+    /// <summary>
+    /// Почему сценарий нельзя запускать при таком состоянии службы; null — можно. <paramref name="processId"/> —
+    /// процесс службы (0 — остановлена или не установлена, null — состояние узнать не удалось).
+    /// </summary>
+    internal static string? ServiceRunningProblem(uint? processId, string? queryError) => processId switch
+    {
+        0 => null,
+        null => $"Не удалось узнать состояние службы SplitVpn ({queryError}). Сценарий меняет маршруты, DNS или WFP: остановите службу и повторите.",
+        _ => "Остановите службу SplitVpn перед сценарием: маршруты прототипа помечены той же меткой, что и маршруты службы, "
+            + "и сценарий с ней снимали бы маршруты друг друга.",
+    };
 }

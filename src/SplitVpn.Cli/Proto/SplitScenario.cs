@@ -26,6 +26,11 @@ internal static class SplitScenario
     {
         var report = new ScenarioReport("s3-split");
         var profile = ProtoContext.LoadProfile();
+        if (!ProtoContext.RequireServiceStopped(report))
+        {
+            return await report.SaveAsync(args, Secrets(profile));
+        }
+
         var password = ProtoContext.LoadPassword();
         var state = new SplitState();
         try
@@ -327,6 +332,15 @@ internal static class SplitScenario
     private static void CheckPktmon(ScenarioReport report, PktmonProbe pktmon, SplitState state, string stage)
     {
         var groups = pktmon.Snapshot();
+        if (pktmon.LastProblem is { } problem)
+        {
+            // Пустой снимок не означает «0 пакетов»: проверка не засчитывается.
+            report.Note($"pktmon ({stage}): {problem}");
+            report.Check($"pktmon: счётчики получены ({stage})", false, problem);
+            PktmonProbe.Reset();
+            return;
+        }
+
         report.Measure("pktmon " + stage, groups);
         var physical = groups.Where(g => string.Equals(g.Group, state.Primary!.Description, StringComparison.OrdinalIgnoreCase)).ToList();
         var outbound = physical.Sum(g => g.OutboundFlowPackets);
@@ -359,11 +373,26 @@ internal static class SplitScenario
     {
         if (state.Connection is { } connection)
         {
-            await RasClient.HangUpAsync(connection, CancellationToken.None);
+            try
+            {
+                await RasClient.HangUpAsync(connection, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                report.Fail("Разрыв соединения", ex);
+            }
         }
 
-        var routes = RouteOps.RemoveAllMarked();
-        report.Measure("cleanupRoutesRemoved", routes.Removed);
+        try
+        {
+            var routes = RouteOps.RemoveAllMarked();
+            report.Measure("cleanupRoutesRemoved", routes.Removed);
+        }
+        catch (Exception ex)
+        {
+            report.Fail("Снятие маршрутов", ex);
+        }
+
         report.Note("Динамическая сессия WFP закрыта — фильтры прототипа удалены.");
     }
 

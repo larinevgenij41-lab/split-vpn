@@ -131,10 +131,19 @@ internal static class RasScenario
         {
             return Describe(report, result, stopwatch);
         }
-        catch (OperationCanceledException) when (CliCancellation.IsInterrupted && result.Handle is { } dialed)
+        catch (Exception) when (result.Handle is { } dialed)
         {
-            // Ctrl+C во время дозвона: вызывающий ещё не получил описатель и в своей очистке соединение не разорвёт.
-            await RasClient.HangUpAsync(dialed, CancellationToken.None);
+            // Ctrl+C или любой сбой описания после дозвона: вызывающий ещё не получил описатель и в своей очистке
+            // соединение не разорвёт. Сбой разрыва записывается, но наружу уходит исходная ошибка.
+            try
+            {
+                await RasClient.HangUpAsync(dialed, CancellationToken.None);
+            }
+            catch (Exception hangUp)
+            {
+                report.Fail("Разрыв соединения после сбоя описания", hangUp);
+            }
+
             throw;
         }
     }
