@@ -236,6 +236,8 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     /// <summary>Пока идёт остановка или перезапуск службы по команде пользователя, потеря связи — без уведомления.</summary>
     public void ExpectServiceLoss(bool expected) => _lossExpected = expected;
 
+    internal bool ServiceLossExpected => _lossExpected;
+
     public void Dispose()
     {
         _timer.Stop();

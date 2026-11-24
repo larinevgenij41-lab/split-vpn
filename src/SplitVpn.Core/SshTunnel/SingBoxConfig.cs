@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using SplitVpn.Core.Net;
@@ -112,7 +113,7 @@ public static class SingBoxConfig
             json.WriteString("server", Ipv4.Format(parameters.Server));
             json.WriteNumber("server_port", parameters.Port);
             json.WriteString("user", parameters.User);
-            json.WriteString("private_key", privateKey);
+            WritePrivateKey(json, privateKey);
             json.WriteStartArray("host_key");
             json.WriteStringValue(parameters.HostKey.Text);
             json.WriteEndArray();
@@ -173,6 +174,85 @@ public static class SingBoxConfig
 
         return buffer.Written;
     }
+
+    /// <summary>
+    /// Ключ экранируется в собственный массив и пишется как готовое значение: WriteString экранирует его во
+    /// временный буфер из ArrayPool и оставляет там копию ключа. Свой массив затирается сразу после записи.
+    /// </summary>
+    private static void WritePrivateKey(Utf8JsonWriter json, ReadOnlySpan<char> privateKey)
+    {
+        var escaped = new byte[EscapedLength(privateKey)];
+        try
+        {
+            Escape(privateKey, escaped);
+            json.WritePropertyName("private_key");
+            json.WriteRawValue(escaped, skipInputValidation: true);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(escaped);
+        }
+    }
+
+    /// <summary>Длина строки JSON в кавычках, которую даёт <see cref="Escape"/>.</summary>
+    internal static int EscapedLength(ReadOnlySpan<char> value)
+    {
+        var length = 2;
+        foreach (var c in value)
+        {
+            length = checked(length + (ShortEscape(c) != '\0' ? 2 : c is < ' ' or > '~' ? 6 : 1));
+        }
+
+        return length;
+    }
+
+    /// <summary>
+    /// Строка JSON в кавычках: кавычка, обратная косая и управляющие символы экранируются, всё вне печатного
+    /// ASCII пишется как \uXXXX по кодовым единицам UTF-16 (пара суррогатов остаётся парой). Результат всегда
+    /// корректный JSON и получается без промежуточного перекодирования в UTF-8.
+    /// </summary>
+    internal static void Escape(ReadOnlySpan<char> value, Span<byte> destination)
+    {
+        const string Hex = "0123456789abcdef";
+        var at = 0;
+        destination[at++] = (byte)'"';
+        foreach (var c in value)
+        {
+            if (ShortEscape(c) is var simple && simple != '\0')
+            {
+                destination[at++] = (byte)'\\';
+                destination[at++] = (byte)simple;
+            }
+            else if (c is < ' ' or > '~')
+            {
+                destination[at++] = (byte)'\\';
+                destination[at++] = (byte)'u';
+                destination[at++] = (byte)Hex[(c >> 12) & 0xF];
+                destination[at++] = (byte)Hex[(c >> 8) & 0xF];
+                destination[at++] = (byte)Hex[(c >> 4) & 0xF];
+                destination[at++] = (byte)Hex[c & 0xF];
+            }
+            else
+            {
+                destination[at++] = (byte)c;
+            }
+        }
+
+        destination[at] = (byte)'"';
+    }
+
+    /// <summary>Буква короткого экранирования JSON или '\0', если у символа его нет.</summary>
+    private static char ShortEscape(char c) => c switch
+    {
+        '"' => '"',
+        '\\' => '\\',
+        '\n' => 'n',
+        '\r' => 'r',
+        '\t' => 't',
+        '\b' => 'b',
+        '\f' => 'f',
+        _ => '\0',
+    };
 
     /// <summary>Размер массива с запасом под экранирование ключа.</summary>
     public static int BufferSize(int privateKeyChars) => checked(privateKeyChars * 6 + 4096);

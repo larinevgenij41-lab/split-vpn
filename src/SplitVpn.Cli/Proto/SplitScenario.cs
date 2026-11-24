@@ -63,6 +63,7 @@ internal static class SplitScenario
         }
         finally
         {
+            report.BeginCleanup();
             Array.Clear(password);
             await CleanupAsync(report, state);
         }

@@ -200,8 +200,23 @@ public sealed record SessionInfo
     /// <summary>
     /// Сети шлюза как CIDR; неразборчивые маршруты пропускаются, слишком широкие — отбрасываются
     /// (<see cref="TooWideIncludes"/>): сеть шире /8 забрала бы заметную часть интернета в туннель шлюза.
+    /// Слой, который вместе выходит за пределы <see cref="GatewayNetworkLimits"/>, отбрасывается целиком
+    /// (<see cref="RejectedIncludes"/>): список пуст, как если бы шлюз сетей не прислал.
     /// </summary>
-    public IReadOnlyList<Ipv4Cidr> IncludeCidrs() => SplitIncludes.Select(ParseRoute).OfType<Ipv4Cidr>()
+    public IReadOnlyList<Ipv4Cidr> IncludeCidrs()
+    {
+        var cidrs = NarrowEnoughIncludes();
+        return GatewayNetworkLimits.Violation(GatewayNetworkLimits.Union(cidrs)) is null ? cidrs : [];
+    }
+
+    /// <summary>
+    /// Причина, по которой сети шлюза отброшены целиком (суммарное покрытие или число маршрутов выше предела),
+    /// или null. Для журнала и предупреждения пользователю, как <see cref="TooWideIncludes"/>. Считается по тому же
+    /// набору, что и <see cref="IncludeCidrs"/>: сети шире /8, отброшенные поштучно, в покрытие не входят.
+    /// </summary>
+    public string? RejectedIncludes() => GatewayNetworkLimits.Violation(GatewayNetworkLimits.Union(NarrowEnoughIncludes()));
+
+    private List<Ipv4Cidr> NarrowEnoughIncludes() => SplitIncludes.Select(ParseRoute).OfType<Ipv4Cidr>()
         .Where(c => c.PrefixLength >= PolicyCompiler.MinServerNetworkPrefix).Distinct().ToList();
 
     /// <summary>Отброшенные маршруты шлюза: разобрались, но шире /8. Для журнала и предупреждения пользователю.</summary>

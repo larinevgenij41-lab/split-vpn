@@ -251,6 +251,21 @@ public static class FilterPlanBuilder
     public const byte WeightDirect = 4;
     public const byte WeightBlockAll = 0;
 
+    /// <summary>
+    /// Разрешение проверки интернета Windows - вес правил для доменов, выше блока «Туннель недоступен» (13): адрес
+    /// www.msftconnecttest.com из общей сети доставки может попасть в диапазон лежащего дополнительного туннеля, и
+    /// при весе ниже 13 проба блокировалась бы, Windows помечала бы сеть «без интернета» и сбрасывала Wi-Fi.
+    /// Разрешение узкое: только svchost.exe (NCSI), только TCP на порт пробы и только через основной адаптер, -
+    /// поэтому чужая программа к тому же адресу и порту им не проходит, а попадает под обычные запреты.
+    /// </summary>
+    public const byte WeightConnectivityCheck = WeightDomain;
+
+    /// <summary>
+    /// %SystemRoot%\System32\svchost.exe: в нём живут клиент DHCP и проверка интернета Windows (NCSI), их разрешения
+    /// действуют только для этого приложения.
+    /// </summary>
+    public static string SvchostExecutablePath { get; } = Path.Combine(Environment.SystemDirectory, "svchost.exe");
+
     public const byte ProtocolTcp = 6;
     public const byte ProtocolUdp = 17;
     public const byte ProtocolIcmpV6 = 58;
@@ -273,10 +288,12 @@ public static class FilterPlanBuilder
         var filters = new List<FilterSpec>
         {
             Spec("Loopback", FilterGroup.Base, FilterFamily.Both, WeightLoopback, FilterAction.Permit, new LoopbackCondition()),
+            // Клиент DHCP — служба Dhcp в svchost.exe; разрешение только ей, как в стандартных правилах брандмауэра
+            // Windows «Основы сетей — DHCP». Иначе любая программа ходила бы с порта 68 на 67 мимо защиты.
             Spec("DHCPv4", FilterGroup.Base, FilterFamily.V4, WeightInfrastructure, FilterAction.Permit,
-                new ProtocolCondition(ProtocolUdp), new LocalPortRange(68, 68), new RemotePortCondition(67)),
+                new AppIdCondition(SvchostExecutablePath), new ProtocolCondition(ProtocolUdp), new LocalPortRange(68, 68), new RemotePortCondition(67)),
             Spec("DHCPv6", FilterGroup.Base, FilterFamily.V6, WeightInfrastructure, FilterAction.Permit,
-                new ProtocolCondition(ProtocolUdp), new LocalPortRange(546, 546), new RemotePortCondition(547)),
+                new AppIdCondition(SvchostExecutablePath), new ProtocolCondition(ProtocolUdp), new LocalPortRange(546, 546), new RemotePortCondition(547)),
             Spec("IPv6 ND", FilterGroup.Base, FilterFamily.V6, WeightInfrastructure, FilterAction.Permit,
                 new ProtocolCondition(ProtocolIcmpV6), new LocalPortRange(133, 137)),
             Spec("DNS-страж UDP", FilterGroup.Base, FilterFamily.Both, WeightDnsGuard, FilterAction.Block,
@@ -459,11 +476,20 @@ public static class FilterPlanBuilder
     /// </summary>
     private static void AddRevocationEndpoints(ProtectionInputs inputs, List<FilterSpec> filters)
     {
-        AddPrimaryTcpEndpoints(inputs.PrimaryLuid, inputs.RevocationEndpoints, "Проверка отзыва", filters);
-        AddPrimaryTcpEndpoints(inputs.PrimaryLuid, inputs.ConnectivityCheckEndpoints, "Проверка интернета Windows", filters);
+        AddPrimaryTcpEndpoints(inputs.PrimaryLuid, inputs.RevocationEndpoints, "Проверка отзыва", WeightDomain, null, filters);
+        // Адреса узла проверки служба узнаёт через DNS основной (возможно, чужой) сети, поэтому разрешение получает
+        // только NCSI в svchost.exe (вес - WeightConnectivityCheck, выше блока «Туннель недоступен»).
+        AddPrimaryTcpEndpoints(inputs.PrimaryLuid, inputs.ConnectivityCheckEndpoints, "Проверка интернета Windows",
+            WeightConnectivityCheck, new AppIdCondition(SvchostExecutablePath), filters);
     }
 
-    private static void AddPrimaryTcpEndpoints(ulong? primaryLuid, IReadOnlyList<RevocationEndpoint> endpoints, string label, List<FilterSpec> filters)
+    private static void AddPrimaryTcpEndpoints(
+        ulong? primaryLuid,
+        IReadOnlyList<RevocationEndpoint> endpoints,
+        string label,
+        byte weight,
+        AppIdCondition? app,
+        List<FilterSpec> filters)
     {
         if (primaryLuid is not { } primary)
         {
@@ -476,12 +502,15 @@ public static class FilterPlanBuilder
                 string.Create(CultureInfo.InvariantCulture, $"{label} {Ipv4.Format(endpoint.Address)}:{endpoint.Port}"),
                 FilterGroup.Dynamic,
                 FilterFamily.V4,
-                WeightDomain,
+                weight,
                 FilterAction.Permit,
-                new RemoteRangeV4(endpoint.Address, endpoint.Address),
-                new ProtocolCondition(ProtocolTcp),
-                new RemotePortCondition(endpoint.Port),
-                new LocalInterfaceCondition(primary, NotEqual: false)));
+                [
+                    .. app is null ? Array.Empty<FilterCondition>() : [app],
+                    new RemoteRangeV4(endpoint.Address, endpoint.Address),
+                    new ProtocolCondition(ProtocolTcp),
+                    new RemotePortCondition(endpoint.Port),
+                    new LocalInterfaceCondition(primary, NotEqual: false),
+                ]));
         }
     }
 

@@ -35,7 +35,7 @@ internal sealed class CliArgs(string[] values)
     /// </summary>
     private static readonly HashSet<string> s_flags = new(StringComparer.OrdinalIgnoreCase)
     {
-        "--json", "--keep-protection", "--no-mask", "--no-save-password", "--save-password", "--from-dev-creds", "--hangup", "--with-routes",
+        "--json", "--keep-protection", "--no-mask", "--no-save-password", "--save-password", "--from-dev-creds", "--hangup", "--with-routes", "--force",
     };
 
     /// <summary>Позиционный аргумент (не начинающийся с «--» и не являющийся значением опции).</summary>

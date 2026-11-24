@@ -366,10 +366,27 @@ public static unsafe class InterfaceDnsOps
     /// <summary>
     /// Сбрасывает системный кеш DNS. false — сброс не подтверждён: ipconfig не запустился или не завершился
     /// за 10 секунд. Зависший процесс завершается, иначе повторные сбросы копили бы процессы.
+    /// ipconfig запускается полным путём из System32 (служба не ищет программы по PATH и в текущем каталоге) и
+    /// под общей очередью запусков дочерних процессов: иначе он мог унаследовать наследуемые концы труб
+    /// помощника AnyConnect, запускаемого в то же мгновение, и смерть помощника замечалась бы с задержкой.
+    /// Очередь держится только на время запуска, не на ожидание завершения.
     /// </summary>
     public static bool FlushResolverCache()
     {
-        using var process = Process.Start(new ProcessStartInfo("ipconfig.exe", "/flushdns") { CreateNoWindow = true, UseShellExecute = false });
+        var system = Environment.SystemDirectory;
+        var start = new ProcessStartInfo(Path.Combine(system, "ipconfig.exe"), "/flushdns")
+        {
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            WorkingDirectory = system,
+        };
+        Process? started;
+        lock (Operations.ChildProcessJob.StartGate)
+        {
+            started = Process.Start(start);
+        }
+
+        using var process = started;
         if (process is null)
         {
             return false;

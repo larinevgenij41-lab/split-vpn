@@ -50,6 +50,9 @@ public sealed class PackageDownloader(HttpClient client, TimeSpan? idleTimeout =
     {
         ArgumentNullException.ThrowIfNull(urls);
         PackageDownloadResult? last = null;
+        // Ограничение частоты у одного источника не закрывает зеркала: срок повтора возвращается, только если
+        // не скачалось ни с одного.
+        PackageDownloadResult? rateLimited = null;
         foreach (var url in urls)
         {
             var reusable = PartialLength(partialPath);
@@ -65,10 +68,11 @@ public sealed class PackageDownloader(HttpClient client, TimeSpan? idleTimeout =
                 last = await DownloadFromSourceAsync(url, false);
             }
 
-            if (last.Success || last.Failure == FetchFailure.RateLimited) { break; }
+            if (last.Success) { return last; }
+            if (last.Failure == FetchFailure.RateLimited) { rateLimited ??= last; }
         }
 
-        return last ?? new PackageDownloadResult { Failure = FetchFailure.Network, Message = "Не задан адрес установщика." };
+        return rateLimited ?? last ?? new PackageDownloadResult { Failure = FetchFailure.Network, Message = "Не задан адрес установщика." };
 
         async Task<PackageDownloadResult> DownloadFromSourceAsync(Uri url, bool resume)
         {

@@ -39,6 +39,7 @@ internal static class ScaleScenario
         }
         finally
         {
+            report.BeginCleanup();
             var leftover = RouteOps.RemoveAllMarked();
             report.Measure("cleanupRoutesRemoved", leftover.Removed);
         }

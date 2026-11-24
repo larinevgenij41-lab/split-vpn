@@ -162,9 +162,11 @@ public partial class FilterPlanTests
         var inputs = Inputs(tunnel: null) with { OutageMode = OutageMode.BlockAllPublic, ConnectivityCheckEndpoints = [new RevocationEndpoint(CrlHost, 80)] };
         var filters = All(inputs);
 
-        Assert.Equal(FilterAction.Permit, Evaluate(filters, Tcp(CrlHost, 80, WiFi)));
-        Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(CrlHost, 443, WiFi)));
-        Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(CrlHost, 80, Radmin)));
+        // Проверку выполняет NCSI в svchost.exe; другим программам узел не открыт (см. FilterPlanSystemAppTests).
+        var ncsi = FilterPlanBuilder.SvchostExecutablePath;
+        Assert.Equal(FilterAction.Permit, Evaluate(filters, Tcp(CrlHost, 80, WiFi) with { AppPath = ncsi }));
+        Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(CrlHost, 443, WiFi) with { AppPath = ncsi }));
+        Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(CrlHost, 80, Radmin) with { AppPath = ncsi }));
         Assert.Contains(FilterPlanBuilder.BuildDynamic(inputs), f => f.Name.StartsWith("Проверка интернета Windows", StringComparison.Ordinal));
         Assert.DoesNotContain(FilterPlanBuilder.BuildDynamic(inputs with { PrimaryLuid = null }),
             f => f.Name.StartsWith("Проверка интернета Windows", StringComparison.Ordinal));

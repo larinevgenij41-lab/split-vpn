@@ -213,7 +213,9 @@ public static class ConnectionEdits
 
     /// <summary>
     /// Сохранённый пароль привязан к серверу, протоколу, способу входа и учётной записи: после их смены служба
-    /// не должна сама отдавать прежний пароль новому серверу (MS-CHAPv2 позволяет перебрать NT-хэш).
+    /// не должна сама отдавать прежний пароль новому серверу (MS-CHAPv2 позволяет перебрать NT-хэш). Для способов
+    /// EAP с проверкой сервера привязка включает и саму проверку: имена сервера и доверенные корневые CA. Иначе
+    /// ослабленная проверка (чужой CA, другое имя) отдала бы прежний пароль подставному серверу.
     /// </summary>
     public static bool PasswordBindingChanged(ConnectionProfile before, ConnectionProfile after)
     {
@@ -222,8 +224,33 @@ public static class ConnectionEdits
         return PreSharedKeyBindingChanged(before, after)
             || before.AuthMethod != after.AuthMethod
             || !SameText(before.UserName, after.UserName)
-            || !SameText(before.Domain, after.Domain);
+            || !SameText(before.Domain, after.Domain)
+            || ServerValidationChanged(before, after);
     }
+
+    /// <summary>
+    /// Изменились имена сервера EAP (без учёта регистра и порядка) или набор отпечатков доверенных корневых CA
+    /// (после нормализации). Учитывается, только если способ входа проверяет сервер.
+    /// </summary>
+    private static bool ServerValidationChanged(ConnectionProfile before, ConnectionProfile after)
+    {
+        if (!VpnProtocols.NeedsServerValidation(after.AuthMethod))
+        {
+            return false;
+        }
+
+        return !EapServerNames(before.Eap).SetEquals(EapServerNames(after.Eap))
+            || !EapThumbprints(before.Eap).SetEquals(EapThumbprints(after.Eap));
+    }
+
+    // Профиль может прийти по каналу управления без нормализации: раздел или строка - null.
+    private static HashSet<string> EapServerNames(EapSettings? eap) => new(
+        (eap?.ServerNames ?? "").Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries),
+        StringComparer.OrdinalIgnoreCase);
+
+    private static HashSet<string> EapThumbprints(EapSettings? eap) => new(
+        (eap?.TrustedRootThumbprints ?? []).Where(t => !string.IsNullOrWhiteSpace(t)).Select(VpnProtocols.NormalizeThumbprint),
+        StringComparer.Ordinal);
 
     /// <summary>Общий ключ IPsec привязан к серверу и протоколу.</summary>
     public static bool PreSharedKeyBindingChanged(ConnectionProfile before, ConnectionProfile after)

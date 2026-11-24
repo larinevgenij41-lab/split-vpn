@@ -61,6 +61,11 @@ internal static class CredsCommand
             var profile = new ProtoProfile(server.Trim(), user.Trim(), args.Option("--domain"));
             AtomicFile.WriteAllText(ProtoContext.ProfilePathFor(slot), JsonSerializer.Serialize(profile, JsonDefaults.Options));
             ProtoContext.Secrets().Save(ProtoContext.ProfileIdFor(slot), password.ToArray());
+            if (args.Option("--password-file") is { } passwordFile)
+            {
+                File.Delete(passwordFile);
+            }
+
             Console.WriteLine($"Профиль и пароль прототипа {slot} сохранены.");
             return 0;
         }
@@ -83,15 +88,20 @@ internal static class CredsCommand
             return ReadMasked();
         }
 
-        // Файл одноразовый, но удаляется только после успешного чтения: при сбое это единственная копия пароля.
-        var password = File.ReadAllText(file).TrimEnd('\r', '\n');
-        File.Delete(file);
-        return [.. password];
+        // Файл одноразовый, но удаляется только после сохранения пароля (см. Set): при сбое это единственная копия.
+        try
+        {
+            return [.. File.ReadAllText(file).TrimEnd('\r', '\n')];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new InputFileException(file, ex);
+        }
     }
 
     private static int Show()
     {
-        foreach (var slot in new[] { 1, 2 })
+        foreach (var slot in Slots)
         {
             if (!File.Exists(ProtoContext.ProfilePathFor(slot)))
             {
@@ -131,7 +141,15 @@ internal static class CredsCommand
                     System.Security.AccessControl.AccessControlType.Allow));
             }
 
-            using var stream = new FileInfo(file).Create(FileMode.Create, System.Security.AccessControl.FileSystemRights.Write, FileShare.None, 4096, FileOptions.None, security);
+            // Только новый файл: у существующего Windows сохраняет прежний ACL и игнорирует заданный здесь,
+            // и пароль оказался бы в файле, доступном посторонним.
+            using var stream = CreateExclusive(file, security);
+            if (stream is null)
+            {
+                Console.WriteLine($"Файл {file} уже существует — пароль не записан. Удалите файл или укажите новое имя.");
+                return 2;
+            }
+
             using var writer = new StreamWriter(stream, new System.Text.UTF8Encoding(false));
             writer.Write(password);
             Console.WriteLine("Пароль записан в одноразовый файл; удалите его сразу после чтения.");
@@ -143,11 +161,38 @@ internal static class CredsCommand
         }
     }
 
+    /// <summary>
+    /// Создаёт файл с заданным ACL только если его ещё нет (FileMode.CreateNew): дескриптор безопасности
+    /// применяется лишь к новому файлу. null — файл уже существует, он не перезаписан.
+    /// </summary>
+    internal static FileStream? CreateExclusive(string path, System.Security.AccessControl.FileSecurity security)
+    {
+        try
+        {
+            return new FileInfo(path).Create(FileMode.CreateNew, System.Security.AccessControl.FileSystemRights.Write, FileShare.None, 4096, FileOptions.None, security);
+        }
+        catch (IOException ex) when ((ex.HResult & 0xffff) is ErrorFileExists or ErrorAlreadyExists)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>ERROR_FILE_EXISTS и ERROR_ALREADY_EXISTS.</summary>
+    private const int ErrorFileExists = 80;
+    private const int ErrorAlreadyExists = 183;
+
+    /// <summary>Слоты прототипа: «creds set --slot 2» хранит второй сервер для сценария нескольких туннелей.</summary>
+    internal static readonly int[] Slots = [1, 2];
+
     private static int Delete()
     {
-        ProtoContext.Secrets().Delete(ProtoContext.ProfileId);
-        File.Delete(ProtoContext.ProfilePath);
-        Console.WriteLine("Профиль и пароль прототипа удалены.");
+        foreach (var slot in Slots)
+        {
+            ProtoContext.Secrets().Delete(ProtoContext.ProfileIdFor(slot));
+            File.Delete(ProtoContext.ProfilePathFor(slot));
+        }
+
+        Console.WriteLine("Профили и пароли прототипа (все слоты) удалены.");
         return 0;
     }
 

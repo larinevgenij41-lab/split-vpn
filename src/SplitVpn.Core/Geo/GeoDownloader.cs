@@ -52,11 +52,16 @@ public sealed class GeoDownloader
         _validation = validation ?? new GeoValidationOptions { MinV4Count = 1 };
     }
 
-    /// <summary>Перебирает основной адрес и зеркала; при ограничении частоты не переходит к зеркалам.</summary>
+    /// <summary>
+    /// Перебирает основной адрес и зеркала. Ограничение частоты (429) одного источника не останавливает перебор:
+    /// лимит основного хоста не должен закрывать зеркала. Отказ «лимит» со сроком повтора возвращается, только
+    /// если не ответил ни один источник.
+    /// </summary>
     public async Task<GeoFetchResult> FetchAsync(IGeoSource source, string? etag, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(source);
         GeoFetchResult? last = null;
+        GeoFetchResult? rateLimited = null;
         foreach (var url in source.Urls)
         {
             // ETag относится к основному адресу: у зеркал свои значения.
@@ -66,13 +71,18 @@ public sealed class GeoDownloader
                 var problem = Prepare(source, content, out var prepared);
                 last = problem is null ? last with { Prepared = prepared } : Failed(url, new FetchProblem(FetchFailure.HttpError, problem));
             }
-            if (last.Status != GeoFetchStatus.Failed || last.Failure == FetchFailure.RateLimited)
+            if (last.Status != GeoFetchStatus.Failed)
             {
                 return last;
             }
+
+            if (last.Failure == FetchFailure.RateLimited)
+            {
+                rateLimited ??= last;
+            }
         }
 
-        return last ?? Failed(null, new FetchProblem(FetchFailure.Network, "Источник не содержит адресов."));
+        return rateLimited ?? last ?? Failed(null, new FetchProblem(FetchFailure.Network, "Источник не содержит адресов."));
     }
 
     private string? Prepare(IGeoSource source, byte[] content, out PreparedGeoList? prepared)

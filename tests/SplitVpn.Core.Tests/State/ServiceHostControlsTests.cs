@@ -79,10 +79,16 @@ public sealed class ServiceHostControlsTests
     [Fact]
     public void Commands_UseSingleElevatedProcess()
     {
-        Assert.Equal(("sc.exe", "start SplitVpn"), ServiceHostCommands.For(ServiceHostAction.Start, "SplitVpn"));
-        Assert.Equal(("sc.exe", "stop SplitVpn"), ServiceHostCommands.For(ServiceHostAction.Stop, "SplitVpn"));
+        // Абсолютные пути из System32: голое имя ShellExecute искал бы и в App Paths HKCU, и в текущем каталоге.
+        var sc = Path.Combine(Environment.SystemDirectory, "sc.exe");
+        Assert.Equal((sc, "start SplitVpn"), ServiceHostCommands.For(ServiceHostAction.Start, "SplitVpn"));
+        Assert.Equal((sc, "stop SplitVpn"), ServiceHostCommands.For(ServiceHostAction.Stop, "SplitVpn"));
         var (file, arguments) = ServiceHostCommands.For(ServiceHostAction.Restart, "SplitVpn");
-        Assert.Equal("powershell.exe", file);
+        Assert.Equal(Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"), file);
+        Assert.True(Path.IsPathFullyQualified(file));
+        Assert.True(File.Exists(file));
+        Assert.True(File.Exists(sc));
+        Assert.Equal(Environment.SystemDirectory, ServiceHostCommands.WorkingDirectory);
         Assert.Contains("Restart-Service -Name SplitVpn -Force", arguments, StringComparison.Ordinal);
     }
 

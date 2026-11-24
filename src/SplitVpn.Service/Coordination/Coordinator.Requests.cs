@@ -717,13 +717,23 @@ public sealed partial class Coordinator
                 "Ключ PSK допустим только для L2TP/IPsec и должен содержать не более 256 символов без нулевого символа.");
         }
 
-        if (request.Key.Length == 0)
+        // Сбой записи ключа (диск, права, DPAPI) - понятная ошибка клиенту: ничего ещё не изменено, сверка не прерывалась,
+        // и «неполное применение» здесь было бы ложным (как в SaveConnectionAsync).
+        try
         {
-            _deps.Secrets.Delete(profile.Id, SecretKind.PreSharedKey);
+            if (request.Key.Length == 0)
+            {
+                _deps.Secrets.Delete(profile.Id, SecretKind.PreSharedKey);
+            }
+            else
+            {
+                _deps.Secrets.Save(profile.Id, request.Key, SecretKind.PreSharedKey);
+            }
         }
-        else
+        catch (Exception ex) when (IsSecretWriteFailure(ex))
         {
-            _deps.Secrets.Save(profile.Id, request.Key, SecretKind.PreSharedKey);
+            _deps.Logger.LogWarning(ex, "Ключ IPsec для {Name} не сохранён", profile.Name);
+            return IpcResponse.Failure(IpcErrorCodes.Failed, $"Не удалось сохранить ключ IPsec для «{profile.Name}»: {ex.Message}");
         }
 
         SecretReplaced(profile.Id, SecretKind.PreSharedKey);
@@ -736,7 +746,17 @@ public sealed partial class Coordinator
                 await HangUpAsync(tunnel, "изменён ключ IPsec", cancellationToken);
             }
 
-            _deps.Ras.DeleteEntry(tunnel.EntryName);
+            try
+            {
+                // Запись с прежним ключом убирается сразу; не вышло - не беда: перед дозвоном запись готовится
+                // заново (PrepareEntry) и получает уже новый ключ.
+                _deps.Ras.DeleteEntry(tunnel.EntryName);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _deps.Logger.LogWarning(ex, "Изменён ключ IPsec {Name}: прежняя запись телефонной книги не удалена, она будет переписана перед дозвоном", tunnel.Name);
+            }
+
             tunnel.AppliedEntryServer = null;
             tunnel.ReconnectRequired = false;
             tunnel.BlockingError = ErrorCategory.None;

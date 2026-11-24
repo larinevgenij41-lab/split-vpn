@@ -47,13 +47,45 @@ internal static class PersistScenario
         {
             report.Fail("Применение", ex);
         }
+        finally
+        {
+            // Без прерывания объекты остаются для «proto s5-check». Прерванный Ctrl+C сценарий проверку не продолжит:
+            // его объекты WFP снимаются сразу.
+            report.BeginCleanup();
+            if (CliCancellation.IsInterrupted)
+            {
+                await RemovePrototypeAsync(report);
+            }
+        }
 
         return await report.SaveAsync(args, []);
+    }
+
+    private static RecoveryOptions PrototypeRecovery() =>
+        new() { Phonebooks = [ProtoContext.Phonebook], WfpIdentities = [WfpIdentity.Prototype], DnsBackupPath = ProtoContext.DnsBackupPath };
+
+    /// <summary>Очистка после Ctrl+C: объекты WFP прототипа не остаются в системе.</summary>
+    private static async Task RemovePrototypeAsync(ScenarioReport report)
+    {
+        try
+        {
+            var recovery = await NetworkRecovery.RunAsync(PrototypeRecovery(), CancellationToken.None);
+            report.Measure("recoveryAfterInterrupt", recovery);
+            if (!recovery.Success)
+            {
+                report.Fail("Очистка после прерывания: " + string.Join("; ", recovery.Errors));
+            }
+        }
+        catch (Exception ex)
+        {
+            report.Fail("Очистка после прерывания", ex);
+        }
     }
 
     public static async Task<int> CheckAsync(CliArgs args)
     {
         var report = new ScenarioReport("s5-check");
+        var recovered = false;
         try
         {
             using (var engine = WfpEngine.Open(dynamicSession: false))
@@ -63,7 +95,8 @@ internal static class PersistScenario
                 report.Check("Persistent и static фильтры пережили завершение процесса", filters.Count > 0 && filters.Any(f => f.Persistent) && filters.Any(f => !f.Persistent), $"{filters.Count}");
             }
 
-            var recovery = await NetworkRecovery.RunAsync(new RecoveryOptions { Phonebooks = [ProtoContext.Phonebook], WfpIdentities = [WfpIdentity.Prototype], DnsBackupPath = ProtoContext.DnsBackupPath }, CancellationToken.None);
+            var recovery = await NetworkRecovery.RunAsync(PrototypeRecovery(), CancellationToken.None);
+            recovered = true;
             report.Measure("recovery", recovery);
             using var after = WfpEngine.Open(dynamicSession: true);
             var left = WfpOps.ListFilters(after, WfpIdentity.Prototype).Count;
@@ -73,6 +106,15 @@ internal static class PersistScenario
         catch (Exception ex)
         {
             report.Fail("Проверка", ex);
+        }
+        finally
+        {
+            // Ctrl+C до восстановления: объекты прототипа всё равно снимаются.
+            report.BeginCleanup();
+            if (CliCancellation.IsInterrupted && !recovered)
+            {
+                await RemovePrototypeAsync(report);
+            }
         }
 
         return await report.SaveAsync(args, []);

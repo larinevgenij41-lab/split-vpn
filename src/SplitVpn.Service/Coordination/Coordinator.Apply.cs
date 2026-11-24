@@ -1543,11 +1543,17 @@ public sealed partial class Coordinator
         ExceptionDispatchInfo? failure = null;
         var tunnelLuids = TunnelLuids();
         var suffixChanged = false;
-        foreach (var adapter in (_snapshot?.Adapters ?? []).Where(a => a.IsUp && a.Addresses.Count > 0 && !tunnelLuids.Contains(a.Luid) && a.DnsServers.Count > 0))
+        var adapters = (_snapshot?.Adapters ?? []).Where(a => a.IsUp && a.Addresses.Count > 0 && !tunnelLuids.Contains(a.Luid) && a.DnsServers.Count > 0).ToList();
+
+        // Сначала захват, потом запись DNS: собственный адрес адаптера объявляется DNS-сервером, только если посредник
+        // занял порт на нём эксклюзивно, иначе этот порт мог бы держать чужой процесс (аудит 24.11.2026). Неудачный
+        // захват повторяется на каждой сверке (не реже раза в минуту), и при успехе список DNS адаптера обновляется.
+        var claimed = _deps.DnsProxy.ClaimAdapterAddresses([.. adapters.Where(IsPrimaryAdapter).Select(a => a.Addresses[0])]).ToHashSet();
+        foreach (var adapter in adapters)
         {
             try
             {
-                EnsureAdapterLoopback(adapter.InterfaceGuid, ProxyNameServersFor(adapter));
+                EnsureAdapterLoopback(adapter.InterfaceGuid, ProxyNameServersFor(adapter, claimed));
                 suffixChanged |= EnsureSearchList(adapter.InterfaceGuid);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -1577,6 +1583,14 @@ public sealed partial class Coordinator
         }
 
         SetProxyConfiguration(BuildProxyConfiguration(), suffixChanged);
+
+        // Ушедшие адреса (адаптер перестал быть основным, адрес сменился) освобождаются только после того, как DNS
+        // всех адаптеров записан: при сбое записи прежний адрес ещё может стоять DNS-сервером и остаётся занятым.
+        if (failure is null)
+        {
+            _deps.DnsProxy.ReleaseAdapterAddresses(claimed);
+        }
+
         failure?.Throw();
     }
 
@@ -1602,12 +1616,15 @@ public sealed partial class Coordinator
     /// Windows проверяет интернет запросом, привязанным к адаптеру, а такой запрос до 127.0.0.1 не доходит
     /// (ошибка 10049), и проверка на основном адаптере не проходила никогда. Только основному: на адресе
     /// другого адаптера порт 53 может держать чужой резолвер (DNS WSL или Hyper-V), и запросы ушли бы ему.
-    /// И только пока посредник слушает адреса адаптеров, иначе - прежний одиночный 127.0.0.1.
+    /// И только если посредник занял порт на этом адресе эксклюзивно (<paramref name="claimed"/>), иначе - прежний
+    /// одиночный 127.0.0.1: адрес, порт на котором держит другой процесс, первым DNS-сервером ставить нельзя.
     /// </summary>
-    private string ProxyNameServersFor(AdapterCandidate adapter) =>
+    private string ProxyNameServersFor(AdapterCandidate adapter, HashSet<uint> claimed) =>
         InterfaceDnsOps.ProxyNameServers(
-            _deps.DnsProxy.ServesAdapterAddresses && Facts.Primary?.InterfaceGuid == adapter.InterfaceGuid && adapter.Addresses.Count > 0
-                ? Ipv4.Format(adapter.Addresses[0]) : null);
+            IsPrimaryAdapter(adapter) && claimed.Contains(adapter.Addresses[0]) ? Ipv4.Format(adapter.Addresses[0]) : null);
+
+    private bool IsPrimaryAdapter(AdapterCandidate adapter) =>
+        Facts.Primary?.InterfaceGuid == adapter.InterfaceGuid && adapter.Addresses.Count > 0;
 
     private void EnsureAdapterLoopback(Guid interfaceGuid, string nameServerV4)
     {
@@ -1883,6 +1900,12 @@ public sealed partial class Coordinator
         }
 
         failure?.Throw();
+        // DNS всех адаптеров возвращён: собственный адрес адаптера больше нигде не стоит DNS-сервером, и порт 53 на
+        // нём освобождается (не раньше - иначе адрес побыл бы DNS-сервером без эксклюзивного захвата).
+        if (_deps.DnsProxy.IsRunning)
+        {
+            _deps.DnsProxy.ReleaseAdapterAddresses([]);
+        }
     }
 
     /// <summary>Обнаружение обрывов и подхват соединений своей телефонной книги. true — состояние изменилось.</summary>

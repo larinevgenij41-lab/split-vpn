@@ -673,8 +673,17 @@ internal sealed class FakeRas(FakeInventory inventory) : IRasOps
         Slot(entryName);
     }
 
+    /// <summary>Следующее удаление записи телефонной книги падает (книга занята, нет доступа); один раз.</summary>
+    public Exception? DeleteEntryFailure { get; set; }
+
     public void DeleteEntry(string entryName)
     {
+        if (DeleteEntryFailure is { } failure)
+        {
+            DeleteEntryFailure = null;
+            throw failure;
+        }
+
         lock (_lock)
         {
             _entries.Remove(entryName);
@@ -746,6 +755,12 @@ internal sealed class FakeRas(FakeInventory inventory) : IRasOps
     /// <summary>Состояние соединения записи вместо обычного «подключено/нет»: «подключается», «разорвано».</summary>
     public Dictionary<string, RasConnectionStatus> StatusOverride { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Ожидание внутри RasHangUp с токеном, который передала служба: так тест держит разрыв посреди сверки и видит,
+    /// под каким сроком он идёт. null — разрыв сразу.
+    /// </summary>
+    public Func<CancellationToken, Task>? HangUpHook { get; set; }
+
     public Task HangUpAsync(RasConnectionHandle handle, CancellationToken cancellationToken)
     {
         HangUps++;
@@ -754,6 +769,17 @@ internal sealed class FakeRas(FakeInventory inventory) : IRasOps
             throw failure;
         }
 
+        return HangUpHook is { } hook ? HangUpAfterAsync(hook, handle, cancellationToken) : HangUpNow(handle);
+    }
+
+    private async Task HangUpAfterAsync(Func<CancellationToken, Task> hook, RasConnectionHandle handle, CancellationToken cancellationToken)
+    {
+        await hook(cancellationToken);
+        await HangUpNow(handle);
+    }
+
+    private Task HangUpNow(RasConnectionHandle handle)
+    {
         var entry = EntryOf(handle);
         if (entry is not null)
         {
@@ -877,8 +903,17 @@ internal sealed class FakeResolver : IResolver
 
     public int Calls { get; private set; }
 
+    /// <summary>Разрешение имени падает этим исключением (например, ArgumentException на недопустимом имени).</summary>
+    public Dictionary<string, Exception> Failures { get; } = new(StringComparer.OrdinalIgnoreCase);
+
     public Task<IReadOnlyList<uint>> ResolveAsync(string host, IReadOnlyList<uint> servers, uint? interfaceIndex, CancellationToken cancellationToken)
     {
+        if (Failures.TryGetValue(host, out var failure))
+        {
+            Calls++;
+            return Task.FromException<IReadOnlyList<uint>>(failure);
+        }
+
         // Служба сама заранее разрешает имя проверки интернета Windows при каждой смене сети: в счёт вызовов и в общий
         // ответ оно не входит, пока тест не задал для него адреса явно.
         if (host == Coordination.Coordinator.ConnectivityCheckWebHost && !Answers.ContainsKey(host))
@@ -901,8 +936,41 @@ internal sealed class FakeProxy : IDnsProxy
 
     public bool IsRunning { get; private set; }
 
-    /// <summary>Посредник слушает адреса адаптеров: основному адаптеру ставится «свой адрес, 127.0.0.1».</summary>
+    /// <summary>Посредник занимает адреса адаптеров: основному адаптеру ставится «свой адрес, 127.0.0.1».</summary>
     public bool ServesAdapterAddresses { get; set; }
+
+    /// <summary>Адреса, порт на которых держит чужой процесс: эксклюзивный захват не удаётся.</summary>
+    public HashSet<uint> ForeignHeld { get; } = [];
+
+    /// <summary>Эксклюзивно занятые сейчас адреса.</summary>
+    public HashSet<uint> Claimed { get; } = [];
+
+    /// <summary>Вызывается перед освобождением каждого адреса: тест проверяет, что адрес уже убран из DNS адаптеров.</summary>
+    public Action<uint>? OnRelease { get; set; }
+
+    public IReadOnlyCollection<uint> ClaimAdapterAddresses(IReadOnlyCollection<uint> addresses)
+    {
+        if (!IsRunning || !ServesAdapterAddresses)
+        {
+            return [];
+        }
+
+        foreach (var address in addresses.Where(a => !ForeignHeld.Contains(a)))
+        {
+            Claimed.Add(address);
+        }
+
+        return [.. addresses.Where(Claimed.Contains)];
+    }
+
+    public void ReleaseAdapterAddresses(IReadOnlyCollection<uint> keep)
+    {
+        foreach (var address in Claimed.Where(a => !keep.Contains(a)).ToList())
+        {
+            OnRelease?.Invoke(address);
+            Claimed.Remove(address);
+        }
+    }
 
     public Dictionary<string, IReadOnlyList<uint>> Pinned { get; } = [];
 

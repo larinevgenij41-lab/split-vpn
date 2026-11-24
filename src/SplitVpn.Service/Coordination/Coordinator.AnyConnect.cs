@@ -1,6 +1,5 @@
 using System.ComponentModel;
 using System.Globalization;
-using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using SplitVpn.Core.Ipc;
 using SplitVpn.Core.Net;
@@ -449,9 +448,12 @@ public sealed partial class Coordinator
             return await _deps.Resolver.ResolveAsync(host, servers, interfaceIndex, limit.Token)
                 .WaitAsync(limit.Token);
         }
-        catch (Exception ex) when (ex is SocketException or IOException or InvalidOperationException or TimeoutException
-            || (ex is OperationCanceledException && !cancellationToken.IsCancellationRequested))
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
+            // Любой сбой, а не только сетевой: задача разрешения запущена без наблюдателя, и неожиданное исключение
+            // (например, ArgumentException на имени узла, присланном шлюзом) терялось бы вместе с ответом - помощник
+            // ждал бы его до своего срока. Пустой список - ответ «узел не разрешился». Отмена при остановке службы
+            // уходит дальше: отвечать уже некому.
             _deps.Logger.LogWarning(ex, "Не удалось разрешить узел шлюза AnyConnect");
             return [];
         }
@@ -497,7 +499,13 @@ public sealed partial class Coordinator
         var networks = up.Session.IncludeCidrs().Count;
         Journal("Сведения", string.Create(CultureInfo.InvariantCulture,
             $"«{tunnel.Name}» подключён (AnyConnect): адрес {up.Session.Address}, сетей шлюза {networks}, {(up.Session.DtlsActive ? "DTLS" : "TLS")}."));
-        if (networks == 0)
+        // Отклонённый слой тоже даёт пустой список сетей: «шлюз не прислал сетей» тогда было бы неправдой.
+        if (up.Session.RejectedIncludes() is { } rejected)
+        {
+            Journal("Предупреждение", $"«{tunnel.Name}»: сети шлюза отброшены целиком — {rejected}. "
+                + "Через подключение действуют пользовательские правила.");
+        }
+        else if (networks == 0)
         {
             Journal("Предупреждение", $"«{tunnel.Name}»: шлюз не прислал сетей. Через подключение действуют пользовательские правила.");
         }
@@ -509,6 +517,25 @@ public sealed partial class Coordinator
         }
 
         await ReconcileAsync(cancellationToken);
+    }
+
+    /// <summary>Причина отказа от сетей шлюза по сеансу: считается один раз, а статус строится часто.</summary>
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<SessionInfo, System.Runtime.CompilerServices.StrongBox<string?>> _rejectedIncludes = new();
+
+    /// <summary>
+    /// Сети шлюза отброшены целиком (<see cref="SessionInfo.RejectedIncludes"/>): предупреждение на главной, а не
+    /// только строка в журнале - иначе подключение выглядело бы рабочим, а корпоративные сети шли бы мимо него.
+    /// </summary>
+    private IEnumerable<StatusWarning> GatewayNetworkWarnings()
+    {
+        foreach (var tunnel in Facts.Tunnels.Values.Where(t => t is { IsUp: true, Session: not null }))
+        {
+            if (_rejectedIncludes.GetValue(tunnel.Session!, s => new(s.RejectedIncludes())).Value is { } rejected)
+            {
+                yield return new StatusWarning("gateway-networks-rejected",
+                    $"«{tunnel.Name}»: сети шлюза отброшены целиком ({rejected}). Через подключение действуют только пользовательские правила.", null);
+            }
+        }
     }
 
     private void ApplySession(TunnelFacts tunnel, SessionInfo session)

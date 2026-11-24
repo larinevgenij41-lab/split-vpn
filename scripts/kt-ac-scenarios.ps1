@@ -143,7 +143,8 @@ function Settings {
 function SaveSettings($settings) {
     $file = Join-Path $work "settings-$([guid]::NewGuid().ToString('N')).json"
     $settings | ConvertTo-Json -Depth 32 | Set-Content -Path $file -Encoding UTF8
-    try { return (Cli @('settings', 'set', '--file', $file)) } finally { Remove-Item $file -ErrorAction SilentlyContinue }
+    # Файл собран здесь из «settings get» без --out, ревизии рядом нет: запись поверх (--force).
+    try { return (Cli @('settings', 'set', '--file', $file, '--force')) } finally { Remove-Item $file -ErrorAction SilentlyContinue }
 }
 
 function Helpers { @(Get-Process -Name $helperName -ErrorAction SilentlyContinue) }

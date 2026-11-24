@@ -61,36 +61,38 @@ public sealed class ProxyService : IDisposable
         }
     }
 
+    /// <summary>Имя межпроцессного мьютекса; в проверках подменяется, по умолчанию Global\SplitVpn.Proxy.&lt;SID&gt;.</summary>
+    internal string? MutexName { get; init; }
+
+    private static string DefaultMutexName()
+    {
+        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+        return @"Global\SplitVpn.Proxy." + identity.User!.Value;
+    }
+
     private string? Sync(string? pac, bool exiting)
     {
         try
         {
-            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
-            using var gate = new Mutex(false, @"Global\SplitVpn.Proxy." + identity.User!.Value);
-            try
+            // Снятие прокси при отключении и выходе не должно зависеть от мьютекса: его имя может занять
+            // другой пользователь компьютера. Берутся файловая блокировка в профиле и мьютекс; без мьютекса -
+            // под одной файловой, без обеих - без блокировки (UserGate).
+            using var gate = UserGate.Enter(MutexName ?? DefaultMutexName(), Path.Combine(_directoryPath, "proxy-sync.lock"), TimeSpan.FromSeconds(2), "Proxy");
+            Directory.CreateDirectory(_directoryPath);
+            if (exiting)
             {
-                if (!gate.WaitOne(TimeSpan.FromSeconds(2))) { return "Не удалось обновить прокси: настройки заняты другим сеансом."; }
+                _lease?.Dispose();
+                _lease = null;
+                try { using var last = File.Open(_leasePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+                catch (IOException ex) when ((ex.HResult & 0xffff) == 32) { return null; }
             }
-            catch (AbandonedMutexException) { /* Завершившийся процесс освободил блокировку. */ }
-            try
+            else
             {
-                Directory.CreateDirectory(_directoryPath);
-                if (exiting)
-                {
-                    _lease?.Dispose();
-                    _lease = null;
-                    try { using var last = File.Open(_leasePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
-                    catch (IOException ex) when ((ex.HResult & 0xffff) == 32) { return null; }
-                }
-                else
-                {
-                    _lease ??= File.Open(_leasePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
-                }
-                _applier.Sync(pac);
-                if (_settings is WinInetProxySettings windows) { windows.NotifyChanges(); }
-                return null;
+                _lease ??= File.Open(_leasePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
             }
-            finally { gate.ReleaseMutex(); }
+            _applier.Sync(pac);
+            if (_settings is WinInetProxySettings windows) { windows.NotifyChanges(); }
+            return null;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
         {

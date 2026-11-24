@@ -22,6 +22,9 @@ public static class WindowsServiceHost
     /// <summary>Сколько ждать итогового состояния после команды: остановка закрывает сеансы AnyConnect.</summary>
     private static readonly TimeSpan SettleTimeout = TimeSpan.FromSeconds(30);
 
+    /// <summary>Сколько ждать завершения команды с повышением (sc/powershell): остановка ждёт закрытия сеансов.</summary>
+    internal static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(90);
+
     public static ServiceHostState Query()
     {
         try
@@ -92,8 +95,16 @@ public static class WindowsServiceHost
                 UseShellExecute = true,
                 Verb = "runas",
                 WindowStyle = ProcessWindowStyle.Hidden,
+                // Повышенный процесс не должен искать свои библиотеки в текущем каталоге интерфейса.
+                WorkingDirectory = Environment.SystemDirectory,
             })!;
-            await process.WaitForExitAsync();
+            // Служба, зависшая в StopPending, держит команду бесконечно: блок «Служба» не должен ждать её вечно.
+            // Процесс не завершаем — он может ещё довести остановку до конца.
+            if (!await ExitsWithinAsync(process.WaitForExitAsync, CommandTimeout))
+            {
+                return Overdue(action);
+            }
+
             if (!ServiceHostCommands.Succeeded(action, process.ExitCode))
             {
                 return $"{Failure(action)} (код {process.ExitCode}). Проверьте службу «Раздельный VPN» в «Службах» Windows или перезагрузите компьютер.";
@@ -124,6 +135,28 @@ public static class WindowsServiceHost
 
         return null;
     }
+
+    /// <summary>
+    /// Ждёт <paramref name="wait"/> не дольше <paramref name="timeout"/>; false — срок истёк (ожидаемое не отменяется,
+    /// перестаём только ждать).
+    /// </summary>
+    internal static async Task<bool> ExitsWithinAsync(Func<CancellationToken, Task> wait, TimeSpan timeout)
+    {
+        using var deadline = new CancellationTokenSource(timeout);
+        try
+        {
+            await wait(deadline.Token);
+            return true;
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+        {
+            return false;
+        }
+    }
+
+    internal static string Overdue(ServiceHostAction action) => action == ServiceHostAction.Start
+        ? $"Служба не запустилась за отведённое время ({CommandTimeout.TotalSeconds:0} с). Проверьте её в «Службах» Windows или журнал в «Диагностике»."
+        : $"Служба не остановилась за отведённое время ({CommandTimeout.TotalSeconds:0} с). Проверьте службу «Раздельный VPN» в «Службах» Windows или перезагрузите компьютер.";
 
     private static string Failure(ServiceHostAction action) => action switch
     {

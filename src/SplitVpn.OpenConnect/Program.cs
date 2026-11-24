@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using SplitVpn.OpenConnect.Native;
 
 namespace SplitVpn.OpenConnect;
@@ -11,6 +12,13 @@ internal static class Program
 {
     private static unsafe int Main(string[] args)
     {
+        // Первым делом, до загрузки libopenconnect и её зависимостей: помощник работает от LocalSystem.
+        if (!DllSearch.Harden())
+        {
+            Console.Error.WriteLine("Не удалось ограничить поиск нативных библиотек: " + Marshal.GetLastPInvokeError());
+            return 4;
+        }
+
         if (args is ["--version"])
         {
             try

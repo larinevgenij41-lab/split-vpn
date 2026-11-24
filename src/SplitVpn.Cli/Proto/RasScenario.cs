@@ -50,11 +50,13 @@ internal static class RasScenario
         var report = new ScenarioReport("s2-dial");
         var profile = ProtoContext.LoadProfile();
         var password = ProtoContext.LoadPassword();
+        var hangUp = args.Flag("--hangup");
+        RasConnectionHandle? connection = null;
         try
         {
             RasPhonebook.Save(ProtoContext.Phonebook, new RasEntrySpec(ProtoContext.EntryName, profile.Server));
             var routesBefore = NetInventory.ReadRoutesV4().Select(r => r.Destination + "→" + Ipv4.Format(r.NextHop)).ToHashSet();
-            var connection = await DialAndDescribeAsync(report, profile, password);
+            connection = await DialAndDescribeAsync(report, profile, password);
             if (connection is null)
             {
                 return await report.SaveAsync(args, [profile.UserName, profile.Server]);
@@ -63,12 +65,7 @@ internal static class RasScenario
             var added = NetInventory.ReadRoutesV4().Select(r => r.Destination + "→" + Ipv4.Format(r.NextHop)).Where(r => !routesBefore.Contains(r)).ToList();
             report.Measure("routesAddedByRas", added);
             report.Check("RAS не поставил маршрут по умолчанию", !added.Any(r => r.StartsWith("0.0.0.0/0", StringComparison.Ordinal) || r.StartsWith("0.0.0.0/1", StringComparison.Ordinal)), string.Join(", ", added));
-            if (args.Flag("--hangup"))
-            {
-                await RasClient.HangUpAsync(connection.Value, CancellationToken.None);
-                report.Note("Соединение разорвано в том же процессе.");
-            }
-            else
+            if (!hangUp)
             {
                 report.Note("Процесс завершается без HangUp: проверка подхвата — «proto s2-adopt».");
             }
@@ -79,7 +76,21 @@ internal static class RasScenario
         }
         finally
         {
+            // Очистка и после Ctrl+C: с --hangup установленное соединение разрывается в любом случае.
+            report.BeginCleanup();
             Array.Clear(password);
+            if (hangUp && connection is { } dialed)
+            {
+                try
+                {
+                    await RasClient.HangUpAsync(dialed, CancellationToken.None);
+                    report.Note("Соединение разорвано в том же процессе.");
+                }
+                catch (Exception ex)
+                {
+                    report.Fail("Разрыв соединения", ex);
+                }
+            }
         }
 
         return await report.SaveAsync(args, [profile.UserName, profile.Server]);
@@ -116,6 +127,20 @@ internal static class RasScenario
     {
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         var result = await RasClient.DialAsync(ProtoContext.Phonebook, ProtoContext.EntryName, profile.UserName, password, profile.Domain, DialTimeout, CancellationToken.None);
+        try
+        {
+            return Describe(report, result, stopwatch);
+        }
+        catch (OperationCanceledException) when (CliCancellation.IsInterrupted && result.Handle is { } dialed)
+        {
+            // Ctrl+C во время дозвона: вызывающий ещё не получил описатель и в своей очистке соединение не разорвёт.
+            await RasClient.HangUpAsync(dialed, CancellationToken.None);
+            throw;
+        }
+    }
+
+    private static RasConnectionHandle? Describe(ScenarioReport report, RasDialResult result, System.Diagnostics.Stopwatch stopwatch)
+    {
         report.Measure("dialSeconds", Math.Round(stopwatch.Elapsed.TotalSeconds, 1));
         if (!report.Check("SSTP подключился через свою запись", result.Success, result.Success ? "Connected" : $"код {result.ErrorCode}: {result.ErrorText}; категория {RasErrorClassifier.Classify((int)result.ErrorCode).Category}"))
         {

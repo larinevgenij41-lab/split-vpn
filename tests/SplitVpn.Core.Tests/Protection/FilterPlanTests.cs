@@ -467,7 +467,11 @@ public partial class FilterPlanTests
         public static Packet V6(string remote, byte protocol, ushort port, ulong luid, ushort localPort = 50000) =>
             new(true, 0, IPAddress.Parse(remote), protocol, port, localPort, luid);
 
-        public static Packet Dhcp(ulong luid) => new(false, Ipv4.Parse("192.168.1.1"), null, FilterPlanBuilder.ProtocolUdp, 67, 68, luid);
+        /// <summary>Клиент DHCP Windows - служба Dhcp в svchost.exe.</summary>
+        public static Packet Dhcp(ulong luid) => new(false, Ipv4.Parse("192.168.1.1"), null, FilterPlanBuilder.ProtocolUdp, 67, 68, luid)
+        {
+            AppPath = FilterPlanBuilder.SvchostExecutablePath,
+        };
 
         public static Packet Loopback() => new(false, Ipv4.Parse("127.0.0.1"), null, FilterPlanBuilder.ProtocolTcp, 53, 50000, 1) { IsLoopback = true };
     }

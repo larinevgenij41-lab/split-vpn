@@ -9,7 +9,8 @@ public static class FrameCodec
 {
     /// <summary>
     /// Предел кадра в обе стороны. Подключиться к каналу могут и обычные пользователи, а окончательно права клиента
-    /// служба проверяет только после первого кадра: предел держит в границах память, которую клиент занимает кадром.
+    /// служба проверяет только после первого кадра: первый кадр она читает с меньшим пределом
+    /// (<see cref="ReadAsync(Stream, int, CancellationToken)"/>), а этот действует после проверки.
     /// </summary>
     public const int MaxFrameBytes = 2 * 1024 * 1024;
 
@@ -40,9 +41,18 @@ public static class FrameCodec
     }
 
     /// <summary>Читает кадр; null — поток закрыт до начала кадра.</summary>
-    public static async Task<byte[]?> ReadAsync(Stream stream, CancellationToken cancellationToken)
+    public static Task<byte[]?> ReadAsync(Stream stream, CancellationToken cancellationToken) =>
+        ReadAsync(stream, MaxFrameBytes, cancellationToken);
+
+    /// <summary>
+    /// Читает кадр не длиннее <paramref name="maxBytes"/>; null — поток закрыт до начала кадра. Длина проверяется по
+    /// заголовку до выделения буфера: служба так ограничивает первый кадр клиента, права которого ещё не проверены.
+    /// </summary>
+    public static async Task<byte[]?> ReadAsync(Stream stream, int maxBytes, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxBytes);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxBytes, MaxFrameBytes);
         var header = new byte[4];
         if (!await ReadExactAsync(stream, header, allowEof: true, cancellationToken))
         {
@@ -50,7 +60,7 @@ public static class FrameCodec
         }
 
         var length = BinaryPrimitives.ReadInt32LittleEndian(header);
-        if (length is < 0 or > MaxFrameBytes)
+        if (length < 0 || length > maxBytes)
         {
             throw new IpcProtocolException("Недопустимая длина сообщения.");
         }

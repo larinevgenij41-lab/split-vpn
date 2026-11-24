@@ -292,11 +292,12 @@ public sealed class DnsProxyServer : IAsyncDisposable
     /// стек отвечает ошибкой 10049. Слушатель не эксклюзивный: чужая программа по-прежнему может занять порт
     /// на своём адресе (DNS WSL, Hyper-V, общий доступ к интернету), и её запросы достаются ей, а запросы
     /// к 127.0.0.1 - основному слушателю. Адрес слушателя виден из сети, поэтому он отвечает только на запросы
-    /// с адресов этого компьютера (<see cref="IsLocalSource"/>).
+    /// с адресов этого компьютера (<see cref="IsLocalSource"/>). Адрес, который служба объявляет DNS-сервером
+    /// адаптера, посредник сверх того занимает эксклюзивно (<see cref="ClaimAdapterAddresses"/>).
     /// </summary>
     public bool ServeAdapterAddresses { get; init; }
 
-    /// <summary>Занят ли слушатель всех адресов: только тогда адаптеру можно ставить DNS на его собственный адрес.</summary>
+    /// <summary>Занят ли слушатель всех адресов (для тестов и диагностики).</summary>
     public bool AdapterListening
     {
         get
@@ -309,6 +310,140 @@ public sealed class DnsProxyServer : IAsyncDisposable
     }
 
     private Listener? _wildcard;
+
+    /// <summary>Эксклюзивно занятые адреса адаптеров (<see cref="ClaimAdapterAddresses"/>).</summary>
+    private readonly Dictionary<IPAddress, Listener> _claimed = [];
+
+    /// <summary>Адреса, занять которые не удалось: предупреждение пишется один раз, а не на каждой сверке.</summary>
+    private readonly HashSet<IPAddress> _claimFailures = [];
+
+    /// <summary>
+    /// Циклы приёма занятых адресов, в том числе уже освобождённых и ещё не вышедших: остановка посредника ждёт их
+    /// до освобождения семафоров, иначе запоздалый цикл запустил бы обработчик на освобождённых ресурсах.
+    /// </summary>
+    private readonly List<Task> _claimLoops = [];
+
+    /// <summary>
+    /// Эксклюзивно (SO_EXCLUSIVEADDRUSE, UDP и TCP) занимает порт посредника на адресах адаптеров и обслуживает их
+    /// тем же обработчиком, что и слушатель всех адресов, - только для отправителей с этого компьютера. Аудит
+    /// 24.11.2026: при не эксклюзивном слушателе всех адресов процесс без прав администратора занимал
+    /// &lt;адрес адаптера&gt;:53 - более точная привязка выигрывает - и получал запросы всей системы первым, ведь
+    /// адрес адаптера стоит первым DNS-сервером. Эксклюзивно занятый адрес чужой процесс занять уже не может, а
+    /// остальные адреса (ICS 192.168.137.1, Default Switch Hyper-V, WSL) остаются свободны для своих резолверов.
+    /// Возвращает адреса набора, которые сейчас заняты эксклюзивно (в том числе занятые раньше); только их служба
+    /// вправе объявлять DNS-серверами адаптеров. Адрес, уже занятый другим процессом, в ответ не входит: попытка
+    /// повторяется при следующем вызове (служба вызывает его на каждой сверке). Ранее занятые адреса вне набора
+    /// не освобождаются: служба сначала убирает адрес из DNS адаптера, потом зовёт <see cref="ReleaseAdapterAddresses"/>.
+    /// </summary>
+    public IReadOnlyList<IPAddress> ClaimAdapterAddresses(IEnumerable<IPAddress> addresses)
+    {
+        ArgumentNullException.ThrowIfNull(addresses);
+        var held = new List<IPAddress>();
+        var messages = new List<string>();
+        lock (_workGate)
+        {
+            if (_disposeTask is not null || _listeners.Count == 0)
+            {
+                return held;
+            }
+
+            var port = _listeners[0].EndPoint.Port;
+            foreach (var address in addresses.Distinct())
+            {
+                if (address.AddressFamily != AddressFamily.InterNetwork || IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any))
+                {
+                    continue;
+                }
+
+                if (_claimed.ContainsKey(address))
+                {
+                    held.Add(address);
+                    continue;
+                }
+
+                var endpoint = new IPEndPoint(address, port);
+                Listener claimed;
+                try
+                {
+                    // Bind при неудаче не держит ни UDP, ни TCP: частичного захвата не остаётся.
+                    claimed = Bind(endpoint);
+                }
+                catch (SocketException ex)
+                {
+                    if (_claimFailures.Add(address))
+                    {
+                        messages.Add($"DNS-посредник не занял {endpoint} эксклюзивно ({ex.SocketErrorCode}): порт держит другая " +
+                            "программа. Адрес адаптера DNS-сервером не ставится - только 127.0.0.1, проверка интернета Windows " +
+                            "на адаптере может не пройти; попытки продолжаются");
+                    }
+
+                    continue;
+                }
+
+                _claimed.Add(address, claimed);
+                _claimLoops.RemoveAll(t => t.IsCompleted);
+                _claimLoops.Add(Task.Run(() => UdpLoopAsync(claimed, _stop.Token, localOnly: true), CancellationToken.None));
+                _claimLoops.Add(Task.Run(() => TcpAcceptLoopAsync(claimed.Tcp!, _stop.Token, localOnly: true), CancellationToken.None));
+                if (_claimFailures.Remove(address))
+                {
+                    messages.Add($"DNS-посредник занял {endpoint} эксклюзивно");
+                }
+
+                held.Add(address);
+            }
+        }
+
+        foreach (var message in messages)
+        {
+            Warn(message);
+        }
+
+        return held;
+    }
+
+    /// <summary>
+    /// Освобождает эксклюзивно занятые адреса адаптеров, кроме <paramref name="keep"/>. Вызывается после того, как
+    /// адрес убран из DNS адаптеров: иначе на мгновение адрес стоял бы DNS-сервером, не будучи занят.
+    /// </summary>
+    public void ReleaseAdapterAddresses(IEnumerable<IPAddress> keep)
+    {
+        ArgumentNullException.ThrowIfNull(keep);
+        var kept = keep.ToHashSet();
+        var released = new List<Listener>();
+        lock (_workGate)
+        {
+            if (_disposeTask is not null)
+            {
+                return;
+            }
+
+            foreach (var address in _claimed.Keys.Where(a => !kept.Contains(a)).ToList())
+            {
+                released.Add(_claimed[address]);
+                _claimed.Remove(address);
+            }
+
+            _claimFailures.RemoveWhere(a => !kept.Contains(a));
+        }
+
+        // Циклы приёма выходят сами по закрытому сокету и остаются в _claimLoops до остановки посредника.
+        foreach (var listener in released)
+        {
+            listener.Close();
+        }
+    }
+
+    /// <summary>Эксклюзивно занятые адреса адаптеров (для тестов).</summary>
+    internal IReadOnlyList<IPAddress> ClaimedAdapterAddresses
+    {
+        get
+        {
+            lock (_workGate)
+            {
+                return [.. _claimed.Keys];
+            }
+        }
+    }
 
     /// <summary>Адрес слушателя всех адресов (для тестов).</summary>
     internal IPEndPoint? AdapterEndPoint
@@ -699,9 +834,13 @@ public sealed class DnsProxyServer : IAsyncDisposable
     {
         await _stop.CancelAsync();
         Listener[] listeners;
+        Task[] claimLoops;
         lock (_workGate)
         {
-            listeners = _wildcard is { } wildcard ? [.. _listeners, wildcard] : _listeners.ToArray();
+            // После установки _disposeTask (под этой же блокировкой) новые адреса не занимаются: снимок полный.
+            listeners = [.. _listeners, .. _wildcard is { } wildcard ? [wildcard] : Array.Empty<Listener>(), .. _claimed.Values];
+            _claimed.Clear();
+            claimLoops = [.. _claimLoops];
         }
 
         foreach (var listener in listeners)
@@ -709,7 +848,7 @@ public sealed class DnsProxyServer : IAsyncDisposable
             listener.Close();
         }
 
-        await Task.WhenAll(_loops.Select(t => t.ContinueWith(_ => { }, TaskScheduler.Default)));
+        await Task.WhenAll(_loops.Concat(claimLoops).Select(t => t.ContinueWith(_ => { }, TaskScheduler.Default)));
         // Приём уже завершён: новых обработчиков не будет. Сначала они вернут разрешения
         // семафоров и закроют клиентские сокеты, затем можно освобождать общие ресурсы.
         Task[] workers;

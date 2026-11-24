@@ -62,6 +62,7 @@ internal static class TunnelDiagScenario
         }
         finally
         {
+            report.BeginCleanup();
             Array.Clear(password);
             var cleanup = RouteOps.RemoveAllMarked();
             report.Measure("cleanupRoutesRemoved", cleanup.Removed);

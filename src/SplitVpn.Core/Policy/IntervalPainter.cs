@@ -170,6 +170,48 @@ internal sealed class IntervalPainter
         _segments.InsertRange(first, replacement);
     }
 
+    /// <summary>
+    /// <see cref="PaintKeeping(Ipv4Range, Classification, Func{Classification, bool})"/> для всего слоя за один
+    /// проход: десятки тысяч сетей шлюза по одной сдвигали бы хвост списка на каждой вставке.
+    /// </summary>
+    public void PaintKeeping(RangeSet ranges, Classification label, Func<Classification, bool> keep)
+    {
+        ArgumentNullException.ThrowIfNull(ranges);
+        ArgumentNullException.ThrowIfNull(keep);
+        if (ranges.Count == 0)
+        {
+            return;
+        }
+
+        if (ranges.Count == 1)
+        {
+            PaintKeeping(ranges[0], label, keep);
+            return;
+        }
+
+        var result = new List<Segment>(_segments.Count + (ranges.Count * 2));
+        var next = 0;
+        foreach (var segment in _segments)
+        {
+            // Защищённый участок остаётся как есть; диапазоны, целиком лежащие в нём, пропускаются.
+            if (keep(segment.Label))
+            {
+                Append(result, segment);
+                while (next < ranges.Count && ranges[next].End <= segment.End)
+                {
+                    next++;
+                }
+
+                continue;
+            }
+
+            next = PaintSegment(segment, ranges, next, label, result);
+        }
+
+        _segments.Clear();
+        _segments.AddRange(result);
+    }
+
     public Classification Classify(uint address) => _segments[IndexOf(address)].Label;
 
     /// <summary>Множество адресов, у которых решение совпадает с заданным.</summary>

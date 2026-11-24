@@ -31,10 +31,22 @@ public sealed class IpcServer(Coordinator coordinator, ILogger<IpcServer> logger
     /// переподключается, как при перезапуске службы.
     /// </summary>
     internal static readonly TimeSpan FirstFrameTimeout = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Предел первого кадра: до олицетворения права клиента не подтверждены, и кадр в 2 МБ занимал бы память службы
+    /// по просьбе любого пользователя. Клиенты начинают с проверки версии (запрос состояния) — это десятки байт;
+    /// после проверки прав действует общий <see cref="FrameCodec.MaxFrameBytes"/>.
+    /// </summary>
+    internal const int MaxFirstFrameBytes = 64 * 1024;
+
     private static readonly TimeSpan CreateRetryDelay = TimeSpan.FromSeconds(1);
 
-    /// <summary>Сколько остановка ждёт клиентов, обслуживаемых в этот момент.</summary>
-    private static readonly TimeSpan ClientShutdownWait = TimeSpan.FromSeconds(10);
+    /// <summary>
+    /// Сколько остановка ждёт клиентов, обслуживаемых в этот момент. Команды, меняющие состояние, выполняются под
+    /// сроком жизни координатора и с уходом канала не обрываются, а общий срок остановки службы (HostOptions) делят
+    /// ещё очередь координатора и помощники AnyConnect и SSH (расчёт - у CoordinatorHost.ShutdownTimeout).
+    /// </summary>
+    private static readonly TimeSpan ClientShutdownWait = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan WarningInterval = TimeSpan.FromMinutes(10);
 
     private readonly Dictionary<string, DateTimeOffset> _deniedWarnings = new(StringComparer.OrdinalIgnoreCase);
@@ -52,7 +64,7 @@ public sealed class IpcServer(Coordinator coordinator, ILogger<IpcServer> logger
     /// <summary>Сколько новых имён подряд пробуется без паузы, если первый экземпляр канала не создаётся.</summary>
     internal const int MaxBusyNames = 5;
 
-    /// <summary>Проверка клиента до первого кадра: false — отказ, null — не определить. В тестах — своя.</summary>
+    /// <summary>Проверка клиента до первого кадра: false — отказ, null — не определить (тоже отказ). В тестах — своя.</summary>
     internal Func<NamedPipeServerStream, bool?>? Precheck { get; init; }
 
     /// <summary>ACL канала; в тестах — null (права создателя), иначе процесс без SYSTEM не создаст второй экземпляр.</summary>
@@ -216,18 +228,28 @@ public sealed class IpcServer(Coordinator coordinator, ILogger<IpcServer> logger
             {
                 // Клиент без прав отсекается сразу, по токену процесса: ответ «отказано» уходит до его запроса,
                 // клиент прочтёт его и после разрыва (IpcClient), а экземпляр канала освобождается немедленно.
-                if ((Precheck ?? (p => PrecheckClientProcess(p, trace)))(pipe) == false)
+                // Не определённый клиент (процесс уже завершился, дескриптор канала передан другому процессу) — тоже
+                // отказ: иначе он три секунды держал бы экземпляр канала в ожидании первого кадра. Достоверно
+                // признать в нём SYSTEM нечем — токен не открылся, — поэтому исключения нет и для него.
+                var precheck = (Precheck ?? (p => PrecheckClientProcess(p, trace)))(pipe);
+                if (precheck != true)
                 {
+                    if (precheck is null)
+                    {
+                        trace.DenialReason = "процесс клиента не открылся (завершился или дескриптор канала передан другому)";
+                    }
+
                     TraceDenied(trace, "по токену процесса до первого кадра");
                     await WriteAsync(pipe, DeniedResponse, cancellationToken);
                     return;
                 }
 
                 // Олицетворение клиента канала возможно только после чтения данных: сначала первый кадр, затем
-                // окончательная проверка — номер процесса клиента подтверждением прав не служит.
+                // окончательная проверка — номер процесса клиента подтверждением прав не служит. Первый кадр —
+                // с малым пределом: права ещё не подтверждены, а буфер под кадр выделяется по его заголовку.
                 using var firstFrameTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 firstFrameTimeout.CancelAfter(FirstFrameTimeout);
-                var first = await FrameCodec.ReadAsync(pipe, firstFrameTimeout.Token);
+                var first = await FrameCodec.ReadAsync(pipe, MaxFirstFrameBytes, firstFrameTimeout.Token);
                 if (first is null)
                 {
                     return;
@@ -357,7 +379,10 @@ public sealed class IpcServer(Coordinator coordinator, ILogger<IpcServer> logger
 
     private static IpcResponse DeniedResponse => IpcResponse.Failure(IpcErrorCodes.Denied, "Управление службой доступно только администратору компьютера.");
 
-    /// <summary>Токен процесса клиента: только отказ — подтверждение прав остаётся за олицетворением.</summary>
+    /// <summary>
+    /// Токен процесса клиента: true — можно читать первый кадр (подтверждение прав остаётся за олицетворением),
+    /// false — не администратор, null — процесс не открылся; null вызывающий считает отказом.
+    /// </summary>
     private bool? PrecheckClientProcess(NamedPipeServerStream pipe, IpcConnectionTrace trace)
     {
         try
@@ -458,7 +483,7 @@ public sealed class IpcServer(Coordinator coordinator, ILogger<IpcServer> logger
             var next = ReadNextAsync(pipe, client);
             try
             {
-                await HandleFrameAsync(pipe, payload, trace, client.Token, stoppingToken);
+                await HandleFrameAsync(pipe, payload, trace, client.Token);
             }
             catch
             {
@@ -492,14 +517,13 @@ public sealed class IpcServer(Coordinator coordinator, ILogger<IpcServer> logger
         }
     }
 
-    private async Task HandleFrameAsync(NamedPipeServerStream pipe, byte[] payload, IpcConnectionTrace trace,
-        CancellationToken cancellationToken, CancellationToken stoppingToken)
+    private async Task HandleFrameAsync(NamedPipeServerStream pipe, byte[] payload, IpcConnectionTrace trace, CancellationToken cancellationToken)
     {
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var request = IpcSerializer.TryDeserializeRequest(payload);
         var response = request is null
             ? IpcResponse.Failure(IpcErrorCodes.BadRequest, "Неверный или неизвестный запрос.")
-            : await coordinator.SubmitAsync(request, cancellationToken, stoppingToken);
+            : await SubmitAsync(request, cancellationToken);
         await WriteAsync(pipe, response, cancellationToken);
         if (logger.IsEnabled(LogLevel.Debug) && trace.Record(request, response, System.Diagnostics.Stopwatch.GetElapsedTime(started)) is { } line)
         {
@@ -507,6 +531,15 @@ public sealed class IpcServer(Coordinator coordinator, ILogger<IpcServer> logger
             logger.LogDebug("IPC {Line} ← {Caller}", line, trace.Caller);
         }
     }
+
+    /// <summary>
+    /// Запрос клиента в очередь координатора. <paramref name="clientWait"/> — ожидание клиента: оно снимается и
+    /// уходом клиента, и остановкой канала. Команды, меняющие состояние, идут под сроком жизни координатора, а не
+    /// канала: хост останавливает канал раньше координатора, и под токеном канала остановка службы посреди
+    /// «Отключить» или «Восстановить сеть» обрывала бы сверку и оставляла ложное «неполное применение».
+    /// </summary>
+    internal Task<IpcResponse> SubmitAsync(IpcRequest request, CancellationToken clientWait) =>
+        coordinator.SubmitAsync(request, clientWait, coordinator.ServiceLifetime);
 
     private static Task WriteAsync(Stream pipe, IpcResponse response, CancellationToken cancellationToken)
     {

@@ -19,7 +19,7 @@ using SplitVpn.Windows.Wfp;
 var paths = ServicePaths.Default;
 if (args.Length > 0 && string.Equals(args[0], "recover", StringComparison.OrdinalIgnoreCase))
 {
-    return await ServiceRecovery.RunAsync(paths, uninstall: args.Contains("--uninstall", StringComparer.OrdinalIgnoreCase));
+    return await ServiceRecovery.RunAsync(paths, ServiceRecovery.ParseMode(args));
 }
 
 // Владелец, защищённый DACL и права потомков — до первого обращения к данным, в том числе до журнала.
@@ -43,9 +43,17 @@ foreach (var warning in dataWarnings)
     Log.Warning("Каталог данных: {Problem}", warning);
 }
 
+// Разрешение установщику стереть данные (PurgeData) действует только внутри удаления; служба запустилась - удаление
+// отменено или откачено, и отметка снимается. Сбой - только в журнал.
+ServiceRecovery.ClearStalePurgeMark(problem => Log.Warning("Удаление программы: {Problem}", problem));
+
 try
 {
     var builder = Host.CreateApplicationBuilder(args);
+    // Остановка идёт по шагам: канал управления (до 3 с), очередь координатора и затем помощники AnyConnect и движок
+    // SSH (параллельно, до 15 с). Общий срок - меньше 30 с, которые установщик ждёт остановки службы (расчёт - у
+    // CoordinatorHost.ShutdownTimeout).
+    builder.Services.Configure<HostOptions>(options => options.ShutdownTimeout = CoordinatorHost.ShutdownTimeout);
     builder.Services.AddWindowsService(options => options.ServiceName = ServicePaths.ServiceName);
     if (Microsoft.Extensions.Hosting.WindowsServices.WindowsServiceHelpers.IsWindowsService())
     {
@@ -148,10 +156,24 @@ internal sealed class RouteSinkHost(Coordinator coordinator, ServiceDependencies
 internal sealed class CoordinatorHost(Coordinator coordinator, ILogger<CoordinatorHost> logger) : BackgroundService
 {
     /// <summary>
-    /// Запасной предел ожидания помощников: 2 с на дописывание канала, их собственный срок выхода 15 с и 3 с на конец
-    /// процесса после принудительного завершения.
+    /// Предел ожидания помощников AnyConnect. Прощание со шлюзом обычно занимает секунды; собственный срок выхода
+    /// помощника (15 с, затем принудительное завершение) может оказаться длиннее - тогда его завершит закрытие Job
+    /// при выходе службы. Предел ограничен сроком остановки (<see cref="ShutdownTimeout"/>), а не сроком помощника.
     /// </summary>
-    private static readonly TimeSpan AnyConnectExitBudget = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan AnyConnectExitBudget = TimeSpan.FromSeconds(15);
+
+    /// <summary>Предел ожидания движка «VPN поверх SSH»: он завершается по команде и прощаться ему не с кем.</summary>
+    private static readonly TimeSpan SshExitBudget = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Общий срок остановки хоста. Установщик (ServiceControl Wait="yes") ждёт остановки службы около 30 с, иначе
+    /// ошибка 1921 и возможный откат обновления, поэтому сумма должна быть заведомо меньше 30 с. Шаги хоста идут друг
+    /// за другом (в обратном порядке регистрации): канал управления ждёт клиентов до 3 с (IpcServer.ClientShutdownWait),
+    /// затем координатор доводит текущую работу очереди под отменой и ждёт выхода помощников: AnyConnect до 15 с и SSH
+    /// до 5 с параллельно, то есть до 15 с. Итого 3 + 15 = 18 с плюс работа очереди; 28 с оставляют ей 10 с, а сверх
+    /// срока хост перестаёт ждать, и процесс завершается с запасом 2 с до предела установщика (на сброс журнала).
+    /// </summary>
+    internal static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(28);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -164,26 +186,12 @@ internal sealed class CoordinatorHost(Coordinator coordinator, ILogger<Coordinat
             // Остановка службы: фильтры, маршруты и соединения RAS остаются — новая служба их подхватит.
             // Сеанс AnyConnect не переносится между процессами: его сети снимаются, помощник прощается со шлюзом.
             // Выход службы закрывает Job помощников (KILL_ON_JOB_CLOSE): ждём, пока они попрощаются со шлюзом.
-            // Сам сеанс помощника ограничивает ожидание (15 с на выход, затем завершение); предел здесь — запасной.
-            try
-            {
-                await coordinator.ShutdownAnyConnect().WaitAsync(AnyConnectExitBudget, CancellationToken.None);
-            }
-            catch (TimeoutException)
-            {
-                logger.LogWarning("Помощники AnyConnect не завершились за {Seconds} с", AnyConnectExitBudget.TotalSeconds);
-            }
-
-            try
-            {
-                // Движок «VPN поверх SSH» службу не переживает (он в её Job): завершаем его сами и ждём выхода.
-                await coordinator.ShutdownSshTunnels().WaitAsync(TimeSpan.FromSeconds(5), CancellationToken.None);
-            }
-            catch (TimeoutException)
-            {
-                logger.LogWarning("Движок «VPN поверх SSH» не завершился за отведённое время");
-            }
-
+            // Сам сеанс помощника ограничивает ожидание (15 с на выход, затем завершение); здесь ждём не дольше
+            // AnyConnectExitBudget, чтобы остановка уложилась в срок установщика.
+            // Движок «VPN поверх SSH» службу не переживает (он в её Job): завершаем его сами и ждём выхода.
+            // Синхронная часть (снятие сетей AnyConnect, команды выхода) идёт в прежнем порядке, а ожидание выхода
+            // процессов — параллельно: друг от друга они не зависят, и последовательные пределы не складываются.
+            await WaitExitAsync(coordinator.ShutdownAnyConnect(), coordinator.ShutdownSshTunnels());
             logger.LogInformation("Служба останавливается; системные объекты сохранены для подхвата.");
         }
         catch (Exception ex)
@@ -194,6 +202,29 @@ internal sealed class CoordinatorHost(Coordinator coordinator, ILogger<Coordinat
             logger.LogCritical(ex, "Цикл координатора остановлен ошибкой: служба завершается для перезапуска");
             await Log.CloseAndFlushAsync();
             Environment.Exit(1);
+        }
+    }
+
+    private async Task WaitExitAsync(Task anyConnect, Task ssh)
+    {
+        var sshLimit = Task.Delay(SshExitBudget, CancellationToken.None);
+        var anyConnectLimit = Task.Delay(AnyConnectExitBudget, CancellationToken.None);
+        if (await Task.WhenAny(ssh, sshLimit) != ssh)
+        {
+            logger.LogWarning("Движок «VPN поверх SSH» не завершился за {Seconds} с", SshExitBudget.TotalSeconds);
+        }
+
+        if (await Task.WhenAny(anyConnect, anyConnectLimit) != anyConnect)
+        {
+            logger.LogWarning("Помощники AnyConnect не завершились за {Seconds} с", AnyConnectExitBudget.TotalSeconds);
+        }
+
+        foreach (var (task, name) in new[] { (anyConnect, "помощников AnyConnect"), (ssh, "движка «VPN поверх SSH»") })
+        {
+            if (task.IsFaulted)
+            {
+                logger.LogWarning(task.Exception?.GetBaseException(), "Остановка {Name} завершилась ошибкой", name);
+            }
         }
     }
 }

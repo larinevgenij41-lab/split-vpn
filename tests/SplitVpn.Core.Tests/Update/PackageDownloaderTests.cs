@@ -220,9 +220,9 @@ public sealed class PackageDownloaderTests : IDisposable
         Assert.Equal(Mirror, result.Url);
     }
 
-    /// <summary>Ограничение частоты: зеркала не перебираются, а срок повтора берётся из ответа.</summary>
+    /// <summary>Ограничение частоты у всех источников: зеркала перебраны, срок повтора берётся из ответа.</summary>
     [Fact]
-    public async Task RateLimited_StopsAndReportsRetryAfter()
+    public async Task RateLimitedEverywhere_TriesMirrorsAndReportsRetryAfter()
     {
         var calls = 0;
         var handler = new ScriptedHandler(_ =>
@@ -236,7 +236,7 @@ public sealed class PackageDownloaderTests : IDisposable
         var result = await Download(handler);
 
         Assert.Equal(FetchFailure.RateLimited, result.Failure);
-        Assert.Equal(1, calls);
+        Assert.Equal(2, calls);
         Assert.Equal(TimeSpan.FromMinutes(30), result.RetryAfter);
     }
 

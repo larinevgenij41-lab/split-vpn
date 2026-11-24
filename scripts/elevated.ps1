@@ -21,7 +21,28 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$logs = Join-Path $root 'logs'
+
+# Разрешения на запись корня репозитория для Everyone, Authenticated Users и BUILTIN\Users — по SID
+# (имена локализованы). Копия функции из publish-release.ps1, где такое дерево — ошибка выпуска.
+function Get-WritableTreeGrants([string]$path) {
+    $broad = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-11' = 'Authenticated Users'; 'S-1-5-32-545' = 'BUILTIN\Users' }
+    $writeMask = 0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+    foreach ($rule in (Get-Acl -LiteralPath $path).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        $sid = $rule.IdentityReference.Value
+        if ($rule.AccessControlType -ne 'Allow' -or -not $broad.ContainsKey($sid)) { continue }
+        if (([long]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
+        "$($broad[$sid]) ($sid): $($rule.FileSystemRights)"
+    }
+}
+
+# Команда исполняется от администратора или SYSTEM в каталоге репозитория и обычно запускает файлы из него.
+try { $writableGrants = @(Get-WritableTreeGrants $root) }
+catch { $writableGrants = @(); Write-Warning "Не удалось проверить разрешения ${root}: $($_.Exception.Message)" }
+if ($writableGrants.Count) {
+    Write-Warning "Корень репозитория $root доступен на запись обычным пользователям, а команда выполнится с повышенными правами — подменённый ими файл получит права администратора или SYSTEM:`n  $($writableGrants -join "`n  ")`nКак закрыть доступ — см. scripts\publish-release.ps1 (проверка ACL) или docs\RELEASE.md."
+}
+
+$logs =Join-Path $root 'logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $log = Join-Path $logs "$stamp-$Name.log"

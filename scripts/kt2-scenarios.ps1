@@ -431,7 +431,7 @@ Run 'switch-mode' {
     & $cli settings set --file $file | Out-Null
     Start-Sleep -Seconds 6
     $r.Data.RussiaDirect = Snapshot
-    Remove-Item $file -ErrorAction SilentlyContinue
+    Remove-Item $file, "$file.revision" -ErrorAction SilentlyContinue
     Check $r 'Россия напрямую: RU через Wi-Fi' ($r.Data.RussiaDirect.RussianLocal -like '192.168.1.*' -and $r.Data.RussiaDirect.ForeignLocal -like '192.168.44.*')
     Check $r 'RU-маршруты вернулись' ($r.Data.RussiaDirect.MarkedRoutes -gt 10000)
 }
@@ -459,7 +459,7 @@ Run 'switch-profile' {
     $json.profiles = @($json.profiles | Where-Object name -ne 'Копия'); WriteJson $json $file
     $r.Data.Delete = (& $cli settings set --file $file 2>&1 | Out-String).Trim()
     $deleteCode = $LASTEXITCODE
-    Remove-Item $file -ErrorAction SilentlyContinue
+    Remove-Item $file, "$file.revision" -ErrorAction SilentlyContinue
     Check $r 'копия удалена' ($deleteCode -eq 0 -and -not ((& $cli settings get | Out-String) -match 'Копия'))
     Check $r 'подключено' ((WaitState @('Connected') 60).state -eq 'Connected')
 }

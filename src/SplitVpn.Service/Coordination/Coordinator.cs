@@ -592,6 +592,7 @@ public sealed partial class Coordinator
         {
             warnings.AddRange(GroupWarnings());
             warnings.AddRange(PausedWarnings());
+            warnings.AddRange(GatewayNetworkWarnings());
         }
 
         warnings.AddRange(BypassWarnings());

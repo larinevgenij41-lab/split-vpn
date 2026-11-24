@@ -44,6 +44,14 @@ public sealed partial class ServiceHostViewModel : ObservableObject, IDisposable
     [NotifyPropertyChangedFor(nameof(Description))]
     private string _version = "";
 
+    /// <summary>Диспетчер служб; в проверках подменяется.</summary>
+    internal Func<ServiceHostState> QueryState { get; init; } = WindowsServiceHost.Query;
+
+    internal Func<string?> ReadVersion { get; init; } = WindowsServiceHost.Version;
+
+    /// <summary>Команда с повышением; ограничена сроком (WindowsServiceHost.CommandTimeout) и возвращает текст ошибки.</summary>
+    internal Func<ServiceHostAction, Task<string?>> RunElevated { get; init; } = WindowsServiceHost.RunElevatedAsync;
+
     public string Text => View.Text;
 
     public StateTone Tone => View.Tone switch
@@ -99,11 +107,11 @@ public sealed partial class ServiceHostViewModel : ObservableObject, IDisposable
 
     private void Update()
     {
-        var state = WindowsServiceHost.Query();
+        var state = QueryState();
         if (state != _state || (Version.Length == 0 && state != ServiceHostState.NotInstalled))
         {
             // Версию файла перечитываем только при смене состояния: после переустановки она могла измениться.
-            Version = state == ServiceHostState.NotInstalled ? "" : WindowsServiceHost.Version() ?? "";
+            Version = state == ServiceHostState.NotInstalled ? "" : ReadVersion() ?? "";
         }
 
         _state = state;
@@ -157,7 +165,7 @@ public sealed partial class ServiceHostViewModel : ObservableObject, IDisposable
         _main.ExpectServiceLoss(action != ServiceHostAction.Start);
         try
         {
-            if (await WindowsServiceHost.RunElevatedAsync(action) is { } error)
+            if (await RunElevated(action) is { } error)
             {
                 _main.CurrentPage.ShowError(error);
             }

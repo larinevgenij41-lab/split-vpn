@@ -10,8 +10,14 @@ public sealed class CompiledPolicy
     private readonly Dictionary<Guid, IReadOnlyList<Ipv4Cidr>> _tunnelCidrs = [];
     private readonly Dictionary<uint, RouteTarget> _pins;
 
-    internal CompiledPolicy(PolicyInput input, IntervalPainter painter, IReadOnlyList<PinnedHost> pins, IReadOnlyList<uint> directServerAddresses)
+    internal CompiledPolicy(
+        PolicyInput input,
+        IntervalPainter painter,
+        IReadOnlyList<PinnedHost> pins,
+        IReadOnlyList<uint> directServerAddresses,
+        IReadOnlyList<string>? warnings = null)
     {
+        Warnings = warnings ?? [];
         _painter = painter;
         Pins = pins;
         _pins = pins.ToDictionary(p => p.Address, p => p.Target);
@@ -31,6 +37,7 @@ public sealed class CompiledPolicy
     private CompiledPolicy(CompiledPolicy source, IReadOnlyList<PinnedHost> pins)
     {
         _painter = source._painter;
+        Warnings = source.Warnings;
         _tunnelRanges = source._tunnelRanges;
         _tunnelCidrs = source._tunnelCidrs;
         DefaultTarget = source.DefaultTarget;
@@ -87,6 +94,13 @@ public sealed class CompiledPolicy
     public IReadOnlyList<PinnedHost> Pins { get; }
 
     public int SegmentCount => _painter.Segments.Count;
+
+    /// <summary>
+    /// Предупреждения сборки: например, сети шлюза, отброшенные целиком за превышение пределов. Второй рубеж: служба
+    /// отбрасывает такой слой раньше (SessionInfo.IncludeCidrs) и сама сообщает об этом в журнал и статус, поэтому
+    /// список сейчас не читается - он для проверок и на случай нового источника сетей шлюза мимо этой проверки.
+    /// </summary>
+    public IReadOnlyList<string> Warnings { get; }
 
     /// <summary>
     /// Решение для адреса. Закрепление по правилу для домена важнее адресных слоёв: маршруты, фильтры
@@ -178,15 +192,8 @@ public static class PolicyCompiler
         painter.Paint(SpecialRanges.Reserved, Reserved(input.DefaultTarget));
         painter.Paint(SpecialRanges.LinkScope, local);
         Verify(painter, "зарезервированные и link-scope", input);
-        foreach (var (target, cidr, userRulesWin) in input.ServerNetworks
-            .SelectMany(n => n.Cidrs.Where(c => c.PrefixLength >= MinServerNetworkPrefix).Select(c => (n.Target, c, n.UserRulesWin)))
-            .OrderBy(n => n.c.PrefixLength))
-        {
-            // Запрет пользователя сохраняется всегда: адрес, который он запретил, не должен уйти в корпоративный
-            // туннель только потому, что шлюз прислал охватывающую сеть. С флагом UserRulesWin так же сохраняются
-            // все ручные правила, какой бы ни была длина их префикса.
-            painter.PaintKeeping(cidr.ToRange(), Label(target, DecisionSource.ServerNetwork), userRulesWin ? IsUserRule : IsUserBlock);
-        }
+        var warnings = new List<string>();
+        PaintServerNetworks(painter, input.ServerNetworks, warnings);
 
         Verify(painter, "сети шлюза", input);
         // Link-local, multicast и широковещание остаются локальными и тогда, когда шлюз прислал охватывающую их сеть.
@@ -218,7 +225,40 @@ public static class PolicyCompiler
         var groups = GroupMembers(input.Groups);
         painter.ExpandGroups(groups);
         Verify(painter, "раскрытие групп", input);
-        return new CompiledPolicy(input, painter, ResolvePins(input, painter, groups), directServers);
+        return new CompiledPolicy(input, painter, ResolvePins(input, painter, groups), directServers, warnings);
+    }
+
+    /// <summary>
+    /// Слой сетей шлюзов. Слой шлюза, вышедший за <see cref="GatewayNetworkLimits"/>, отбрасывается целиком
+    /// с предупреждением. Остальные красятся множествами: по одному проходу на пару «длина префикса, шлюз»
+    /// от широких к узким — тот же порядок, что при покраске по одной сети, но без O(n·m) вставок.
+    /// </summary>
+    private static void PaintServerNetworks(IntervalPainter painter, IReadOnlyList<ServerNetworks> networks, List<string> warnings)
+    {
+        var accepted = new List<ServerNetworks>(networks.Count);
+        foreach (var layer in networks)
+        {
+            if (GatewayNetworkLimits.Violation(GatewayNetworkLimits.Union(layer.Cidrs)) is { } violation)
+            {
+                warnings.Add($"Сети шлюза ({layer.Target}) отброшены целиком: {violation}.");
+                continue;
+            }
+
+            accepted.Add(layer);
+        }
+
+        for (var prefix = MinServerNetworkPrefix; prefix <= 32; prefix++)
+        {
+            foreach (var layer in accepted)
+            {
+                var length = prefix;
+                var ranges = RangeSet.From(layer.Cidrs.Where(c => c.PrefixLength == length));
+                // Запрет пользователя сохраняется всегда: адрес, который он запретил, не должен уйти в корпоративный
+                // туннель только потому, что шлюз прислал охватывающую сеть. С флагом UserRulesWin так же сохраняются
+                // все ручные правила, какой бы ни была длина их префикса.
+                painter.PaintKeeping(ranges, Label(layer.Target, DecisionSource.ServerNetwork), layer.UserRulesWin ? IsUserRule : IsUserBlock);
+            }
+        }
     }
 
     /// <summary>

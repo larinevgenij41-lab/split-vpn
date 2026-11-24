@@ -292,13 +292,25 @@ public static class IpcSerializer
 
     public static byte[] SerializeResponse(IpcResponse response) => JsonSerializer.SerializeToUtf8Bytes(response, JsonDefaults.Compact);
 
-    /// <summary>Разбирает запрос; неизвестный тип и неверный JSON дают null.</summary>
+    /// <summary>
+    /// Разбор запросов строже общего: null или пропуск поля, которое по аннотациям не может быть null
+    /// (saveSettings без settings, setProfileOrder без order), — неверный запрос, а не значения по умолчанию.
+    /// Иначе служба сохранила бы настройки по умолчанию, стерев все подключения. Файлы на диске читаются
+    /// прежними, нестрогими параметрами (<see cref="JsonDefaults.Options"/>): там null заменяет нормализация.
+    /// </summary>
+    private static readonly JsonSerializerOptions RequestOptions = new(JsonDefaults.Compact)
+    {
+        RespectNullableAnnotations = true,
+        RespectRequiredConstructorParameters = true,
+    };
+
+    /// <summary>Разбирает запрос; неизвестный тип, неверный JSON и null в обязательном поле дают null.</summary>
     public static IpcRequest? TryDeserializeRequest(byte[] payload)
     {
         try
         {
             using var document = JsonDocument.Parse(payload);
-            var request = JsonSerializer.Deserialize<IpcRequest>(payload, JsonDefaults.Compact);
+            var request = JsonSerializer.Deserialize<IpcRequest>(payload, RequestOptions);
             var version = document.RootElement.TryGetProperty("contractVersion", out var value)
                 && value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var parsed) ? parsed : 1;
             return request is null ? null : request with { ContractVersion = version };

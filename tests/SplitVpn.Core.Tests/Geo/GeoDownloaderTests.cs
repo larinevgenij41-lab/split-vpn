@@ -53,7 +53,7 @@ public class GeoDownloaderTests
     [Theory]
     [InlineData(HttpStatusCode.TooManyRequests)]
     [InlineData(HttpStatusCode.Forbidden)]
-    public async Task RateLimited_StopsAndReportsRetryAfter(HttpStatusCode code)
+    public async Task RateLimitedEverywhere_TriesMirrorsAndReportsRetryAfter(HttpStatusCode code)
     {
         var calls = 0;
         var handler = new ScriptedHandler(_ =>
@@ -68,7 +68,7 @@ public class GeoDownloaderTests
 
         Assert.Equal(FetchFailure.RateLimited, result.Failure);
         Assert.Equal(TimeSpan.FromMinutes(30), result.RetryAfter);
-        Assert.Equal(1, calls);
+        Assert.Equal(new LoyalsoldierSource().Urls.Count, calls);
     }
 
     [Fact]

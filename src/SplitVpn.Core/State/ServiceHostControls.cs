@@ -67,12 +67,27 @@ public static class ServiceHostCommands
     /// <summary>ERROR_SERVICE_NOT_ACTIVE: «Остановить» по уже остановленной службе — не ошибка.</summary>
     public const int NotActive = 1062;
 
-    /// <summary>Программа и аргументы. Перезапуск — одной командой, чтобы запрос прав администратора был один.</summary>
+    /// <summary>
+    /// Каталог System32. Программы запускаются с повышением по абсолютному пути из него: ShellExecute ищет голое имя
+    /// и в App Paths текущего пользователя (HKCU), и в текущем каталоге — туда можно подложить свою программу, и
+    /// пользователь одобрил бы в UAC её. Он же — рабочий каталог запуска.
+    /// </summary>
+    public static string WorkingDirectory => Environment.SystemDirectory;
+
+    /// <summary>Абсолютный путь к sc.exe.</summary>
+    public static string ScPath => Path.Combine(Environment.SystemDirectory, "sc.exe");
+
+    /// <summary>Абсолютный путь к Windows PowerShell.</summary>
+    public static string PowerShellPath => Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+
+    /// <summary>
+    /// Программа (абсолютный путь) и аргументы. Перезапуск — одной командой, чтобы запрос прав администратора был один.
+    /// </summary>
     public static (string FileName, string Arguments) For(ServiceHostAction action, string serviceName) => action switch
     {
-        ServiceHostAction.Start => ("sc.exe", "start " + serviceName),
-        ServiceHostAction.Stop => ("sc.exe", "stop " + serviceName),
-        _ => ("powershell.exe", $"-NoProfile -NonInteractive -WindowStyle Hidden -Command \"Restart-Service -Name {serviceName} -Force -ErrorAction Stop\""),
+        ServiceHostAction.Start => (ScPath, "start " + serviceName),
+        ServiceHostAction.Stop => (ScPath, "stop " + serviceName),
+        _ => (PowerShellPath, $"-NoProfile -NonInteractive -WindowStyle Hidden -Command \"Restart-Service -Name {serviceName} -Force -ErrorAction Stop\""),
     };
 
     /// <summary>sc.exe возвращает код ошибки Win32, PowerShell при ошибке командлета — 1.</summary>

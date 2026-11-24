@@ -11,7 +11,27 @@ param([string]$Configuration = 'Release', [string]$Version)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$publish = Join-Path $root 'artifacts\publish\install'
+
+# Разрешения на запись корня репозитория для Everyone, Authenticated Users и BUILTIN\Users — по SID
+# (имена локализованы). Копия функции из publish-release.ps1, где такое дерево — ошибка выпуска.
+function Get-WritableTreeGrants([string]$path) {
+    $broad = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-11' = 'Authenticated Users'; 'S-1-5-32-545' = 'BUILTIN\Users' }
+    $writeMask = 0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+    foreach ($rule in (Get-Acl -LiteralPath $path).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        $sid = $rule.IdentityReference.Value
+        if ($rule.AccessControlType -ne 'Allow' -or -not $broad.ContainsKey($sid)) { continue }
+        if (([long]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
+        "$($broad[$sid]) ($sid): $($rule.FileSystemRights)"
+    }
+}
+
+try { $writableGrants = @(Get-WritableTreeGrants $root) }
+catch { $writableGrants = @(); Write-Warning "Не удалось проверить разрешения ${root}: $($_.Exception.Message)" }
+if ($writableGrants.Count) {
+    Write-Warning "Корень репозитория $root доступен на запись обычным пользователям — собранный MSI может содержать подменённый ими код:`n  $($writableGrants -join "`n  ")`nКак закрыть доступ — см. scripts\publish-release.ps1 (проверка ACL) или docs\RELEASE.md."
+}
+
+$publish =Join-Path $root 'artifacts\publish\install'
 if (Test-Path $publish) { [IO.Directory]::Delete($publish, $true) }
 $env:DOTNET_NOLOGO = '1'
 

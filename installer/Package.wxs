@@ -2,9 +2,13 @@
 <!--
   Установщик «Раздельный VPN»: на весь компьютер, служба LocalSystem с автозапуском и перезапуском при сбоях.
   Обновление: остановка службы не трогает фильтры, маршруты и VPN — новая служба их подхватывает.
-  Удаление: «SplitVpn.Service.exe recover ‐‐uninstall» снимает всё и удаляет данные. Сбой этой команды удаление
+  Удаление идёт в два шага. До StopServices (deferred) «SplitVpn.Service.exe recover ‐‐uninstall-network» снимает
+  изменения в сети и, если сеть возвращена полностью, оставляет в HKLM\Software\SplitVpn отметку PurgeData. Данные
+  (%ProgramData%\SplitVpn) и ключ реестра удаляются только после фиксации удаления (PurgeData, Execute="commit"):
+  отменённое или откаченное удаление возвращает программу с настройками и паролями. Исполняемых файлов программы к
+  этому моменту уже нет (RemoveFiles), поэтому очистку делают cmd.exe и reg.exe из System32. Сбой команды удаление
   не прерывает: с 0.17.2 из-за него программу нельзя было удалить вовсе. Причина сбоя пишется в
-  %WINDIR%\Temp\SplitVpn-uninstall.log.
+  %ProgramData%\SplitVpn.Uninstall (каталог только для SYSTEM и Administrators, переживает удаление).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
@@ -45,11 +49,34 @@
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
     <Property Id="ARPNOMODIFY" Value="1" />
 
-    <!-- Разрешить всё → «recover ‐‐uninstall» только при полном удалении, не при обновлении. -->
-    <SetProperty Id="RecoverNetwork" Value="&quot;[INSTALLFOLDER]SplitVpn.Service.exe&quot; recover --uninstall" Before="RecoverNetwork" Sequence="execute" />
+    <!--
+      Путь установки не меняется: служба LocalSystem запускается из INSTALLFOLDER, а у произвольного каталога
+      (D:\Apps\...) родитель может принадлежать пользователю — он переименовал бы каталог программы и подложил свой.
+      Интерфейс и так принимает только службу из Program Files (IpcClient.VerifyServer). INSTALLFOLDER — публичное
+      свойство, поэтому значение из командной строки перекрывается здесь (действие типа 35 сразу после CostFinalize,
+      как MsiSetTargetPath). Только для новой установки (в том числе обновления: новый продукт ещё не установлен):
+      у установленного продукта путь берётся из его компонентов, а смена пути при восстановлении или удалении
+      завершилась бы ошибкой.
+    -->
+    <SetDirectory Id="INSTALLFOLDER" Value="[ProgramFiles64Folder]SplitVpn\" Sequence="both" Condition="NOT Installed" />
+
+    <!-- Сеть → «recover ‐‐uninstall-network» только при полном удалении, не при обновлении. Данные не трогает. -->
+    <SetProperty Id="RecoverNetwork" Value="&quot;[INSTALLFOLDER]SplitVpn.Service.exe&quot; recover --uninstall-network" Before="RecoverNetwork" Sequence="execute" />
     <CustomAction Id="RecoverNetwork" DllEntry="WixQuietExec" BinaryRef="Wix4UtilCA_X64" Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!--
+      Данные и ключ программы — после фиксации удаления и только с отметкой PurgeData (ServiceRecovery.PurgeMarkName):
+      без неё сеть возвращена не полностью, и копия исходных DNS в данных ещё нужна повторному восстановлению.
+      Отметку пишет SYSTEM в HKLM, а каталог данных к этому моменту свой и закрыт (recover проверил и защитил его);
+      rd /s не идёт по ссылкам внутри каталога. Ключ удаляется здесь, а не RemoveRegistryKey: тот сработал бы и при
+      обновлении и выключал бы подробный журнал.
+    -->
+    <SetProperty Id="PurgeData" Value="&quot;[System64Folder]cmd.exe&quot; /d /s /c &quot;&quot;[System64Folder]reg.exe&quot; query &quot;HKLM\Software\SplitVpn&quot; /v PurgeData &gt;nul 2&gt;&amp;1 &amp;&amp; (rd /s /q &quot;[CommonAppDataFolder]SplitVpn&quot; &amp; &quot;[System64Folder]reg.exe&quot; delete &quot;HKLM\Software\SplitVpn&quot; /f)&quot;" Before="PurgeData" Sequence="execute" />
+    <CustomAction Id="PurgeData" DllEntry="WixQuietExec" BinaryRef="Wix4UtilCA_X64" Execute="commit" Impersonate="no" Return="ignore" />
+
     <InstallExecuteSequence>
       <Custom Action="RecoverNetwork" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="PurgeData" Before="InstallFinalize" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
 
     <Feature Id="Main" Title="Раздельный VPN" Level="1" AllowAbsent="no">
@@ -78,6 +105,15 @@
 
   <Fragment>
     <ComponentGroup Id="ServiceComponents" Directory="INSTALLFOLDER">
+      <!-- Каталог программы: из него служба LocalSystem запускает себя и помощников. Защищённый DACL без
+           наследования (MsiLockPermissionsEx, SDDL «D:P…»): SYSTEM и Administrators — полный доступ, Users — только
+           чтение и выполнение (0x1200a9). Ставится в CreateFolders, до копирования файлов; файлы и подкаталоги
+           наследуют его. Без него каталог наследовал бы права родителя, а там бывает запись для Authenticated Users. -->
+      <Component Id="InstallFolderAcl" Guid="0B6E3D9A-7C21-4F58-9E4A-2D8B1C6F3A57">
+        <CreateFolder>
+          <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+        </CreateFolder>
+      </Component>
       <Component Id="ServiceExe" Guid="3A7C1E9B-5D42-4B8F-9C60-1F2E7A8D4C13">
         <File Id="ServiceExe" Source="$(ServiceDir)\SplitVpn.Service.exe" KeyPath="yes" />
         <ServiceInstall
@@ -136,8 +172,8 @@
         <RemoveFolder Id="RemoveDataFolder" On="uninstall" />
         <RegistryValue Root="HKLM" Key="Software\SplitVpn" Name="DataFolder" Type="string" Value="[DataFolder]" KeyPath="yes" />
         <!-- Имя канала управления (ControlPipe) и срок подробного журнала пишет служба. Ключ целиком удаляет
-             команда восстановления службы с ключом uninstall при настоящем удалении: RemoveRegistryKey сработал бы и при обновлении (оно удаляет
-             прежнюю версию целиком) и выключал бы включённый подробный журнал. -->
+             действие PurgeData после фиксации настоящего удаления: RemoveRegistryKey сработал бы и при обновлении
+             (оно удаляет прежнюю версию целиком) и выключал бы включённый подробный журнал. -->
       </Component>
     </ComponentGroup>
 

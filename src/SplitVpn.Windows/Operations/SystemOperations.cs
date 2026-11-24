@@ -548,7 +548,11 @@ public sealed class SystemDnsProxy(Action<string>? warning = null) : IDnsProxy, 
 
     public bool IsRunning => _server is not null;
 
-    public bool ServesAdapterAddresses => _server?.AdapterListening == true;
+    public IReadOnlyCollection<uint> ClaimAdapterAddresses(IReadOnlyCollection<uint> addresses) =>
+        _server is { } server ? [.. server.ClaimAdapterAddresses(addresses.Select(Ipv4.ToAddress)).Select(Ipv4.ToUInt)] : [];
+
+    public void ReleaseAdapterAddresses(IReadOnlyCollection<uint> keep) =>
+        _server?.ReleaseAdapterAddresses(keep.Select(Ipv4.ToAddress));
 
     internal static bool ListensIpv6Loopback => s_server?.OptionalListening == true;
 

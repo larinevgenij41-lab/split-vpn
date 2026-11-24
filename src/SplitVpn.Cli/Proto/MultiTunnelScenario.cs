@@ -33,6 +33,8 @@ internal static class MultiTunnelScenario
 
         ProtoContext.EnsureRoot();
         var connections = new List<(string Entry, RasConnectionHandle Handle, AdapterCandidate Adapter)>();
+        // Соединение, уже набранное, но ещё не попавшее в список: его тоже нужно разорвать при сбое или Ctrl+C.
+        RasConnectionHandle? pending = null;
         try
         {
             foreach (var (profile, slot) in new[] { (first, 1), (second, 2) })
@@ -50,10 +52,11 @@ internal static class MultiTunnelScenario
                     Array.Clear(password);
                 }
 
+                pending = result.Handle;
                 report.Check($"Туннель {slot} подключён", result.Success, result.ErrorText + " код " + result.ErrorCode);
                 if (!result.Success || result.Handle is not { } handle)
                 {
-                    return await FinishAsync(report, args, connections, secrets);
+                    return await FinishAsync(report, args, connections, secrets, pending);
                 }
 
                 var projection = RasClient.GetProjection(handle);
@@ -61,10 +64,11 @@ internal static class MultiTunnelScenario
                 report.Check($"Интерфейс туннеля {slot} найден", adapter is not null, Ipv4.Format(projection.ClientAddress));
                 if (adapter is null)
                 {
-                    return await FinishAsync(report, args, connections, secrets);
+                    return await FinishAsync(report, args, connections, secrets, pending);
                 }
 
                 connections.Add((entry, handle, adapter));
+                pending = null;
                 report.Note($"туннель {slot}: адрес {Ipv4.Format(projection.ClientAddress)}, интерфейс {adapter.Name}, LUID {adapter.Luid}");
             }
 
@@ -78,7 +82,7 @@ internal static class MultiTunnelScenario
             report.Fail("Спайк двух туннелей", ex);
         }
 
-        return await FinishAsync(report, args, connections, secrets);
+        return await FinishAsync(report, args, connections, secrets, pending);
     }
 
     /// <summary>Проба цели через каждый туннель: временный маршрут /32 и сокет, привязанный к его адресу.</summary>
@@ -122,9 +126,11 @@ internal static class MultiTunnelScenario
         ScenarioReport report,
         CliArgs args,
         List<(string Entry, RasConnectionHandle Handle, AdapterCandidate Adapter)> connections,
-        string[] secrets)
+        string[] secrets,
+        RasConnectionHandle? pending = null)
     {
         // Спайк всегда заканчивается снятыми маршрутами и разорванными соединениями.
+        report.BeginCleanup();
         try
         {
             RouteOps.Reconcile([]);
@@ -134,7 +140,7 @@ internal static class MultiTunnelScenario
             report.Note("маршруты пробы снять не удалось: " + ex.Message);
         }
 
-        foreach (var (_, handle, _) in connections)
+        foreach (var handle in connections.Select(c => c.Handle).Concat(pending is { } dialed ? [dialed] : []))
         {
             await RasClient.HangUpAsync(handle, CancellationToken.None);
         }

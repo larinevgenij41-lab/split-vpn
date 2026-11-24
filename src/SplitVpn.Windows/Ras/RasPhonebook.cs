@@ -229,9 +229,26 @@ public static unsafe class RasPhonebook
         }
     }
 
+    /// <summary>RAS: телефонная книга не открывается.</summary>
+    private const uint ErrorCannotOpenPhonebook = 615;
+
+    /// <summary>
+    /// Путь книги можно передать RAS: пустой (книга по умолчанию) или полный локальный на несъёмном диске. Путь
+    /// чужой книги приходит из RasEnumConnections, то есть от пользователя: \\server\share\x.pbk служба (SYSTEM)
+    /// открыла бы с учётной записью компьютера, отдав её NTLM-аутентификацию чужому узлу.
+    /// </summary>
+    internal static bool IsAcceptablePhonebook(string? phonebookPath, Func<string, DriveType>? driveType = null) =>
+        string.IsNullOrEmpty(phonebookPath)
+        || (driveType is null ? Security.LocalPath.IsLocalFixed(phonebookPath) : Security.LocalPath.IsLocalFixed(phonebookPath, driveType));
+
     private static uint TryRead(string? phonebookPath, string entryName, out RASENTRYW entry)
     {
         entry = new RASENTRYW { dwSize = (uint)sizeof(RASENTRYW) };
+        if (!IsAcceptablePhonebook(phonebookPath))
+        {
+            return ErrorCannotOpenPhonebook;
+        }
+
         var size = (uint)sizeof(RASENTRYW);
         uint deviceInfoSize = 0;
         var code = PInvoke.RasGetEntryProperties(phonebookPath, entryName, ref entry, ref size, default, ref deviceInfoSize);

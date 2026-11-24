@@ -57,6 +57,7 @@ internal static class DnsScenario
         }
         finally
         {
+            report.BeginCleanup();
             Array.Clear(password);
             RestoreDns(report, primary, store);
             RouteOps.RemoveAllMarked();
@@ -140,6 +141,20 @@ internal static class DnsScenario
 
         RasPhonebook.Save(ProtoContext.Phonebook, new RasEntrySpec(ProtoContext.EntryName, profile.Server, DnsServer: Ipv4.Parse("127.0.0.1")));
         var handle = await RasScenario.DialAndDescribeAsync(report, profile, password);
+        try
+        {
+            return await CheckVariantBAsync(report, handle, proxy);
+        }
+        catch (OperationCanceledException) when (CliCancellation.IsInterrupted && handle is { } dialed)
+        {
+            // Вызывающий держит описатель уже разорванного соединения: новое разрываем здесь.
+            await RasClient.HangUpAsync(dialed, CancellationToken.None);
+            throw;
+        }
+    }
+
+    private static async Task<RasConnectionHandle?> CheckVariantBAsync(ScenarioReport report, RasConnectionHandle? handle, DnsProxyServer proxy)
+    {
         var newTunnel = handle is null ? null : RasScenario.FindTunnel(RasClient.GetProjection(handle.Value).ClientAddress);
         if (newTunnel is null)
         {

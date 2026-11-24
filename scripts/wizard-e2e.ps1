@@ -56,6 +56,8 @@ function Probe([string]$ip) {
 $proto = Get-Content (Join-Path $env:ProgramData 'SplitVpn.Dev\proto.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $secretFile = Join-Path $env:ProgramData "SplitVpn.Dev\wizard-$([guid]::NewGuid().ToString('N')).tmp"
 & $cli creds export --file $secretFile | Out-Null
+# Код 2 — файл уже есть (экспорт пишет только в новый файл) или не задан; пароль тогда не записан.
+if ($LASTEXITCODE -ne 0) { throw "creds export завершился с кодом $LASTEXITCODE — пароль прототипа не получен." }
 $password = (Get-Content $secretFile -Raw -Encoding UTF8)
 [IO.File]::Delete($secretFile)
 if (-not $password) { throw 'Пароль прототипа не получен.' }

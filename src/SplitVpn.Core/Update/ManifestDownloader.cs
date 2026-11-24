@@ -45,7 +45,9 @@ public sealed class ManifestDownloader(HttpClient client, TimeSpan? timeout = nu
         FetchAsync(urls, etag, null, cancellationToken);
 
     /// <summary>
-    /// Перебирает адреса по порядку; при ограничении частоты к следующему не переходит. Ответ каждого
+    /// Перебирает адреса по порядку. Ограничение частоты (429) у одного источника не останавливает перебор:
+    /// зеркала у других хостов, и лимит основного адреса не должен закрывать их. Отказ «лимит» со сроком
+    /// повтора возвращается, только если не ответил ни один источник. Ответ каждого
     /// источника сразу проверяется (<paramref name="validate"/>: подпись, разбор, срок годности): отвергнутый
     /// ответ не останавливает перебор — иначе перехватчик на основном адресе, отдающий старый или испорченный
     /// манифест, закрывал бы и исправные зеркала. Если ни один источник не прошёл проверку, возвращается
@@ -57,6 +59,7 @@ public sealed class ManifestDownloader(HttpClient client, TimeSpan? timeout = nu
         ArgumentNullException.ThrowIfNull(urls);
         ManifestFetch? last = null;
         ManifestFetch? rejected = null;
+        ManifestFetch? rateLimited = null;
         foreach (var url in urls)
         {
             // ETag относится к основному адресу: у зеркал свои значения.
@@ -67,13 +70,18 @@ public sealed class ManifestDownloader(HttpClient client, TimeSpan? timeout = nu
                 continue;
             }
 
-            if (last.Ok || last.NotModified || last.Failure == FetchFailure.RateLimited)
+            if (last.Ok || last.NotModified)
             {
                 return last;
             }
+
+            if (last.Failure == FetchFailure.RateLimited)
+            {
+                rateLimited ??= last;
+            }
         }
 
-        return rejected ?? last ?? Failed(null, new FetchProblem(FetchFailure.Network, "Не задан адрес проверки обновлений."));
+        return rejected ?? rateLimited ?? last ?? Failed(null, new FetchProblem(FetchFailure.Network, "Не задан адрес проверки обновлений."));
     }
 
     private async Task<ManifestFetch> FetchOneAsync(Uri url, string? etag, CancellationToken cancellationToken)

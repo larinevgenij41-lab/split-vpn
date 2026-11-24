@@ -7,12 +7,24 @@ namespace SplitVpn.Cli.Proto;
 
 internal sealed record ScenarioCheck(string Name, bool Passed, string Details);
 
-/// <summary>Отчёт сценария: замеры, проверки и ошибки. Персональные данные маскируются при записи.</summary>
-internal sealed class ScenarioReport(string scenario)
+/// <summary>
+/// Отчёт сценария: замеры, проверки и ошибки. Персональные данные маскируются при записи.
+/// Каждая запись шага — точка прерывания: после Ctrl+C она бросает OperationCanceledException, сценарий
+/// попадает в свой catch и finally, и очистка (маршруты, DNS, RAS) выполняется. С <see cref="BeginCleanup"/>
+/// записи больше не прерываются, чтобы очистка дошла до конца.
+/// </summary>
+internal sealed class ScenarioReport
 {
     private readonly Stopwatch _clock = Stopwatch.StartNew();
+    private bool _cleanup;
 
-    public string Scenario { get; } = scenario;
+    public ScenarioReport(string scenario)
+    {
+        Scenario = scenario;
+        CliCancellation.Cooperate();
+    }
+
+    public string Scenario { get; }
 
     public string Account { get; } = WindowsIdentity.GetCurrent().Name;
 
@@ -29,6 +41,25 @@ internal sealed class ScenarioReport(string scenario)
     public bool Passed => Errors.Count == 0 && Checks.All(c => c.Passed);
 
     public void Note(string text)
+    {
+        Write(text);
+        if (!_cleanup)
+        {
+            CliCancellation.ThrowIfInterrupted();
+        }
+    }
+
+    /// <summary>Начало очистки (блок finally): дальнейшие записи не прерываются по Ctrl+C.</summary>
+    public void BeginCleanup()
+    {
+        _cleanup = true;
+        if (CliCancellation.IsInterrupted)
+        {
+            Write("Прервано пользователем — выполняется очистка.");
+        }
+    }
+
+    private void Write(string text)
     {
         var line = $"[{_clock.Elapsed:mm\\:ss\\.f}] {text}";
         Log.Add(line);
@@ -52,7 +83,8 @@ internal sealed class ScenarioReport(string scenario)
     {
         var message = ex is null ? text : $"{text}: {ex.GetType().Name}: {ex.Message}";
         Errors.Add(message);
-        Note("ОШИБКА " + message);
+        // Без точки прерывания: Fail вызывается из catch сценария, и запись ошибки не должна бросать снова.
+        Write("ОШИБКА " + message);
     }
 
     public async Task<int> SaveAsync(CliArgs args, IEnumerable<string?> secrets)

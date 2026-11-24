@@ -71,7 +71,8 @@ if (args.Length == 0 || !commands.TryGetValue(args[0], out var command))
     Console.WriteLine("Общие опции: --geo <ru.txt>, --report-dir <каталог>");
     Console.WriteLine("Служба (IPC, без повышения):");
     Console.WriteLine("  status [--json] | events [--since N] [--last N] | adapters");
-    Console.WriteLine("  settings get [--out <файл>] | settings set --file <файл>");
+    Console.WriteLine("  settings get [--out <файл>] | settings set --file <файл> [--revision <ревизия> | --force]");
+    Console.WriteLine("      get --out кладёт рядом <файл>.revision; set сверяет с ним ревизию службы (--force — записать поверх чужих изменений)");
     Console.WriteLine("  profile set --name <имя> --server <хост:порт> --user <имя> [--role primary|secondary|off] [--password-file <файл>] [--save-password|--no-save-password]  без --role роль прежняя, новое - опорное; без флага пароля выбор прежний, новое сохраняет пароль");
     Console.WriteLine("  profile set ... --ssh-host-key \"ssh-ed25519 AAAA...\" [--ssh-key-file <файл>]  подключение «VPN поверх SSH»");
     Console.WriteLine("  diagnostics --out <файл.zip>          архив службы для разбора: журналы, снимки состояния и сети");
@@ -92,12 +93,15 @@ if (args.Length == 0 || !commands.TryGetValue(args[0], out var command))
     return 2;
 }
 
+// Ctrl+C отменяет общий токен у команд, которые его наблюдают: так выполняется очистка в finally.
+CliCancellation.Install();
 try
 {
     return await command(new CliArgs(args.Skip(1).ToArray()));
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine("Ошибка: " + ex.Message);
-    return 1;
+    var (code, message) = CliExit.ForException(ex);
+    Console.Error.WriteLine(message);
+    return code;
 }

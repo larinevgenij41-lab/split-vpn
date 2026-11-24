@@ -42,6 +42,7 @@ public static class NetworkRecovery
                 UseShellExecute = true,
                 Verb = "runas",
                 WindowStyle = ProcessWindowStyle.Hidden,
+                WorkingDirectory = Environment.SystemDirectory,
             })!;
             // Сама команда recover ограничена тремя минутами и коротким сроком завершения.
             using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(4));
@@ -70,6 +71,7 @@ public static class NetworkRecovery
                 UseShellExecute = true,
                 Verb = "runas",
                 WindowStyle = ProcessWindowStyle.Hidden,
+                WorkingDirectory = Environment.SystemDirectory,
             })!;
             using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(2));
             await process.WaitForExitAsync(deadline.Token);

@@ -108,8 +108,8 @@ internal unsafe struct ShimCallbacks
 }
 
 /// <summary>
-/// Вызовы libopenconnect и прослойки ocshim. Библиотеки лежат рядом с exe и загружаются стандартным
-/// поиском Windows из каталога приложения.
+/// Вызовы libopenconnect и прослойки ocshim. Библиотеки лежат рядом с exe и загружаются из каталога
+/// приложения; поиск ограничен им и System32 (<see cref="DllSearch"/>), PATH и текущий каталог не смотрятся.
 /// </summary>
 internal static unsafe partial class OcNative
 {

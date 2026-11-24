@@ -47,28 +47,22 @@ public sealed record UiPreferences
     {
         ArgumentNullException.ThrowIfNull(baseline);
         using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
-        using var gate = new Mutex(false, @"Global\SplitVpn.UiPreferences." + identity.User!.Value);
-        try
+        // Файловая блокировка в своём профиле и мьютекс (UserGate). Имя мьютекса может занять другой пользователь
+        // компьютера: тогда остаётся файловая или запись без блокировки — настройки сохраняются в любом случае.
+        using var gate = UserGate.Enter(@"Global\SplitVpn.UiPreferences." + identity.User!.Value,
+            Path.Combine(Path.GetDirectoryName(FilePath)!, "ui.json.lock"), TimeSpan.FromSeconds(2), "Ui");
+        var current = Load();
+        var merged = current with
         {
-            if (!gate.WaitOne(TimeSpan.FromSeconds(2))) { throw new IOException("Файл настроек занят другим сеансом."); }
-        }
-        catch (AbandonedMutexException) { /* Прежний владелец завершился, блокировка получена. */ }
-        try
-        {
-            var current = Load();
-            var merged = current with
-            {
-                Theme = Theme == baseline.Theme ? current.Theme : Theme,
-                Notifications = Notifications == baseline.Notifications ? current.Notifications : Notifications,
-                ShowAdvanced = ShowAdvanced == baseline.ShowAdvanced ? current.ShowAdvanced : ShowAdvanced,
-                WizardDismissed = WizardDismissed == baseline.WizardDismissed ? current.WizardDismissed : WizardDismissed,
-                TrayHintShown = TrayHintShown == baseline.TrayHintShown ? current.TrayHintShown : TrayHintShown,
-            };
-            Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
-            AtomicFile.WriteAllText(FilePath, JsonSerializer.Serialize(merged, JsonDefaults.Options));
-            return merged;
-        }
-        finally { gate.ReleaseMutex(); }
+            Theme = Theme == baseline.Theme ? current.Theme : Theme,
+            Notifications = Notifications == baseline.Notifications ? current.Notifications : Notifications,
+            ShowAdvanced = ShowAdvanced == baseline.ShowAdvanced ? current.ShowAdvanced : ShowAdvanced,
+            WizardDismissed = WizardDismissed == baseline.WizardDismissed ? current.WizardDismissed : WizardDismissed,
+            TrayHintShown = TrayHintShown == baseline.TrayHintShown ? current.TrayHintShown : TrayHintShown,
+        };
+        Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+        AtomicFile.WriteAllText(FilePath, JsonSerializer.Serialize(merged, JsonDefaults.Options));
+        return merged;
     }
 }
 

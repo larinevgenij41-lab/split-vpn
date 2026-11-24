@@ -16,7 +16,19 @@
     Пароль ключа подписи, по порядку: -PasswordFile (открытый текст — только явно, с предупреждением),
     переменная SPLITVPN_SIGNING_KEY_PASSWORD, файл %USERPROFILE%\.splitvpn\release-signing.password.dpapi
     (DPAPI текущего пользователя, создаётся scripts\protect-signing-password.ps1), ввод в консоли.
-    Утилите подписи пароль передаётся через переменную окружения только на время её запуска.
+    Переменная SPLITVPN_SIGNING_KEY_PASSWORD сразу при запуске переносится в SecureString и удаляется
+    из окружения процесса (в том числе из сеанса PowerShell, откуда запущен скрипт): сборка, тесты и
+    сторонние программы её не видят. Утилите подписи пароль передаётся через переменную окружения только
+    на время её запуска.
+
+    Утилита подписи (splitvpn-cli) публикуется скриптом в чистый artifacts\release-tools и вызывается
+    только оттуда, также и при -SkipBuild; версия её файла сверяется с выпускаемой.
+
+    Рабочее дерево, доступное на запись обычным пользователям (Everyone, Authenticated Users, Users),
+    — ошибка выпуска: подменённый ими скрипт или исходник исполнился бы с правами выпускающего и попал
+    бы в подписанный выпуск. Осознанный обход — -AllowWritableTree.
+
+    Аудит уязвимостей пакетов NuGet включён; без доступа к api.nuget.org его отключает -OfflineNuGet.
 
     Манифест получает срок годности (-ManifestLifetimeDays, по умолчанию 60 суток): просроченный манифест
     программа не принимает и сообщает «новых версий не найдено». Срок ограничивает, сколько перехватчик
@@ -36,10 +48,22 @@ param(
     [string]$MinUpgradableVersion,
     [switch]$SkipBuild,
     [switch]$AllowNoWfpCheck,
+    [switch]$AllowWritableTree,
+    [switch]$OfflineNuGet,
     [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Пароль из окружения — первым делом, до любого дочернего процесса: переменную окружения наследуют все
+# они (git, gh, dotnet build, анализаторы и пакеты NuGet, тесты, sing-box.exe). Дальше пароль живёт
+# только в SecureString и попадает в окружение лишь на время запуска утилиты подписи.
+$environmentPassword = $null
+if ($env:SPLITVPN_SIGNING_KEY_PASSWORD) {
+    $environmentPassword = ConvertTo-SecureString $env:SPLITVPN_SIGNING_KEY_PASSWORD -AsPlainText -Force
+}
+Remove-Item Env:\SPLITVPN_SIGNING_KEY_PASSWORD -ErrorAction SilentlyContinue
+
 $root = Split-Path -Parent $PSScriptRoot
 $repository = 'larinevgenij41-lab/split-vpn'
 $gh = 'C:\Program Files\GitHub CLI\gh.exe'
@@ -98,8 +122,43 @@ function PlainText([Security.SecureString]$secure) {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
+# Разрешения на запись корня репозитория для широких групп: Everyone, Authenticated Users, BUILTIN\Users.
+# Сравнение по SID — имена групп в русской Windows локализованы. Учитываются и наследуемые только
+# дочерними (InheritOnly) правила: они дают запись во все файлы дерева. Та же функция есть в
+# build-installer.ps1, elevated.ps1 и install-dev-service.ps1.
+function Get-WritableTreeGrants([string]$path) {
+    $broad = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-11' = 'Authenticated Users'; 'S-1-5-32-545' = 'BUILTIN\Users' }
+    # WriteData, AppendData, DeleteSubdirectoriesAndFiles, Delete, ChangePermissions, TakeOwnership,
+    # GENERIC_ALL, GENERIC_WRITE: любое из них — это Write, Modify или FullControl.
+    $writeMask = 0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+    $rules = (Get-Acl -LiteralPath $path).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+    foreach ($rule in $rules) {
+        $sid = $rule.IdentityReference.Value
+        if ($rule.AccessControlType -ne 'Allow' -or -not $broad.ContainsKey($sid)) { continue }
+        if (([long]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
+        [pscustomobject]@{ Sid = $sid; Name = $broad[$sid]; Rights = $rule.FileSystemRights; Inherited = $rule.IsInherited }
+    }
+}
+
 # ---------------------------------------------------------------- проверки
 Step 'проверки'
+# Скрипт исполняет код из дерева (сборка, тесты, установщик) и подписывает результат ключом выпуска:
+# запись в дерево для обычных пользователей — это подмена выпуска без прав выпускающего.
+$writableGrants = @(Get-WritableTreeGrants $root)
+if ($writableGrants.Count) {
+    $grantList = ($writableGrants | ForEach-Object {
+        "  $($_.Name) ($($_.Sid)): $($_.Rights)$(if ($_.Inherited) { ', унаследовано' } else { ', задано явно' })"
+    }) -join "`n"
+    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $fix = "icacls `"$root`" /inheritance:r /grant:r `"*${userSid}:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`" `"*S-1-5-32-544:(OI)(CI)F`""
+    $explicitSids = @($writableGrants | Where-Object { -not $_.Inherited } | ForEach-Object Sid | Sort-Object -Unique)
+    foreach ($sid in $explicitSids) { $fix += "`nicacls `"$root`" /remove:g *$sid" }
+    if (-not $AllowWritableTree) {
+        throw "Корень репозитория $root доступен на запись обычным пользователям:`n$grantList`nЛюбой из них может подменить скрипт или исходник, который исполнится с вашими правами и попадёт в подписанный выпуск. Оставьте доступ только себе, SYSTEM и Администраторам (из консоли администратора):`n$fix`nОсознанно выпустить из такого дерева: -AllowWritableTree."
+    }
+    Write-Warning "Корень репозитория доступен на запись обычным пользователям (-AllowWritableTree):`n$grantList"
+}
+
 $declared = ([xml](Get-Content (Join-Path $root 'Directory.Build.props'))).Project.PropertyGroup.Version
 if (-not $Version) { $Version = $declared }
 if ($Version -ne $declared) { throw "Версия $Version не совпадает с Directory.Build.props ($declared)" }
@@ -113,12 +172,13 @@ if ($PasswordFile) {
     if (-not (Test-Path $PasswordFile)) { throw "Нет файла пароля: $PasswordFile" }
     Write-Warning "Пароль ключа подписи читается из открытого файла $PasswordFile. Переведите его в DPAPI: scripts\protect-signing-password.ps1 -RemovePlainText"
 }
-elseif ($env:SPLITVPN_SIGNING_KEY_PASSWORD) {
-    # Задан снаружи — утилита подписи возьмёт его сама.
+elseif ($environmentPassword) {
+    # Задан снаружи через SPLITVPN_SIGNING_KEY_PASSWORD; из окружения уже убран в начале скрипта.
+    $signingPassword = $environmentPassword
 }
 elseif (Test-Path $ProtectedPasswordFile) {
     # Формат ConvertFrom-SecureString без ключа — DPAPI текущего пользователя: расшифровать может только он.
-    $signingPassword = PlainText ((Get-Content -Raw $ProtectedPasswordFile).Trim() | ConvertTo-SecureString)
+    $signingPassword = (Get-Content -Raw $ProtectedPasswordFile).Trim() | ConvertTo-SecureString
 }
 else {
     # Открытый файл прежних выпусков сам не читается (только через -PasswordFile): подсказать перевод в DPAPI.
@@ -132,8 +192,9 @@ else {
         throw "Пароль ключа подписи не найден, а ввести его негде (неинтерактивный запуск). Создайте $ProtectedPasswordFile командой scripts\protect-signing-password.ps1 или задайте SPLITVPN_SIGNING_KEY_PASSWORD."
     }
 
-    $signingPassword = PlainText (Read-Host -AsSecureString 'Пароль ключа выпуска')
+    $signingPassword = Read-Host -AsSecureString 'Пароль ключа выпуска'
 }
+$environmentPassword = $null
 
 # Отслеживаемые правки блокируют выпуск: снимок берётся из HEAD, и выложенное не совпало бы с собранным.
 $status = git -C $root status --porcelain --untracked-files=no
@@ -158,6 +219,19 @@ if (git -C $root tag --list $tag) { throw "Тег $tag уже существуе
 Run $gh @('auth', 'status')
 
 # ---------------------------------------------------------------- сборка
+$env:DOTNET_NOLOGO = '1'
+# Аудит уязвимостей пакетов по умолчанию включён: выпуск с известной уязвимостью в зависимости должен
+# остановиться на NU1901–NU1904. Без доступа к api.nuget.org аудит падает на NU1900 — тогда, и только
+# явно, -OfflineNuGet (MSBuild читает переменную окружения как свойство; её наследует и build-installer.ps1).
+if ($OfflineNuGet) {
+    $env:NuGetAudit = 'false'
+    Write-Warning 'Аудит уязвимостей пакетов NuGet пропущен (-OfflineNuGet): выпуск собирается без проверки зависимостей на известные уязвимости.'
+}
+else {
+    # Унаследованное из сеанса NuGetAudit=false молча отключило бы аудит.
+    Remove-Item Env:\NuGetAudit -ErrorAction SilentlyContinue
+}
+
 if (-not $SkipBuild) {
     Step 'сборка и испытания'
     # Испытания WfpRealEngineTests работают с настоящими фильтрами Windows и без прав администратора
@@ -168,8 +242,6 @@ if (-not $SkipBuild) {
         if (-not $AllowNoWfpCheck) { throw 'Консоль без прав администратора: проверка настоящих фильтров Windows будет пропущена. Запустите выпуск из консоли администратора или передайте -AllowNoWfpCheck.' }
         Write-Warning 'Проверка настоящих фильтров Windows пропущена (-AllowNoWfpCheck).'
     }
-    $env:DOTNET_NOLOGO = '1'
-    $env:NuGetAudit = 'false'
     Run 'dotnet' @('build', (Join-Path $root 'SplitVpn.slnx'), '-c', 'Release', '--nologo', '-v', 'q')
     Run 'dotnet' @('test', (Join-Path $root 'SplitVpn.slnx'), '-c', 'Release', '--no-build')
 
@@ -178,6 +250,21 @@ if (-not $SkipBuild) {
     Step 'установщик'
     & (Join-Path $root 'scripts\build-installer.ps1') -Version $Version
     if ($LASTEXITCODE -ne 0) { throw "Сборка установщика завершилась с кодом $LASTEXITCODE" }
+}
+
+# Утилита подписи получает путь к ключу и пароль, поэтому берётся не «первая найденная» в bin\Release
+# (порядок обхода не определён, там может лежать старая или подложенная сборка), а публикуется из
+# текущего дерева в чистый каталог и вызывается ровно оттуда. При -SkipBuild тоже: без неё не подписать.
+Step 'утилита подписи'
+$releaseTools = Join-Path $root 'artifacts\release-tools'
+if (Test-Path $releaseTools) { [IO.Directory]::Delete($releaseTools, $true) }
+Run 'dotnet' @('publish', (Join-Path $root 'src\SplitVpn.Cli\SplitVpn.Cli.csproj'), '-c', 'Release', '-o', $releaseTools, '--nologo', '-v', 'q')
+$cli = Join-Path $releaseTools 'splitvpn-cli.exe'
+if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) { throw "Публикация не создала $cli" }
+# Команды версии у splitvpn-cli нет: сверяется версия файла, которую задаёт Directory.Build.props.
+$cliFileVersion = (Get-Item -LiteralPath $cli).VersionInfo.FileVersion
+if ($cliFileVersion -ne $Version -and -not "$cliFileVersion".StartsWith("$Version.")) {
+    throw "splitvpn-cli.exe в $releaseTools версии $cliFileVersion, а выпускается $Version"
 }
 
 $msi = Join-Path $root "artifacts\installer\SplitVpn-$Version.msi"
@@ -241,18 +328,20 @@ $json = @"
 "@
 [IO.File]::WriteAllBytes($manifestPath, [Text.UTF8Encoding]::new($false).GetBytes(($json -replace "`r`n", "`n")))
 
-$cli = Get-ChildItem (Join-Path $root 'src\SplitVpn.Cli\bin\Release') -Recurse -Filter 'splitvpn-cli.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $cli) { throw 'Не найден splitvpn-cli.exe: соберите решение в конфигурации Release.' }
 $signArguments = @('release-sign', '--manifest', $manifestPath, '--key', $KeyPath)
 if ($PasswordFile) { $signArguments += @('--password-file', $PasswordFile) }
-if ($signingPassword) { $env:SPLITVPN_SIGNING_KEY_PASSWORD = $signingPassword }
-try { Run $cli.FullName $signArguments }
+# В окружении пароль только на время запуска утилиты подписи; убирается при любом исходе.
+try {
+    if ($signingPassword) { $env:SPLITVPN_SIGNING_KEY_PASSWORD = PlainText $signingPassword }
+    Run $cli $signArguments
+}
 finally {
-    if ($signingPassword) { Remove-Item Env:\SPLITVPN_SIGNING_KEY_PASSWORD -ErrorAction SilentlyContinue }
+    Remove-Item Env:\SPLITVPN_SIGNING_KEY_PASSWORD -ErrorAction SilentlyContinue
+    if ($signingPassword) { $signingPassword.Dispose() }
     $signingPassword = $null
 }
 # Самопроверка тем же кодом, что и в службе: с неработающей подписью релиз не выкладывается.
-Run $cli.FullName @('release-verify', '--manifest', $manifestPath, '--signature', $signaturePath, '--package', $msi)
+Run $cli @('release-verify', '--manifest', $manifestPath, '--signature', $signaturePath, '--package', $msi)
 
 # ---------------------------------------------------------------- заметки
 $notesForRelease = Join-Path $releaseDir "notes-$Version.md"
@@ -371,7 +460,7 @@ for ($attempt = 1; ; $attempt++) {
     if ((Get-FileHash "$published.sig").Hash -eq $expectedSignature -or $attempt -ge 12) { break }
     Start-Sleep -Seconds 10
 }
-Run $cli.FullName @('release-verify', '--manifest', $published, '--signature', "$published.sig")
+Run $cli @('release-verify', '--manifest', $published, '--signature', "$published.sig")
 if (((Get-Content $published -Raw) | ConvertFrom-Json).version -ne $Version) { throw 'Выложенный манифест указывает на другую версию' }
 
 $head = Invoke-WebRequest "https://github.com/$repository/releases/download/$tag/SplitVpn-$Version.msi" -Method Head -UseBasicParsing

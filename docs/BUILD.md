@@ -21,7 +21,9 @@ dotnet publish src\SplitVpn.Cli\SplitVpn.Cli.csproj -c Release -o artifacts\publ
 dotnet publish src\SplitVpn.App\SplitVpn.App.csproj -c Release -o artifacts\publish\app
 ```
 
-Нет доступа к api.nuget.org — сборка падает на `NU1900` (проверка уязвимостей пакетов). Для локальной сборки добавьте `-p:NuGetAudit=false` к `dotnet build`/`test`/`publish`; скрипт установщика параметра не принимает — задайте перед ним `$env:NuGetAudit='false'` (MSBuild читает переменные среды как свойства). Пакеты при этом должны уже быть в кэше NuGet.
+Нет доступа к api.nuget.org — сборка падает на `NU1900` (проверка уязвимостей пакетов). Для локальной сборки добавьте `-p:NuGetAudit=false` к `dotnet build`/`test`/`publish`; скрипт установщика параметра не принимает — задайте перед ним `$env:NuGetAudit='false'` (MSBuild читает переменные среды как свойства). Пакеты при этом должны уже быть в кэше NuGet. `scripts\publish-release.ps1` аудит по умолчанию не отключает (и убирает унаследованный `NuGetAudit` из окружения): выпуск без доступа к api.nuget.org — только с явным `-OfflineNuGet`, скрипт предупредит, что проверка зависимостей на уязвимости пропущена.
+
+Рабочее дерево не должно быть доступно на запись обычным пользователям: корень диска (например, `D:\`) по умолчанию даёт Authenticated Users право «Изменение», и это наследуется. Скрипты исполняют код из дерева от администратора/SYSTEM и подписывают выпуск, поэтому `build-installer.ps1`, `elevated.ps1` и `install-dev-service.ps1` предупреждают о таком дереве, а `publish-release.ps1` отказывается выпускать (обход — `-AllowWritableTree`). Команда для исправления — в [RELEASE.md](RELEASE.md#права-на-рабочее-дерево).
 
 Установщику нужен движок подключения "VPN поверх SSH": `scripts\fetch-sing-box.ps1` скачивает sing-box и архив его исходников и сверяет SHA-256 с `third_party\sing-box\manifest.json` (файлы в git не хранятся). Для сборки и испытаний решения движок не нужен.
 

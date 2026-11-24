@@ -67,6 +67,7 @@ public static class ConflictDetector
         // PPPoE-подключение к провайдеру - не VPN: через него идёт сам интернет, конфликта нет.
         foreach (var connection in RasClient.EnumerateConnections().Where(c => string.Equals(c.DeviceType, "vpn", StringComparison.OrdinalIgnoreCase) && !IsOwn(c.Phonebook, own)))
         {
+            // Путь книги приходит от пользователя: сетевой TryReadServer отвергает, не обращаясь к нему.
             var server = servers.Count == 0 ? null : RasPhonebook.TryReadServer(connection.Phonebook, connection.EntryName);
             warnings.Add(ForeignConnectionWarning(connection.EntryName, server, servers, cached, PhonebookOwner(connection.Phonebook),
                 () => HangUp(connection.Handle), stillCurrent));
@@ -448,9 +449,9 @@ public static class ConflictDetector
             try
             {
                 using var folders = Registry.Users.OpenSubKey(sid + @"\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders");
+                // Значение пишет сам пользователь: сетевой путь (\\server\share) отвергается до обращения к нему.
                 if (folders?.GetValue("AppData", null, RegistryValueOptions.DoNotExpandEnvironmentNames) is string root
-                    && Path.IsPathFullyQualified(root) && root.Length > 2 && root[1] == ':'
-                    && new DriveInfo(Path.GetPathRoot(root)!).DriveType == DriveType.Fixed)
+                    && Security.LocalPath.IsLocalFixed(root))
                 {
                     paths.Add(Path.Combine(root, PhonebookSuffix));
                 }
@@ -471,7 +472,8 @@ public static class ConflictDetector
     /// </summary>
     private static void ReadPhonebook(string path, string root, List<WindowsVpnEntry> entries)
     {
-        if (!File.Exists(path))
+        // До File.Exists: даже проверка существования сетевого пути отправляет туда учётную запись компьютера.
+        if (!Security.LocalPath.IsLocalFixed(path) || !Security.LocalPath.IsLocalFixed(root) || !File.Exists(path))
         {
             return;
         }

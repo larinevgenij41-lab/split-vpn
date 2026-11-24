@@ -25,7 +25,10 @@ public static partial class PipeClientIdentity
         return (processId, sessionId);
     }
 
-    /// <summary>Токен процесса клиента; null — определить не удалось (процесс завершился, доступа нет).</summary>
+    /// <summary>
+    /// Токен процесса клиента; null — определить не удалось (процесс завершился, дескриптор канала передан другому
+    /// процессу, доступа нет). Служба считает null отказом: кто на том конце, неизвестно.
+    /// </summary>
     public static WindowsIdentity? TryOpen(SafePipeHandle pipe)
     {
         ArgumentNullException.ThrowIfNull(pipe);

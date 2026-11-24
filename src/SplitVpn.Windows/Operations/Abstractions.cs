@@ -131,10 +131,14 @@ public interface IDnsProxy
     bool IsRunning { get; }
 
     /// <summary>
-    /// Посредник принимает запросы и на адресах адаптеров (слушатель всех адресов занят): только тогда
-    /// основному адаптеру ставится DNS «свой адрес, 127.0.0.1».
+    /// Эксклюзивно занимает порт посредника на этих адресах адаптеров и возвращает адреса набора, занятые сейчас
+    /// (см. DnsProxyServer.ClaimAdapterAddresses). Только такой адрес служба ставит адаптеру DNS-сервером («свой
+    /// адрес, 127.0.0.1»): порт на незанятом адресе мог бы держать чужой процесс. Посредник не запущен - пусто.
     /// </summary>
-    bool ServesAdapterAddresses { get; }
+    IReadOnlyCollection<uint> ClaimAdapterAddresses(IReadOnlyCollection<uint> addresses);
+
+    /// <summary>Освобождает занятые адреса адаптеров, кроме <paramref name="keep"/>; зовётся после записи DNS адаптеров.</summary>
+    void ReleaseAdapterAddresses(IReadOnlyCollection<uint> keep);
 
     void Start();
 

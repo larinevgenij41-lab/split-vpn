@@ -22,7 +22,7 @@ internal static class ServiceCommands
 
     public static Task<int> StatusAsync(CliArgs args) => WithClientAsync(async client =>
     {
-        var status = Expect<StatusDto>(await client.SendAsync(new GetStatusRequest(), CancellationToken.None));
+        var status = Expect<StatusDto>(await SendAsync(client, new GetStatusRequest()));
         if (args.Flag("--json"))
         {
             Console.WriteLine(JsonSerializer.Serialize(status, JsonDefaults.Options));
@@ -42,7 +42,7 @@ internal static class ServiceCommands
             Console.Error.WriteLine("--since требует неотрицательный номер события.");
             return 2;
         }
-        var events = Expect<List<ServiceEvent>>(await client.SendAsync(new GetEventsRequest(since), CancellationToken.None));
+        var events = Expect<List<ServiceEvent>>(await SendAsync(client, new GetEventsRequest(since)));
         foreach (var e in events.TakeLast(args.IntOption("--last", 50)))
         {
             Console.WriteLine(Text.Inv($"{e.Id,5} {e.TimeUtc.ToLocalTime():dd.MM HH:mm:ss} {e.Level,-8} {e.Text}"));
@@ -53,7 +53,7 @@ internal static class ServiceCommands
 
     public static Task<int> AdaptersAsync(CliArgs args) => WithClientAsync(async client =>
     {
-        foreach (var a in Expect<List<AdapterDto>>(await client.SendAsync(new GetAdaptersRequest(), CancellationToken.None)))
+        foreach (var a in Expect<List<AdapterDto>>(await SendAsync(client, new GetAdaptersRequest())))
         {
             Console.WriteLine($"{(a.IsPrimary ? "*" : " ")} {a.Name} [{a.Type}] шлюз {a.Gateway ?? "—"} {a.InterfaceGuid}");
         }
@@ -70,7 +70,7 @@ internal static class ServiceCommands
             return 2;
         }
 
-        var package = Expect<DiagnosticsPackageDto>(await client.SendAsync(new CollectDiagnosticsRequest(), CancellationToken.None));
+        var package = Expect<DiagnosticsPackageDto>(await SendAsync(client, new CollectDiagnosticsRequest()));
         var target = Path.GetFullPath(path);
         var temp = target + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
@@ -79,7 +79,7 @@ internal static class ServiceCommands
             {
                 while (true)
                 {
-                    var chunk = Expect<DiagnosticsChunkDto>(await client.SendAsync(new ReadDiagnosticsChunkRequest(package.Token, file.Length), CancellationToken.None));
+                    var chunk = Expect<DiagnosticsChunkDto>(await SendAsync(client, new ReadDiagnosticsChunkRequest(package.Token, file.Length)));
                     if (file.Length + chunk.Data.Length > package.Length || (!chunk.Last && chunk.Data.Length == 0))
                     {
                         throw new InvalidDataException("Неверный размер данных диагностики.");
@@ -101,7 +101,7 @@ internal static class ServiceCommands
             }
 
             File.Move(temp, target, overwrite: true);
-            await DiagnosticsArchive.ConfirmReceiptAsync(client.SendAsync, package, CancellationToken.None);
+            await DiagnosticsArchive.ConfirmReceiptAsync((request, token) => client.SendAsync(request, RequestTimeouts.For(request), token), package, CliCancellation.Token);
         }
         finally
         {
@@ -117,29 +117,104 @@ internal static class ServiceCommands
         return 0;
     });
 
-    /// <summary>settings get [--out файл] | settings set --file файл</summary>
+    internal const string SettingsUsage = "settings get [--out <файл>] | settings set --file <файл> [--revision <ревизия> | --force]";
+
+    /// <summary>
+    /// settings get [--out файл] | settings set --file файл [--revision R | --force]. «get --out» кладёт рядом
+    /// файл «.revision» с ревизией прочитанных настроек; «set» передаёт её службе, и та отклоняет запись, если
+    /// настройки за это время изменили (приложение или другая команда). Без ревизии запись идёт только с --force.
+    /// </summary>
     public static Task<int> SettingsAsync(CliArgs args) => WithClientAsync(async client =>
     {
         switch (args.Positional(0))
         {
             case "get":
-                var json = JsonSerializer.Serialize(Expect<AppSettings>(await client.SendAsync(new GetSettingsRequest(), CancellationToken.None)), JsonDefaults.Options);
-                WriteOrPrint(args.Option("--out"), json);
+                var current = Expect<AppSettings>(await SendAsync(client, new GetSettingsRequest()));
+                var json = JsonSerializer.Serialize(current, JsonDefaults.Options);
+                var revision = SettingsSerializer.Revision(current);
+                if (args.Option("--out") is { } output)
+                {
+                    WriteOrPrint(output, json);
+                    File.WriteAllText(RevisionPath(output), revision);
+                    Console.WriteLine("Ревизия настроек: " + revision);
+                }
+                else
+                {
+                    // Только JSON: сценарии разбирают вывод целиком (вместе с потоком ошибок).
+                    Console.WriteLine(json);
+                }
+
                 return 0;
             case "set" when args.Option("--file") is { } file:
-                var loaded = SettingsSerializer.Deserialize(await File.ReadAllTextAsync(file));
+                if (!TryExpectedRevision(args, file, out var expected))
+                {
+                    return 2;
+                }
+
+                var loaded = SettingsSerializer.Deserialize(await ReadInputFileAsync(file));
                 if (loaded.Settings is null)
                 {
                     Console.WriteLine("Файл настроек не разобран: " + loaded.Error);
                     return 1;
                 }
 
-                return PrintWarnings(await client.SendAsync(new SaveSettingsRequest(loaded.Settings), CancellationToken.None));
+                var saved = await SendAsync(client, new SaveSettingsRequest(loaded.Settings, expected));
+                if (!saved.Ok && expected is not null)
+                {
+                    Console.WriteLine("Если настройки изменились после «settings get», получите их заново и повторите правку (или запишите поверх с --force).");
+                }
+
+                var result = PrintWarnings(saved);
+                if (saved.Ok && File.Exists(RevisionPath(file)))
+                {
+                    // Следующая правка того же файла сверяется уже с записанными настройками, а не с исходными.
+                    var stored = Expect<AppSettings>(await SendAsync(client, new GetSettingsRequest()));
+                    File.WriteAllText(RevisionPath(file), SettingsSerializer.Revision(stored));
+                }
+
+                return result;
             default:
-                Console.WriteLine("settings get [--out <файл>] | settings set --file <файл>");
+                Console.WriteLine(SettingsUsage);
                 return 2;
         }
     });
+
+    /// <summary>Файл ревизии рядом с файлом настроек: «settings.json» → «settings.json.revision».</summary>
+    internal static string RevisionPath(string settingsFile) => settingsFile + ".revision";
+
+    /// <summary>
+    /// Ревизия, с которой сверяется запись: --revision, иначе файл «.revision» от «settings get --out».
+    /// Без них — отказ, если не указан --force (null: запись без проверки).
+    /// </summary>
+    internal static bool TryExpectedRevision(CliArgs args, string settingsFile, out string? revision)
+    {
+        revision = args.Option("--revision");
+        var force = args.Flag("--force");
+        if (revision is not null && force)
+        {
+            Console.WriteLine("Укажите только одно: --revision или --force.");
+            return false;
+        }
+
+        if (revision is null && !force && File.Exists(RevisionPath(settingsFile)))
+        {
+            revision = File.ReadAllText(RevisionPath(settingsFile)).Trim();
+        }
+
+        if (revision is { Length: 0 })
+        {
+            revision = null;
+        }
+
+        if (revision is null && !force)
+        {
+            Console.WriteLine($"Нет ревизии настроек: получите их через «settings get --out {settingsFile}» (рядом появится {Path.GetFileName(RevisionPath(settingsFile))}), "
+                + "укажите --revision <ревизия> или запишите поверх изменений с --force.");
+            return false;
+        }
+
+        return true;
+    }
 
     /// <summary>
     /// profile set --name --server --user [--role] [--password-file]: создаёт или обновляет профиль с этим именем
@@ -191,7 +266,7 @@ internal static class ServiceCommands
             }
         }
 
-        var settings = Expect<AppSettings>(await client.SendAsync(new GetSettingsRequest(), CancellationToken.None));
+        var settings = Expect<AppSettings>(await SendAsync(client, new GetSettingsRequest()));
         // Имена подключений сравниваются так же, как в проверке настроек: без учёта регистра и пробелов по краям.
         var existing = settings.Profiles.FirstOrDefault(p => string.Equals(p.Name.Trim(), name.Trim(), StringComparison.OrdinalIgnoreCase));
         if (existing?.Protocol == VpnProtocol.SshVpn && hasPasswordOptions)
@@ -254,6 +329,7 @@ internal static class ServiceCommands
 
         var revision = SettingsSerializer.Revision(settings);
         string? password = null;
+        string? passwordFile = null;
         if (fromDev)
         {
             var characters = Proto.ProtoContext.LoadPassword();
@@ -262,6 +338,7 @@ internal static class ServiceCommands
         }
         else if (args.Option("--password-file") is { } file)
         {
+            passwordFile = file;
             password = await ReadPasswordFileAsync(file);
         }
         if (password is { Length: 0 })
@@ -273,8 +350,17 @@ internal static class ServiceCommands
         IpcRequest save = sshHostKey is null && password is null
             ? new SaveSettingsRequest(updated, revision)
             : new SaveConnectionRequest(updated, profile.Id, password, null, null, sshKey, revision);
-        var saved = await client.SendAsync(save, CancellationToken.None);
-        if (PrintWarnings(saved) != 0) { return 1; }
+        var accepted = false;
+        try
+        {
+            var saved = await SendAsync(client, save);
+            accepted = saved.Ok;
+            if (PrintWarnings(saved) != 0) { return 1; }
+        }
+        finally
+        {
+            ConsumePasswordFile(passwordFile, accepted);
+        }
         Console.WriteLine($"Профиль «{name}» ({RoleText(role)}): {profile.Id}");
         return 0;
     });
@@ -293,7 +379,7 @@ internal static class ServiceCommands
             return 2;
         }
 
-        var settings = Expect<AppSettings>(await client.SendAsync(new GetSettingsRequest(), CancellationToken.None));
+        var settings = Expect<AppSettings>(await SendAsync(client, new GetSettingsRequest()));
         var id = explicitId ?? settings.PrimaryProfile?.Id;
         if (id is null)
         {
@@ -362,7 +448,7 @@ internal static class ServiceCommands
     /// <summary>tunnels: состояние каждого поднимаемого туннеля.</summary>
     public static Task<int> TunnelsAsync(CliArgs args) => WithClientAsync(async client =>
     {
-        var status = Expect<StatusDto>(await client.SendAsync(new GetStatusRequest(), CancellationToken.None));
+        var status = Expect<StatusDto>(await SendAsync(client, new GetStatusRequest()));
         Console.WriteLine($"Остальной интернет: {status.DefaultTargetName}; Россия: {status.GeoTargetName}");
         foreach (var tunnel in status.Tunnels)
         {
@@ -396,7 +482,7 @@ internal static class ServiceCommands
             return 2;
         }
 
-        var status = Expect<StatusDto>(await client.SendAsync(new SetTunnelPausedRequest(profileId, paused), CancellationToken.None));
+        var status = Expect<StatusDto>(await SendAsync(client, new SetTunnelPausedRequest(profileId, paused)));
         var tunnel = status.Tunnels.FirstOrDefault(t => t.ProfileId == profileId);
         Console.WriteLine($"{tunnel?.Name ?? profileId.ToString()}: {(paused ? "отключено" : "включено")}.");
         return 0;
@@ -413,7 +499,7 @@ internal static class ServiceCommands
             return 2;
         }
 
-        var status = Expect<StatusDto>(await client.SendAsync(new SetProfileOrderRequest([.. ids.Select(Guid.Parse)]), CancellationToken.None));
+        var status = Expect<StatusDto>(await SendAsync(client, new SetProfileOrderRequest([.. ids.Select(Guid.Parse)])));
         Console.WriteLine("Порядок: " + string.Join(", ", status.Tunnels.Select(t => t.Name)));
         return 0;
     });
@@ -454,7 +540,7 @@ internal static class ServiceCommands
             return 2;
         }
 
-        var settings = Expect<AppSettings>(await client.SendAsync(new GetSettingsRequest(), CancellationToken.None));
+        var settings = Expect<AppSettings>(await SendAsync(client, new GetSettingsRequest()));
         var id = explicitId ?? settings.PrimaryProfile?.Id;
         if (id is null)
         {
@@ -462,7 +548,7 @@ internal static class ServiceCommands
             return 1;
         }
 
-        var result = Expect<ProfileTestDto>(await client.SendAsync(new TestProfileRequest(id.Value), CancellationToken.None));
+        var result = Expect<ProfileTestDto>(await SendAsync(client, new TestProfileRequest(id.Value)));
         Console.WriteLine(result.Text);
         return result.Success ? 0 : 1;
     });
@@ -475,7 +561,7 @@ internal static class ServiceCommands
             return 2;
         }
 
-        var result = Expect<AddressCheckDto>(await client.SendAsync(new CheckAddressRequest(query), CancellationToken.None));
+        var result = Expect<AddressCheckDto>(await SendAsync(client, new CheckAddressRequest(query)));
         foreach (var item in result.Items)
         {
             Console.WriteLine($"{item.Address}: {item.Decision} ({item.Source}); ожидается {item.ExpectedInterface}, маршрут {item.ActualInterface ?? "—"}{(item.Blocked ? ", заблокировано" : "")}");
@@ -532,13 +618,13 @@ internal static class ServiceCommands
             return 1;
         }
 
-        return PrintResponse(await client.SendAsync(request, CancellationToken.None));
+        return PrintResponse(await SendAsync(client, request));
     });
 
     /// <summary>update [status] | check | download | install | skip [--version X]</summary>
     public static Task<int> UpdateAsync(CliArgs args) => WithClientAsync(async client =>
     {
-        var status = Expect<StatusDto>(await client.SendAsync(new GetStatusRequest(), CancellationToken.None));
+        var status = Expect<StatusDto>(await SendAsync(client, new GetStatusRequest()));
         var update = status.Update;
         var version = args.Option("--version") ?? update?.AvailableVersion ?? "";
         switch (args.Positional(0) ?? "status")
@@ -547,13 +633,13 @@ internal static class ServiceCommands
                 PrintUpdate(update);
                 return update is null || update.Phase == UpdatePhase.Failed ? 1 : 0;
             case "check":
-                return PrintResponse(await client.SendAsync(new CheckUpdateRequest(), CancellationToken.None));
+                return PrintResponse(await SendAsync(client, new CheckUpdateRequest()));
             case "download":
-                return PrintResponse(await client.SendAsync(new DownloadUpdateRequest(version), CancellationToken.None));
+                return PrintResponse(await SendAsync(client, new DownloadUpdateRequest(version)));
             case "install":
                 return await InstallUpdateAsync(client, version);
             case "skip":
-                return PrintResponse(await client.SendAsync(new SkipUpdateRequest(version), CancellationToken.None));
+                return PrintResponse(await SendAsync(client, new SkipUpdateRequest(version)));
             default:
                 Console.WriteLine("update [status] | check | download | install | skip [--version <версия>]");
                 return 2;
@@ -563,7 +649,7 @@ internal static class ServiceCommands
     /// <summary>Установку запускает вызывающий: служба отдаёт проверенную команду, а msiexec требует прав администратора.</summary>
     private static async Task<int> InstallUpdateAsync(IpcClient client, string version)
     {
-        var response = await client.SendAsync(new InstallUpdateRequest(version), CancellationToken.None);
+        var response = await SendAsync(client, new InstallUpdateRequest(version));
         if (!response.Ok)
         {
             return PrintResponse(response);
@@ -574,9 +660,12 @@ internal static class ServiceCommands
         Console.WriteLine("Закройте «Раздельный VPN», если он открыт: установщик заменит его файлы.");
         var processId = 0;
         var registered = false;
+        // Описатель msiexec держится открытым, пока служба не получит номер процесса: иначе завершившийся
+        // установщик (например, сразу с кодом 1618) освободил бы номер, и служба приняла бы чужой процесс за него.
+        System.Diagnostics.Process? process = null;
         try
         {
-            using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(install.FileName, install.Arguments)
+            process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(install.FileName, install.Arguments)
             {
                 UseShellExecute = true,
                 Verb = "runas",
@@ -598,13 +687,19 @@ internal static class ServiceCommands
             // Сбой этого сообщения не должен подменять исходную ошибку запуска: только предупреждение.
             try
             {
-                var confirmation = await client.SendAsync(new UpdateStartedRequest(processId) { AttemptId = install.AttemptId }, CancellationToken.None);
+                // Без токена прерывания: сведения о запуске нужны службе и после Ctrl+C; срок ответа ограничен.
+                var started = new UpdateStartedRequest(processId) { AttemptId = install.AttemptId };
+                var confirmation = await client.SendAsync(started, RequestTimeouts.For(started), CancellationToken.None);
                 registered = confirmation.Ok;
                 if (!registered) { Console.Error.WriteLine("Служба отклонила сведения о запуске: " + confirmation.ErrorMessage); }
             }
-            catch (Exception ex) when (ex is ServiceUnavailableException or IpcProtocolException or IOException or ObjectDisposedException)
+            catch (Exception ex) when (ex is ServiceUnavailableException or IpcProtocolException or IOException or ObjectDisposedException or OperationCanceledException)
             {
                 Console.Error.WriteLine("Предупреждение: служба не получила сведения о запуске установки: " + ex.Message);
+            }
+            finally
+            {
+                process?.Dispose();
             }
         }
 
@@ -640,7 +735,7 @@ internal static class ServiceCommands
 
     public static Task<int> ReportAsync(CliArgs args) => WithClientAsync(async client =>
     {
-        var report = Expect<string>(await client.SendAsync(new ExportReportRequest(!args.Flag("--no-mask")), CancellationToken.None));
+        var report = Expect<string>(await SendAsync(client, new ExportReportRequest(!args.Flag("--no-mask"))));
         WriteOrPrint(args.Option("--out"), report);
         return 0;
     });
@@ -648,14 +743,21 @@ internal static class ServiceCommands
     /// <summary>Положительное целое значение параметра, умноженное на <paramref name="scale"/>; иначе -1.</summary>
     private static async Task<string> ReadGeoFileAsync(string path)
     {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        if (stream.Length > FrameCodec.MaxFrameBytes)
+        try
         {
-            throw new InvalidDataException($"Файл превышает {FrameCodec.MaxFrameMegabytes} МБ.");
-        }
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (stream.Length > FrameCodec.MaxFrameBytes)
+            {
+                throw new InvalidDataException($"Файл превышает {FrameCodec.MaxFrameMegabytes} МБ.");
+            }
 
-        using var reader = new StreamReader(stream);
-        return await reader.ReadToEndAsync();
+            using var reader = new StreamReader(stream);
+            return await reader.ReadToEndAsync();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new InputFileException(path, ex);
+        }
     }
 
     private static int PositiveOption(CliArgs args, string name, int scale)
@@ -705,7 +807,7 @@ internal static class ServiceCommands
 
         return await WithClientAsync(async client =>
         {
-            var until = Expect<DateTimeOffset?>(await client.SendAsync(new SetVerboseLoggingRequest(minutes), CancellationToken.None));
+            var until = Expect<DateTimeOffset?>(await SendAsync(client, new SetVerboseLoggingRequest(minutes)));
             Console.WriteLine(until is { } value
                 ? "Подробный журнал включён до " + value.ToLocalTime().ToString("g", System.Globalization.CultureInfo.CurrentCulture)
                 : "Подробный журнал выключен.");
@@ -721,7 +823,7 @@ internal static class ServiceCommands
         Exception? failure = null;
         try
         {
-            client = await IpcClient.ConnectAsync(ServiceName, TimeSpan.FromSeconds(5), CancellationToken.None);
+            client = await IpcClient.ConnectAsync(ServiceName, TimeSpan.FromSeconds(5), CliCancellation.Token);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -736,7 +838,7 @@ internal static class ServiceCommands
                 : (request, token) => client.SendAsync(request, RequestTimeouts.For(request), token);
             var files = DiagnosticsArchive.UserFiles().Append(new ArchiveFile("ui/environment.json", Text: ClientEnvironment.Json(
                 new Dictionary<string, string?> { ["client"] = "splitvpn-cli" }))).ToList();
-            var result = await DiagnosticsArchive.BuildAsync(send, files, output, new Progress<string>(Console.WriteLine), CancellationToken.None);
+            var result = await DiagnosticsArchive.BuildAsync(send, files, output, new Progress<string>(Console.WriteLine), CliCancellation.Token);
             Console.WriteLine("Архив: " + result.Path + (result.ServiceIncluded ? "" : " (без части службы — см. service-missing.txt)"));
             foreach (var problem in result.Problems)
             {
@@ -805,21 +907,81 @@ internal static class ServiceCommands
             return 1;
         }
 
-        return PrintResponse(await client.SendAsync(new SetPasswordRequest(profileId, password), CancellationToken.None));
+        var accepted = false;
+        try
+        {
+            var response = await SendAsync(client, new SetPasswordRequest(profileId, password));
+            accepted = response.Ok;
+            return PrintResponse(response);
+        }
+        finally
+        {
+            ConsumePasswordFile(file, accepted);
+        }
     }
 
     private static async Task<string> ReadPasswordFileAsync(string file)
     {
-        // Одноразовый файл удаляется только после успешного чтения: при сбое чтения это единственная копия пароля.
-        var password = (await File.ReadAllTextAsync(file)).TrimEnd('\r', '\n');
-        File.Delete(file);
-
-        return password;
+        try
+        {
+            return (await File.ReadAllTextAsync(file)).TrimEnd('\r', '\n');
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new InputFileException(file, ex);
+        }
     }
+
+    /// <summary>
+    /// Одноразовый файл пароля удаляется только после того, как служба приняла пароль: при отказе, сбое связи
+    /// или прерывании это единственная копия, и команду можно повторить с тем же файлом.
+    /// </summary>
+    internal static void ConsumePasswordFile(string? file, bool accepted)
+    {
+        if (file is null)
+        {
+            return;
+        }
+
+        if (!accepted)
+        {
+            Console.WriteLine($"Файл пароля не удалён: {file}. Повторите команду или удалите файл сами.");
+            return;
+        }
+
+        try
+        {
+            File.Delete(file);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.WriteLine($"Пароль принят, но файл {file} удалить не удалось: {ex.Message}. Удалите его сами.");
+        }
+    }
+
+    /// <summary>Входной файл команды (настройки и т. п.); ошибка чтения — ошибка использования (код 2), а не отказ службы.</summary>
+    private static async Task<string> ReadInputFileAsync(string file)
+    {
+        try
+        {
+            return await File.ReadAllTextAsync(file);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new InputFileException(file, ex);
+        }
+    }
+
+    /// <summary>
+    /// Запрос с пределом ожидания по типу (как в приложении) и прерыванием по Ctrl+C: зависшая служба
+    /// не должна держать команду бесконечно.
+    /// </summary>
+    private static Task<IpcResponse> SendAsync(IpcClient client, IpcRequest request) =>
+        client.SendAsync(request, RequestTimeouts.For(request), CliCancellation.Token);
 
     private static Task<int> SendStatusCommandAsync(IpcRequest request) => WithClientAsync(async client =>
     {
-        var response = await client.SendAsync(request, CancellationToken.None);
+        var response = await SendAsync(client, request);
         if (!response.Ok)
         {
             return PrintResponse(response);
@@ -833,12 +995,23 @@ internal static class ServiceCommands
     {
         try
         {
-            await using var client = await IpcClient.ConnectAsync(ServiceName, TimeSpan.FromSeconds(5), CancellationToken.None);
+            await using var client = await IpcClient.ConnectAsync(ServiceName, TimeSpan.FromSeconds(5), CliCancellation.Token);
             return await action(client);
+        }
+        catch (ServiceUnavailableException ex) when (ex.Reason == ServiceUnavailableReason.Timeout)
+        {
+            // Запрос мог дойти до службы: команда, возможно, выполняется или уже выполнена.
+            Console.WriteLine(ex.Message + " Команда могла выполниться — проверьте результат командой «status».");
+            return 3;
         }
         catch (ServiceUnavailableException ex)
         {
             Console.WriteLine(ex.Message);
+            return 3;
+        }
+        catch (OperationCanceledException) when (CliCancellation.IsInterrupted)
+        {
+            Console.WriteLine("Прервано: ответ службы не получен. Команда могла выполниться — проверьте результат командой «status».");
             return 3;
         }
         catch (Exception ex) when (ex is IpcProtocolException or System.Text.Json.JsonException)

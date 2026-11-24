@@ -414,8 +414,17 @@ public sealed partial class Coordinator
                     : await _deps.Resolver.ResolveAsync(host, dns, primary.InterfaceIndex, limit.Token).WaitAsync(limit.Token);
                 return (host, addresses);
             }
-            catch (Exception ex) when (ex is IOException or OperationCanceledException or System.Net.Sockets.SocketException)
+            catch (Exception ex)
             {
+                // Любой сбой - «не разрешилось»: итог ждёт фоновая задача без наблюдателя, и неожиданное исключение
+                // (например, ArgumentException на имени из сертификата) оборвало бы её до TryEnqueue - адреса остальных
+                // узлов не закрепились бы, а сверка после разрешения не запустилась бы. Отмена здесь - срок разрешения
+                // или остановка службы; после остановки TryEnqueue работу не ставит.
+                if (ex is not (IOException or OperationCanceledException or System.Net.Sockets.SocketException))
+                {
+                    _deps.Logger.LogWarning(ex, "Узел проверки отзыва {Host} не разрешён", host);
+                }
+
                 return (host, []);
             }
         }
