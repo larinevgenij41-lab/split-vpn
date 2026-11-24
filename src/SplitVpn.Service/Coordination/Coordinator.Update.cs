@@ -1,4 +1,5 @@
 ﻿using SplitVpn.Core.Ipc;
+using SplitVpn.Core.Policy;
 using SplitVpn.Core.State;
 using SplitVpn.Core.Update;
 
@@ -15,7 +16,20 @@ public sealed partial class Coordinator
     /// </summary>
     internal bool NetworkPathAllowed =>
         _state.Intent == Intent.Off || _state.ProtectionSuspended
-        || EssentialTunnels().Exists(t => t.Verified);
+        || EssentialTunnels().Exists(t => t.Verified)
+        || DirectPathOpen;
+
+    /// <summary>
+    /// «Остальной интернет» идёт напрямую: у него нет носителей, и защита прямой публичный трафик через основной
+    /// адаптер не блокирует ни при каком состоянии туннелей. Обрыв (FilterPlanBuilder.IsOutage) определён только
+    /// для носителей «остального интернета», поэтому и «блокировать весь публичный» здесь не включается, а при
+    /// «отключить VPN, сохранить защиту» прямые назначения по-прежнему разрешены. Опорный туннель, лежащий или
+    /// ждущий пароля, запросу не нужен. Нужны основной адаптер и доведённая до фильтров политика - иначе запрос
+    /// оборвали бы фильтры, оставшиеся от прежнего состояния. Когда «остальной интернет» назначен туннелю или
+    /// группе, путь по-прежнему только через проверенный туннель: запрос мимо VPN был бы утечкой.
+    /// </summary>
+    private bool DirectPathOpen =>
+        _settings.DefaultTarget.Kind == TargetKind.Direct && Facts.Primary is not null && Facts.PolicyApplied;
 
     /// <summary>Фоновая проверка или загрузка обновления; для тестов.</summary>
     internal Task UpdateWork => _update.Pending ?? Task.CompletedTask;

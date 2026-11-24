@@ -22,9 +22,12 @@ public sealed class DnsProxyTcpLifetimeTests
     {
         var cache = new DnsCache(TimeProvider.System);
         cache.Pin("pinned.example", [Pinned]);
+        // Срок простоя с большим запасом над паузой между запросами: под нагрузкой полного прогона Task.Delay(1 с)
+        // растягивается, и при простое 2 с соединение закрывал бы простой, а не абсолютный срок, - проверка
+        // становилась бы зависимой от планировщика. Без абсолютного срока соединение по-прежнему жило бы все 15 запросов.
         await using var proxy = new DnsProxyServer(IPAddress.Loopback, cache)
         {
-            TcpIdleTimeout = TimeSpan.FromSeconds(2),
+            TcpIdleTimeout = TimeSpan.FromSeconds(30),
             TcpConnectionLifetime = TimeSpan.FromSeconds(3),
         };
         proxy.Start(0);

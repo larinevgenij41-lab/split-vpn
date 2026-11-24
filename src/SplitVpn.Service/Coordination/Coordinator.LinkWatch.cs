@@ -37,7 +37,7 @@ public sealed partial class Coordinator
         }
 
         var now = _deps.Time.GetUtcNow();
-        foreach (var tunnel in Facts.Tunnels.Values.Where(t => t is { Connection: not null, Verified: true, LinkWatchRunning: false }).ToList())
+        foreach (var tunnel in Facts.Tunnels.Values.Where(t => t is { Connection: not null, Verified: true, LinkWatchRunning: false, HangUpPending: false }).ToList())
         {
             if (now < tunnel.NextLinkWatchAt || tunnel.Adapter is not { IsUp: true, Addresses.Count: > 0 } adapter)
             {
@@ -107,6 +107,12 @@ public sealed partial class Coordinator
 
         var now = _deps.Time.GetUtcNow();
         tunnel.LinkWatchRunning = false;
+        if (tunnel.HangUpPending)
+        {
+            // Сеанс уже решено разорвать: разрыв повторяет сверка, проба ничего не добавляет.
+            return;
+        }
+
         if (alive || !tunnel.Verified || _state.Intent != Intent.Connected)
         {
             tunnel.LinkWatchFailures = 0;
@@ -126,9 +132,11 @@ public sealed partial class Coordinator
         // иначе неработающее подключение дозванивалось бы по кругу каждые несколько секунд.
         var stable = tunnel.WasStableSession(now);
         Journal("Ошибка", $"«{tunnel.Name}»: соединение зависло - данных от сервера нет, пробы через туннель без ответа. Переподключение.");
-        await HangUpAsync(tunnel, "соединение зависло", cancellationToken);
-        // До сервера разрыв по зависшему соединению мог не дойти: он ещё держит прежний сеанс (см. ServerHoldWindow).
+        // Отметка обрыва и срок дозвона - до разрыва: исключение из него не должно их пропустить, иначе новый
+        // сеанс не ждал бы ServerHoldWindow, а дозвон шёл бы без паузы. До сервера разрыв по зависшему соединению
+        // мог не дойти: он ещё держит прежний сеанс.
         tunnel.UncleanDropUtc = now;
+        TimeSpan? delay = null;
         if (stable)
         {
             tunnel.ResetRetries();
@@ -136,8 +144,14 @@ public sealed partial class Coordinator
         }
         else
         {
-            var delay = ScheduleRetry(tunnel, now);
-            Journal("Сведения", string.Create(CultureInfo.InvariantCulture, $"«{tunnel.Name}»: следующая попытка через {delay.TotalSeconds:F0} с."));
+            delay = ScheduleRetry(tunnel, now);
+        }
+
+        // Отказ RasHangUp не повторяет счёт: туннель ждёт повтора разрыва, контроль связи его больше не пробует.
+        await HangUpOrDeferAsync(tunnel, "соединение зависло", cancellationToken);
+        if (delay is { } wait)
+        {
+            Journal("Сведения", string.Create(CultureInfo.InvariantCulture, $"«{tunnel.Name}»: следующая попытка через {wait.TotalSeconds:F0} с."));
         }
 
         await ReconcileAsync(cancellationToken);

@@ -45,6 +45,23 @@ public sealed partial class Coordinator
     }
     private readonly Dictionary<Guid, SshExit> _sshExits = [];
 
+    /// <summary>
+    /// Подготовка адаптера SSH завершилась (успешно или с ошибкой): сверка продолжает дозвон сразу, а не по тику.
+    /// Ответ подготовки, которую уже сменила другая (туннель разорван, профиль выключен), ничего не меняет.
+    /// </summary>
+    private async Task OnSshInterfacePreparedAsync(Guid profileId, Task preparation)
+    {
+        if (Facts.Tunnels.GetValueOrDefault(profileId) is not { } tunnel || !ReferenceEquals(tunnel.SshInterfacePreparation, preparation))
+        {
+            return;
+        }
+
+        await ReconcileAsync(CancellationToken.None);
+    }
+
+    /// <summary>Подготовка адаптера SSH ещё идёт: дозваниваться рано, её завершение само назначит сверку.</summary>
+    private static bool SshInterfacePreparing(TunnelFacts tunnel) => tunnel.SshInterfacePreparation is { IsCompleted: false };
+
     /// <summary>Туннель «VPN поверх SSH» без сеанса: запустить движок, если ничто не мешает.</summary>
     private void EnsureSshTunnel(TunnelFacts tunnel)
     {
@@ -88,7 +105,20 @@ public sealed partial class Coordinator
         var interfaceName = SshTunnelDefaults.InterfaceName(profile.Id);
         try
         {
-            var preparation = tunnel.SshInterfacePreparation ??= _deps.SshTunnel.PrepareInterfaceAsync(interfaceName);
+            if (tunnel.SshInterfacePreparation is null)
+            {
+                var started = tunnel.SshInterfacePreparation = _deps.SshTunnel.PrepareInterfaceAsync(interfaceName);
+                if (!started.IsCompleted)
+                {
+                    // Пока подготовка идёт, DialDue этот туннель не видит (иначе полная сверка шла бы каждые 2 с
+                    // до 30 с подряд): её завершение само назначает сверку, и дозвон продолжится сразу.
+                    var preparedId = tunnel.ProfileId;
+                    _ = started.ContinueWith(_ => TryEnqueue("SshInterfacePrepared", () => OnSshInterfacePreparedAsync(preparedId, started)),
+                        CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                }
+            }
+
+            var preparation = tunnel.SshInterfacePreparation;
             if (!preparation.IsCompleted)
             {
                 tunnel.DialStartedUtc ??= now;
@@ -532,14 +562,18 @@ public sealed partial class Coordinator
         await FailSshTunnelAsync(tunnel, link, null, "соединение с сервером SSH потеряно", cancellationToken);
     }
 
-    /// <summary>Сеть сменилась: соединение SSH, скорее всего, оборвано - контроль не ждёт своего срока.</summary>
+    /// <summary>
+    /// Сеть сменилась: соединение SSH, скорее всего, оборвано - контроль не ждёт своего срока. Счёт неудач не
+    /// обнуляется: при «моргающем» Wi-Fi уведомления приходят чаще, чем набираются две неудачи подряд, и мёртвое
+    /// соединение иначе не перезапускалось бы никогда. Двойного счёта нет: ответ пробы, начатой до смены пути,
+    /// отбрасывается по поколению пути (<see cref="OnSshHealthAsync"/>), засчитывается только новая проба.
+    /// </summary>
     private void HastenSshHealth()
     {
         var now = _deps.Time.GetUtcNow();
         foreach (var link in Facts.Tunnels.Values.Select(t => t.Ssh).OfType<SshTunnelLink>().Where(l => l.Ready))
         {
             link.PathGeneration++;
-            link.HealthFailures = 0;
             link.NextHealthAt = now;
         }
     }

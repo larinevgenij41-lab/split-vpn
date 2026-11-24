@@ -561,7 +561,8 @@ public sealed partial class Coordinator
     /// </summary>
     private void StartVerify(TunnelFacts tunnel)
     {
-        if (tunnel.Adapter is not { IsUp: true, Addresses.Count: > 0 } adapter || Facts.Primary is null)
+        // Сеанс, ждущий повтора разрыва, уже не прошёл проверку: новая проба засчитала бы ту же неудачу снова.
+        if (tunnel.Adapter is not { IsUp: true, Addresses.Count: > 0 } adapter || Facts.Primary is null || tunnel.HangUpPending)
         {
             return;
         }
@@ -638,7 +639,7 @@ public sealed partial class Coordinator
         }
 
         tunnel.Verifying = false;
-        if (_state.Intent != Intent.Connected || !tunnel.IsUp || tunnel.Verified)
+        if (_state.Intent != Intent.Connected || !tunnel.IsUp || tunnel.Verified || tunnel.HangUpPending)
         {
             return;
         }
@@ -764,7 +765,9 @@ public sealed partial class Coordinator
         var delay = ScheduleRetry(tunnel, now, VerifyRetryFloor);
         tunnel.LastErrorText = $"«{tunnel.Name}»: {RasErrorClassifier.VerificationText(tunnel.VerifyFailures, delay)}.{ConflictCause(tunnel, now)}";
         Journal("Ошибка", tunnel.LastErrorText);
-        await HangUpAsync(tunnel, "проверка не пройдена", cancellationToken);
+        // Неудача засчитана здесь один раз: отказ RasHangUp не должен вести к новой пробе и новому счёту на
+        // каждой сверке - разрыв повторит сверка, а DialAttempt и VerifyFailures больше не растут.
+        await HangUpOrDeferAsync(tunnel, "проверка не пройдена", cancellationToken);
     }
 
     /// <summary>

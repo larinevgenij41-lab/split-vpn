@@ -799,21 +799,25 @@ public sealed partial class Coordinator
     /// пользователь не вмешается. Это положенный туннель, туннель с блокирующей ошибкой (пароль, сертификат) или
     /// без сохранённого пароля, а также любой туннель без основного адаптера. Снятие каждого запрета само
     /// назначает сверку: команда пользователя применяется, новый адаптер замечается как изменение сети.
+    /// Туннель SSH, чей адаптер ещё готовится (до 30 с), тоже ждёт: завершение подготовки назначает сверку само.
     /// </summary>
     private bool DialDue(DateTimeOffset now) =>
         _state.Intent == Intent.Connected && !Facts.ProfileTestRunning && Facts.Primary is not null && !WifiDialHeld(now)
         && Facts.Tunnels.Values.Any(t => (VpnProtocols.UsesRas(t.Protocol) ? t.Connection is null : t.Protocol == VpnProtocol.SshVpn && t.Ssh is null)
-            && !t.Dialing && !t.Paused && !t.ExternallyDisconnected && now >= t.NextDialAt
+            && !t.Dialing && !t.Paused && !t.ExternallyDisconnected && now >= t.NextDialAt && !SshInterfacePreparing(t)
             && t.BlockingError == ErrorCategory.None && !t.PasswordRequired
             && (t.ServerAddresses.Count > 0 || (!t.ServerResolving && now >= t.NextServerResolveAt)));
 
     /// <summary>
     /// Туннель поднят, но ещё не проверен, и подошёл срок следующей пробы. Дозвона такому туннелю не нужно,
     /// поэтому <see cref="DialDue"/> его не видит — без отдельного условия пауза между пробами не кончалась бы.
+    /// Как и в <see cref="DialDue"/>, без основного адаптера проба не запускается (<see cref="StartVerify"/>) и срок
+    /// не сдвигается: тик гонял бы полную сверку каждые две секунды. Появление адаптера — изменение сети, оно само
+    /// назначает сверку. Сеанс, ждущий повтора разрыва, не проверяется: разрыв повторяет сверка по своей паузе.
     /// </summary>
     private bool VerifyDue(DateTimeOffset now) =>
-        _state.Intent == Intent.Connected && !Facts.ProfileTestRunning
-        && Facts.Tunnels.Values.Any(t => t.Luid is not null && !t.Verified && !t.Verifying && now >= t.NextVerifyAt);
+        _state.Intent == Intent.Connected && !Facts.ProfileTestRunning && Facts.Primary is not null
+        && Facts.Tunnels.Values.Any(t => t.Luid is not null && !t.Verified && !t.Verifying && !t.HangUpPending && now >= t.NextVerifyAt);
 
     private static readonly TimeSpan AutoConnectBootWindow = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan ConflictCheckInterval = TimeSpan.FromMinutes(5);

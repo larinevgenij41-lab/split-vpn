@@ -360,6 +360,7 @@ public sealed partial class Coordinator
             Journal("Сведения", $"Подключение «{stale.Name}» больше не поднимается.");
         }
 
+        ExceptionDispatchInfo? failure = null;
         foreach (var profile in profiles)
         {
             if (!Facts.Tunnels.TryGetValue(profile.Id, out var tunnel))
@@ -373,9 +374,9 @@ public sealed partial class Coordinator
             tunnel.Protocol = profile.Protocol;
             tunnel.ServerPort = VpnProtocols.TryParseServer(profile.Server, profile.Protocol, out var server) ? server.Port : VpnProtocols.DefaultPort(profile.Protocol);
             await RetryRequiredReconnectAsync(tunnel, cancellationToken);
+            failure ??= await RetryPendingHangUpAsync(tunnel, cancellationToken);
         }
 
-        ExceptionDispatchInfo? failure = null;
         try
         {
             CleanupEntries();
@@ -2422,6 +2423,7 @@ public sealed partial class Coordinator
         StopSshTunnel(tunnel);
         Journal("Сведения", $"Соединение «{tunnel.Name}» разорвано: {reason}.");
         tunnel.Connection = null;
+        tunnel.HangUpPending = false;
         tunnel.Session = null;
         tunnel.Adapter = null;
         tunnel.AdapterMissingSinceUtc = null;
@@ -2429,7 +2431,66 @@ public sealed partial class Coordinator
         tunnel.SessionStartedUtc = null;
         tunnel.Statistics = null;
         Facts.AppliedFilters.Remove(FilterGroup.Runtime);
-        if (refreshRoutes) EnsureRoutesSafe();
+        if (refreshRoutes)
+        {
+            try
+            {
+                EnsureRoutesSafe();
+            }
+            catch (Exception ex) when (!IsShutdown(ex, cancellationToken))
+            {
+                // Разрыв уже состоялся и записан в модель. Сбой обновления маршрутов и фильтров (WFP, таблица
+                // маршрутов) - забота сверки: она проверит всё заново на ближайшем тике. Наружу он не выходит,
+                // иначе вызывающий пропустил бы то, что положено сделать после разрыва (паузу до дозвона, отметку
+                // обрыва для ServerHoldWindow), и туннель переподключался бы по кругу без паузы.
+                MarkInterruptedApply($"обновление маршрутов после разрыва «{tunnel.Name}»", ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Разрыв, решённый проверкой или контролем связи, когда сама неудача уже засчитана и пауза назначена. Сбой
+    /// RasHangUp не выходит наружу и не засчитывает неудачу ещё раз: туннель отмечается <see cref="TunnelFacts.HangUpPending"/>,
+    /// и разрыв повторяет сверка (<see cref="RetryPendingHangUpAsync"/>) по паузе неполного применения.
+    /// </summary>
+    private async Task HangUpOrDeferAsync(TunnelFacts tunnel, string reason, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await HangUpAsync(tunnel, reason, cancellationToken);
+        }
+        catch (Exception ex) when (ex is NativeCallException or InvalidOperationException or IOException or TimeoutException)
+        {
+            tunnel.HangUpPending = true;
+            Journal("Ошибка", $"Не удалось разорвать соединение «{tunnel.Name}» ({reason}): {ex.Message}. Повтор на следующей сверке.");
+        }
+    }
+
+    /// <summary>Повтор разрыва, отложенного <see cref="HangUpOrDeferAsync"/>. Сбой возвращается сверке: она повторится по растущей паузе.</summary>
+    private async Task<ExceptionDispatchInfo?> RetryPendingHangUpAsync(TunnelFacts tunnel, CancellationToken cancellationToken)
+    {
+        if (!tunnel.HangUpPending)
+        {
+            return null;
+        }
+
+        if (!tunnel.HasSession)
+        {
+            tunnel.HangUpPending = false;
+            return null;
+        }
+
+        try
+        {
+            // Маршруты и фильтры пересоберёт эта же сверка сразу после подготовки туннелей.
+            await HangUpAsync(tunnel, "повтор разрыва", cancellationToken, refreshRoutes: false);
+            return null;
+        }
+        catch (Exception ex) when (ex is NativeCallException or InvalidOperationException or IOException or TimeoutException)
+        {
+            _deps.Logger.LogWarning(ex, "Соединение {Name} снова не разорвано: повтор на следующей сверке", tunnel.Name);
+            return ExceptionDispatchInfo.Capture(ex);
+        }
     }
 
     /// <summary>Политика уже собрана и защита не снята: маршруты и фильтры имеет смысл обновлять.</summary>

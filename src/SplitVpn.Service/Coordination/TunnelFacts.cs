@@ -137,6 +137,13 @@ internal sealed class TunnelFacts(Guid profileId, string entryName)
     /// </summary>
     public bool ReconnectRequired { get; set; }
 
+    /// <summary>
+    /// Сеанс решено разорвать (проверка не пройдена, соединение зависло), а RasHangUp отказал. Неудача уже
+    /// засчитана и пауза до дозвона назначена: сверка повторяет только разрыв, а сеанс не проверяется и не
+    /// контролируется заново - иначе каждая следующая проба снова засчитывала бы ту же неудачу.
+    /// </summary>
+    public bool HangUpPending { get; set; }
+
     public bool CertificateProbeRunning { get; set; }
 
     public int CertificateProbeGeneration { get; set; }
@@ -220,6 +227,7 @@ internal sealed class TunnelFacts(Guid profileId, string entryName)
     {
         var stable = WasStableSession(now);
         Connection = null;
+        HangUpPending = false;
         Session = null;
         Adapter = null;
         AdapterMissingSinceUtc = null;
