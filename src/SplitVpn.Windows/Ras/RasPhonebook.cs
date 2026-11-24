@@ -35,41 +35,199 @@ public static unsafe class RasPhonebook
     // IKE и дочерняя SA — AES-256, SHA-256, группа DH 14; PFS выключен. Порядок слов — как в телефонной книге Windows.
     private const string Ikev2PolicyHex = "020000000400000003000000060000000300000000000000";
 
-    /// <summary>В RASENTRY пользовательской политики IPsec нет, поэтому правим раздел записи в файле телефонной книги.</summary>
-    private static void ApplyIkev2Policy(string phonebookPath, string entryName)
+    /// <summary>
+    /// В RASENTRY пользовательской политики IPsec нет, поэтому правим раздел записи в файле телефонной книги.
+    /// Кодировку книги выбирает RAS (UTF-8, UTF-16 с BOM или ANSI-кодировка системы — на стенде не проверено):
+    /// файл читается в его кодировке и пишется в ней же, с тем же BOM и теми же переводами строк, иначе раздел
+    /// с кириллическим именем записи не находился бы, а перезапись меняла бы кодировку чужих записей.
+    /// <paramref name="ansiCodePage"/> — кодовая страница ANSI (для тестов); по умолчанию системная.
+    /// </summary>
+    internal static void ApplyIkev2Policy(string phonebookPath, string entryName, int? ansiCodePage = null)
     {
-        var lines = WithIkev2Policy(File.ReadAllLines(phonebookPath, System.Text.Encoding.UTF8).ToList(), entryName);
-        // Через временный файл и замену: оборванная запись не оставляет телефонную книгу всех профилей усечённой.
-        AtomicFile.WriteAllText(phonebookPath, string.Concat(lines.Select(l => l + Environment.NewLine)));
+        var bytes = File.ReadAllBytes(phonebookPath);
+        var (text, encoding, preamble) = DecodePhonebook(bytes, entryName, ansiCodePage ?? (int)PInvoke.GetACP());
+        var updated = WithIkev2Policy(text, entryName);
+        WritePhonebook(phonebookPath, updated, encoding, preamble);
     }
 
-    /// <summary>Строки телефонной книги с политикой IKEv2 в разделе записи.</summary>
-    internal static List<string> WithIkev2Policy(List<string> lines, string entryName)
+    /// <summary>
+    /// Текст книги, её кодировка и BOM. BOM UTF-8 или UTF-16 определяет кодировку сам. Без BOM — строгий UTF-8,
+    /// а если байты им не являются или раздела записи в таком прочтении нет — ANSI-кодировка системы. Книга, которую
+    /// не удалось прочесть ни так, ни так, не трогается: ошибка с понятным текстом.
+    /// </summary>
+    internal static (string Text, System.Text.Encoding Encoding, byte[] Preamble) DecodePhonebook(byte[] bytes, string entryName, int ansiCodePage)
     {
-        var start = lines.FindIndex(l => l == "[" + entryName + "]");
+        ArgumentNullException.ThrowIfNull(bytes);
+        var strictUtf8 = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+        var boms = new (byte[] Preamble, System.Text.Encoding Encoding)[]
+        {
+            ([0xEF, 0xBB, 0xBF], strictUtf8),
+            ([0xFF, 0xFE], new System.Text.UnicodeEncoding(bigEndian: false, byteOrderMark: false, throwOnInvalidBytes: true)),
+            ([0xFE, 0xFF], new System.Text.UnicodeEncoding(bigEndian: true, byteOrderMark: false, throwOnInvalidBytes: true)),
+        };
+        foreach (var (preamble, encoding) in boms)
+        {
+            if (bytes.AsSpan().StartsWith(preamble))
+            {
+                return (Decode(encoding, bytes.AsSpan(preamble.Length)) ?? throw Unreadable(), encoding, preamble);
+            }
+        }
+
+        if (Decode(strictUtf8, bytes) is { } utf8 && FindSection(SplitLines(utf8), entryName) >= 0)
+        {
+            return (utf8, strictUtf8, []);
+        }
+
+        var ansi = AnsiEncoding(ansiCodePage);
+        if (ansi is not null && Decode(ansi, bytes) is { } text)
+        {
+            return (text, ansi, []);
+        }
+
+        // Байты — UTF-8, но раздела нет и в ANSI: пусть WithIkev2Policy сообщит, что записи нет.
+        return Decode(strictUtf8, bytes) is { } plain ? (plain, strictUtf8, []) : throw Unreadable();
+
+        static InvalidOperationException Unreadable() =>
+            new("Кодировка телефонной книги не распознана: политика IKEv2 не записана, книга не изменена.");
+    }
+
+    /// <summary>ANSI-кодировка со строгой проверкой байтов; null — кодовая страница недоступна или это UTF-8.</summary>
+    private static System.Text.Encoding? AnsiEncoding(int codePage)
+    {
+        if (codePage is <= 0 or 65001)
+        {
+            return null;
+        }
+
+        try
+        {
+            return System.Text.CodePagesEncodingProvider.Instance.GetEncoding(codePage, System.Text.EncoderFallback.ExceptionFallback, System.Text.DecoderFallback.ExceptionFallback)
+                ?? System.Text.Encoding.GetEncoding(codePage, System.Text.EncoderFallback.ExceptionFallback, System.Text.DecoderFallback.ExceptionFallback);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    private static string? Decode(System.Text.Encoding encoding, ReadOnlySpan<byte> bytes)
+    {
+        try
+        {
+            return encoding.GetString(bytes);
+        }
+        catch (System.Text.DecoderFallbackException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Запись книги через временный файл и замену: оборванная запись не оставляет книгу всех профилей усечённой.</summary>
+    private static void WritePhonebook(string phonebookPath, string text, System.Text.Encoding encoding, byte[] preamble)
+    {
+        byte[] body;
+        try
+        {
+            body = encoding.GetBytes(text);
+        }
+        catch (System.Text.EncoderFallbackException)
+        {
+            throw new InvalidOperationException("Политика IKEv2 не помещается в кодировку телефонной книги: книга не изменена.");
+        }
+
+        var temp = string.Create(CultureInfo.InvariantCulture, $"{phonebookPath}.{Environment.ProcessId}-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(preamble);
+                stream.Write(body);
+                stream.Flush(flushToDisk: true);
+            }
+
+            FileRetry.Run(() => File.Move(temp, phonebookPath, overwrite: true));
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(temp);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Временный файл занят: книга уже записана или осталась прежней.
+            }
+        }
+    }
+
+    /// <summary>Строки текста вместе со своими переводами строк: при записи все строки, кроме изменённых, остаются побайтно.</summary>
+    private static List<(string Line, string End)> SplitLines(string text)
+    {
+        var result = new List<(string, string)>();
+        var position = 0;
+        while (position < text.Length)
+        {
+            var newline = text.IndexOf('\n', position);
+            if (newline < 0)
+            {
+                result.Add((text[position..], ""));
+                break;
+            }
+
+            var end = newline > position && text[newline - 1] == '\r' ? newline - 1 : newline;
+            result.Add((text[position..end], text[end..(newline + 1)]));
+            position = newline + 1;
+        }
+
+        return result;
+    }
+
+    private static int FindSection(List<(string Line, string End)> lines, string entryName) =>
+        lines.FindIndex(l => l.Line == "[" + entryName + "]");
+
+    /// <summary>Текст телефонной книги с политикой IKEv2 в разделе записи; прочие строки и переводы строк не меняются.</summary>
+    internal static string WithIkev2Policy(string text, string entryName)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        var lines = SplitLines(text);
+        var start = FindSection(lines, entryName);
         if (start < 0)
         {
             throw new InvalidOperationException("Запись IKEv2 не найдена в телефонной книге.");
         }
 
-        var end = lines.FindIndex(start + 1, l => l.StartsWith('[')) is var next and >= 0 ? next : lines.Count;
+        var newline = lines.Select(l => l.End).FirstOrDefault(e => e.Length > 0) ?? Environment.NewLine;
+        var end = lines.FindIndex(start + 1, l => l.Line.StartsWith('[')) is var next and >= 0 ? next : lines.Count;
+
+        // Пустые строки в конце раздела отделяют его от следующего: новые ключи встают перед ними.
+        while (end - 1 > start && lines[end - 1].Line.Length == 0)
+        {
+            end--;
+        }
+
         var values = new (string Key, string Value)[]
         {
             ("DataEncryption", "256"), ("NumCustomPolicy", "1"), ("CustomIPSecPolicies", Ikev2PolicyHex),
         };
         foreach (var (key, value) in values)
         {
-            var at = lines.FindIndex(start + 1, end - start - 1, l => l.StartsWith(key + "=", StringComparison.Ordinal));
+            var at = lines.FindIndex(start + 1, end - start - 1, l => l.Line.StartsWith(key + "=", StringComparison.Ordinal));
             if (at >= 0)
             {
-                lines[at] = key + "=" + value;
+                lines[at] = (key + "=" + value, lines[at].End);
                 continue;
             }
 
-            lines.Insert(end++, key + "=" + value);
+            // Последняя строка файла могла быть без перевода строки: новая строка за ней пойдёт с новой строки.
+            if (lines[end - 1].End.Length == 0)
+            {
+                lines[end - 1] = (lines[end - 1].Line, newline);
+            }
+
+            lines.Insert(end++, (key + "=" + value, newline));
         }
 
-        return lines;
+        return string.Concat(lines.Select(l => l.Line + l.End));
     }
 
     public static bool Exists(string? phonebookPath, string entryName) => TryRead(phonebookPath, entryName, out _) == ErrorSuccess;

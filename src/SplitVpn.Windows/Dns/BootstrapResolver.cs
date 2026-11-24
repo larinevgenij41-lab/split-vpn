@@ -20,15 +20,23 @@ public static class BootstrapResolver
             return [literal];
         }
 
+        // Имя на национальном алфавите (vpn.пример.рф) один раз переводится в Punycode: так оно уходит в запрос,
+        // так записан владелец A-записи в ответе, и так его чаще пишут в hosts. Сравнение с исходной записью
+        // по-русски не находило ни одного адреса. Имя, которое в IDNA не переводится, не разрешается.
+        if (!DnsMessage.TryGetAsciiName(host, out var name) || name.Length == 0)
+        {
+            return [];
+        }
+
         // Имя закреплено в hosts: RAS при дозвоне возьмёт этот адрес, а не ответ DNS.
-        if (HostsFile.Lookup(host) is { Count: > 0 } fromHosts)
+        if (HostsFile.Lookup(name) is { Count: > 0 } fromHosts)
         {
             return fromHosts;
         }
 
-        var query = DnsMessage.BuildQuery((ushort)Random.Shared.Next(0, 65536), host, DnsMessage.TypeA);
+        var query = DnsMessage.BuildQuery((ushort)Random.Shared.Next(0, 65536), name, DnsMessage.TypeA);
         var servers = dnsServers.Select(s => new IPEndPoint(Ipv4.ToAddress(s), 53)).ToList();
         var response = await DnsForwarder.ForwardAsync(query, servers, interfaceIndex, TimeSpan.FromSeconds(3), cancellationToken);
-        return response is null ? [] : DnsMessage.ReadAddresses(response, host).Distinct().ToList();
+        return response is null ? [] : DnsMessage.ReadAddresses(response, name).Distinct().ToList();
     }
 }

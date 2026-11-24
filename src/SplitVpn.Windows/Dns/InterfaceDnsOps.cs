@@ -192,20 +192,34 @@ public static unsafe class InterfaceDnsOps
     /// Исключение — ::1 при ownsIpv6Loopback: посредник сам занимает [::1]:53, и чужого резолвера там быть не
     /// может, значит ::1 остался от прежнего запуска (например, копия пропала) и исходным не считается.
     /// </summary>
-    public static InterfaceDnsBackup Capture(Guid interfaceGuid, InterfaceDnsBackup? previous, DateTimeOffset now, bool ownsIpv6Loopback = false)
+    public static InterfaceDnsBackup Capture(Guid interfaceGuid, InterfaceDnsBackup? previous, DateTimeOffset now, bool ownsIpv6Loopback = false) =>
+        Capture(interfaceGuid, previous, now, ownsIpv6Loopback, Read);
+
+    /// <summary>
+    /// Снимок с подменяемым чтением (для тестов). IPv6 читается устойчиво, как в <see cref="TryReadIpv6"/>, но без
+    /// предупреждения в журнал: сверка снимает копию часто. Прежде здесь прощались лишь коды 2, 1168 и 50, и адаптер
+    /// с отвязанным IPv6, отвечающий другим кодом (например, 87), ронял снимок: адаптер не переводился на посредник,
+    /// а сверка каждый раз была «неполной». Не прочиталось — IPv6-часть берётся из прежней копии или пустая.
+    /// </summary>
+    internal static InterfaceDnsBackup Capture(Guid interfaceGuid, InterfaceDnsBackup? previous, DateTimeOffset now, bool ownsIpv6Loopback, Func<Guid, bool, InterfaceDnsState> read)
     {
-        var v4 = Read(interfaceGuid, ipv6: false);
-        var v6 = ReadOptionalIpv6(interfaceGuid)?.NameServer ?? previous?.NameServerV6 ?? "";
+        ArgumentNullException.ThrowIfNull(read);
+        var v4 = read(interfaceGuid, false);
+        InterfaceDnsState? ipv6;
+        try
+        {
+            ipv6 = read(interfaceGuid, true);
+        }
+        catch (NativeCallException)
+        {
+            ipv6 = null;
+        }
+
+        var v6 = ipv6?.NameServer ?? previous?.NameServerV6 ?? "";
         var originalSearchList = previous?.AppliedSearchList is { } applied && string.Equals(v4.SearchList, applied, StringComparison.OrdinalIgnoreCase)
             ? previous.SearchList : v4.SearchList;
         return new InterfaceDnsBackup(interfaceGuid, Original(v4.NameServer, previous?.NameServerV4), OriginalV6(v6, previous?.NameServerV6, ownsIpv6Loopback),
             v4.ProfileNameServer, v4.DohServerProperties, now, originalSearchList, v4.SearchList);
-    }
-
-    private static InterfaceDnsState? ReadOptionalIpv6(Guid interfaceGuid)
-    {
-        try { return Read(interfaceGuid, ipv6: true); }
-        catch (NativeCallException ex) when (ex.Code is ErrorFileNotFound or 1168 or 50) { return null; }
     }
 
     internal static string Original(string current, string? previous) =>

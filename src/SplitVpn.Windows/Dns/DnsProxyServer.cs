@@ -119,8 +119,25 @@ public sealed class DnsProxyServer : IAsyncDisposable
     /// <summary>Сколько соединений TCP обслуживается одновременно.</summary>
     public const int MaxTcpClients = 64;
 
-    /// <summary>Предел на всё обслуживание TCP-клиента: заголовок, тело, ответ.</summary>
+    /// <summary>Предел на обслуживание одного запроса TCP-клиента: заголовок, тело, ответ.</summary>
     public static readonly TimeSpan TcpRequestTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Сколько соединение TCP может ждать следующего запроса после ответа (RFC 7766 §6.2.3: несколько секунд).
+    /// Сколько всего живёт одно соединение и сколько запросов оно может прислать. Без этих пределов срок
+    /// соединения начинался заново с каждым запросом: любая местная программа, присылая запрос раз в несколько
+    /// секунд, занимала все <see cref="MaxTcpClients"/> мест навсегда, и большие ответы (повтор по TCP после TC)
+    /// переставали разрешаться. Запрос, уже начатый к сроку, дообслуживается; следующий не принимается.
+    /// </summary>
+    public static readonly TimeSpan DefaultTcpIdleTimeout = TimeSpan.FromSeconds(5);
+    public static readonly TimeSpan DefaultTcpConnectionLifetime = TimeSpan.FromSeconds(30);
+    public const int MaxTcpQueriesPerConnection = 100;
+
+    /// <summary>Ожидание следующего запроса в соединении TCP; в тестах короче.</summary>
+    internal TimeSpan TcpIdleTimeout { get; init; } = DefaultTcpIdleTimeout;
+
+    /// <summary>Наибольший срок одного соединения TCP; в тестах короче.</summary>
+    internal TimeSpan TcpConnectionLifetime { get; init; } = DefaultTcpConnectionLifetime;
 
     /// <summary>Код ответа REFUSED (RFC 1035): имя заблокировано правилом.</summary>
     internal const int RcodeRefused = 5;
@@ -383,7 +400,7 @@ public sealed class DnsProxyServer : IAsyncDisposable
                 _claimed.Add(address, claimed);
                 _claimLoops.RemoveAll(t => t.IsCompleted);
                 _claimLoops.Add(Task.Run(() => UdpLoopAsync(claimed, _stop.Token, localOnly: true), CancellationToken.None));
-                _claimLoops.Add(Task.Run(() => TcpAcceptLoopAsync(claimed.Tcp!, _stop.Token, localOnly: true), CancellationToken.None));
+                _claimLoops.Add(Task.Run(() => TcpAcceptLoopAsync(claimed, claimed.Tcp!, _stop.Token, localOnly: true), CancellationToken.None));
                 if (_claimFailures.Remove(address))
                 {
                     messages.Add($"DNS-посредник занял {endpoint} эксклюзивно");
@@ -441,6 +458,18 @@ public sealed class DnsProxyServer : IAsyncDisposable
             lock (_workGate)
             {
                 return [.. _claimed.Keys];
+            }
+        }
+    }
+
+    /// <summary>Задачи циклов приёма (для тестов): цикл не должен завершаться ошибкой.</summary>
+    internal IReadOnlyList<Task> ReceiveLoops
+    {
+        get
+        {
+            lock (_workGate)
+            {
+                return [.. _loops, .. _claimLoops];
             }
         }
     }
@@ -550,7 +579,7 @@ public sealed class DnsProxyServer : IAsyncDisposable
             _loops.Add(Task.Run(() => UdpLoopAsync(primary, _stop.Token)));
             if (primary.Tcp is { } tcp)
             {
-                _loops.Add(Task.Run(() => TcpAcceptLoopAsync(tcp, _stop.Token)));
+                _loops.Add(Task.Run(() => TcpAcceptLoopAsync(primary, tcp, _stop.Token)));
             }
             else
             {
@@ -567,7 +596,7 @@ public sealed class DnsProxyServer : IAsyncDisposable
                     var optional = Bind(endpoint);
                     _listeners.Add(optional);
                     _loops.Add(Task.Run(() => UdpLoopAsync(optional, _stop.Token)));
-                    _loops.Add(Task.Run(() => TcpAcceptLoopAsync(optional.Tcp!, _stop.Token)));
+                    _loops.Add(Task.Run(() => TcpAcceptLoopAsync(optional, optional.Tcp!, _stop.Token)));
                 }
                 catch (SocketException ex)
                 {
@@ -600,7 +629,7 @@ public sealed class DnsProxyServer : IAsyncDisposable
     {
         _wildcard = wildcard;
         _loops.Add(Task.Run(() => UdpLoopAsync(wildcard, _stop.Token, localOnly: true)));
-        _loops.Add(Task.Run(() => TcpAcceptLoopAsync(wildcard.Tcp!, _stop.Token, localOnly: true)));
+        _loops.Add(Task.Run(() => TcpAcceptLoopAsync(wildcard, wildcard.Tcp!, _stop.Token, localOnly: true)));
     }
 
     /// <summary>Слушатель всех адресов не занят при старте: повторять, пока порт не освободится.</summary>
@@ -687,7 +716,7 @@ public sealed class DnsProxyServer : IAsyncDisposable
             }
 
             Warn($"DNS-посредник занял TCP {listener.EndPoint}");
-            await TcpAcceptLoopAsync(tcp, token);
+            await TcpAcceptLoopAsync(listener, tcp, token);
             return;
         }
     }
@@ -717,7 +746,7 @@ public sealed class DnsProxyServer : IAsyncDisposable
                 }
 
                 _listeners.Add(optional);
-                loops = [Task.Run(() => UdpLoopAsync(optional, token), CancellationToken.None), Task.Run(() => TcpAcceptLoopAsync(optional.Tcp!, token), CancellationToken.None)];
+                loops = [Task.Run(() => UdpLoopAsync(optional, token), CancellationToken.None), Task.Run(() => TcpAcceptLoopAsync(optional, optional.Tcp!, token), CancellationToken.None)];
             }
 
             Warn($"DNS-посредник занял {endpoint}");
@@ -815,8 +844,14 @@ public sealed class DnsProxyServer : IAsyncDisposable
             set => _tcp = value;
         }
 
+        /// <summary>Сокеты закрыты: ошибки приёма после этого - штатный выход цикла, а не отказ.</summary>
+        public bool Closed => _closed;
+
+        private volatile bool _closed;
+
         public void Close()
         {
+            _closed = true;
             Udp.Dispose();
             _tcp?.Stop();
         }
@@ -1586,7 +1621,7 @@ public sealed class DnsProxyServer : IAsyncDisposable
     {
         var socket = listener.Udp;
         var buffer = new byte[MaxUdpMessage];
-        while (!token.IsCancellationRequested)
+        while (!token.IsCancellationRequested && !listener.Closed)
         {
             SocketReceiveFromResult received;
             try
@@ -1597,6 +1632,11 @@ public sealed class DnsProxyServer : IAsyncDisposable
             {
                 // ICMP port unreachable от клиента или слишком длинная датаграмма — ошибка одного пакета.
                 continue;
+            }
+            catch (SocketException) when (listener.Closed)
+            {
+                // Сокет освобождённого адреса закрыт, пока приём ждал (OperationAborted): штатный выход, не отказ.
+                return;
             }
             catch (SocketException)
             {
@@ -1669,25 +1709,36 @@ public sealed class DnsProxyServer : IAsyncDisposable
         }
     }
 
-    private async Task TcpAcceptLoopAsync(TcpListener listener, CancellationToken token, bool localOnly = false)
+    /// <summary>
+    /// Приём соединений TCP. Слушатель освобождённого адреса (<see cref="ReleaseAdapterAddresses"/>) останавливается,
+    /// пока приём ещё ждёт: тот завершается ошибкой OperationAborted, а следующий приём на остановленном слушателе -
+    /// InvalidOperationException. Оба случая - штатный выход, а не отказ: раньше второй ронял задачу цикла.
+    /// </summary>
+    private async Task TcpAcceptLoopAsync(Listener owner, TcpListener listener, CancellationToken token, bool localOnly = false)
     {
-        while (!token.IsCancellationRequested)
+        while (!token.IsCancellationRequested && !owner.Closed)
         {
             TcpClient client;
             try
             {
                 client = await AcceptTcp(listener, token);
             }
-            catch (SocketException) when (!token.IsCancellationRequested)
+            catch (SocketException ex) when (!token.IsCancellationRequested && !owner.Closed)
             {
                 // Ошибка одного соединения (клиент сбросил его до приёма) не должна навсегда остановить TCP:
                 // UDP продолжает отправлять клиентов сюда по флагу TC. Пауза — чтобы устойчивая ошибка не заняла ядро.
-                Interlocked.Increment(ref _failures);
+                // Прерванный приём (OperationAborted) - признак остановки слушателя, а не отказ: он не считается.
+                if (ex.SocketErrorCode != SocketError.OperationAborted)
+                {
+                    Interlocked.Increment(ref _failures);
+                }
+
                 await Task.Delay(ReceiveErrorPause, token).ContinueWith(_ => { }, TaskScheduler.Default);
                 continue;
             }
-            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or SocketException)
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or SocketException or InvalidOperationException)
             {
+                // InvalidOperationException - слушатель уже остановлен (адрес освобождён или посредник останавливается).
                 return;
             }
 
@@ -1717,17 +1768,48 @@ public sealed class DnsProxyServer : IAsyncDisposable
     {
         using (client)
         {
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
             try
             {
                 var stream = client.GetStream();
                 var header = new byte[2];
-                while (!token.IsCancellationRequested)
+                var opened = Environment.TickCount64;
+                for (var served = 0; served < MaxTcpQueriesPerConnection && !token.IsCancellationRequested; served++)
                 {
-                    deadline.CancelAfter(TcpRequestTimeout);
-                    if (await stream.ReadAsync(header.AsMemory(0, 1), deadline.Token) == 0)
+                    using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    if (served == 0)
                     {
-                        return;
+                        // Первый запрос: соединение без заголовка закрывается по общему сроку запроса как отказ.
+                        deadline.CancelAfter(TcpRequestTimeout);
+                        if (await stream.ReadAsync(header.AsMemory(0, 1), deadline.Token) == 0)
+                        {
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        // Следующий запрос ждётся не дольше простоя и не позже абсолютного срока соединения;
+                        // не дождались — штатное закрытие (RFC 7766), а не отказ.
+                        var left = TcpConnectionLifetime - TimeSpan.FromMilliseconds(Environment.TickCount64 - opened);
+                        var wait = left < TcpIdleTimeout ? left : TcpIdleTimeout;
+                        if (wait <= TimeSpan.Zero)
+                        {
+                            return;
+                        }
+
+                        deadline.CancelAfter(wait);
+                        try
+                        {
+                            if (await stream.ReadAsync(header.AsMemory(0, 1), deadline.Token) == 0)
+                            {
+                                return;
+                            }
+                        }
+                        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                        {
+                            return;
+                        }
+
+                        deadline.CancelAfter(TcpRequestTimeout);
                     }
 
                     await stream.ReadExactlyAsync(header.AsMemory(1), deadline.Token);
@@ -1741,6 +1823,12 @@ public sealed class DnsProxyServer : IAsyncDisposable
                     var query = new byte[length];
                     await stream.ReadExactlyAsync(query, deadline.Token);
                     var response = await HandleAsync(query, deadline.Token) ?? DnsMessage.BuildServerFailure(query);
+                    if (DnsMessage.IsTruncated(response))
+                    {
+                        // По TCP ответ с битом TC бессмыслен: клиенту повторять запрос уже негде.
+                        response = DnsMessage.BuildServerFailure(query);
+                    }
+
                     var framed = new byte[response.Length + 2];
                     BinaryPrimitives.WriteUInt16BigEndian(framed, (ushort)response.Length);
                     response.CopyTo(framed, 2);

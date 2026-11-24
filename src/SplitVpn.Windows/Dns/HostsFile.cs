@@ -31,14 +31,14 @@ public static class HostsFile
     {
         ArgumentNullException.ThrowIfNull(lines);
         ArgumentNullException.ThrowIfNull(host);
-        var name = host.TrimEnd('.');
+        var name = Key(host);
         var result = new List<uint>();
         foreach (var raw in lines)
         {
             var hash = raw.IndexOf('#', StringComparison.Ordinal);
             var parts = (hash >= 0 ? raw[..hash] : raw).Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length >= 2 && Ipv4.TryParse(parts[0], out var address)
-                && parts.Skip(1).Any(p => string.Equals(p.TrimEnd('.'), name, StringComparison.OrdinalIgnoreCase)))
+                && parts.Skip(1).Any(p => string.Equals(Key(p), name, StringComparison.OrdinalIgnoreCase)))
             {
                 result.Add(address);
             }
@@ -46,4 +46,11 @@ public static class HostsFile
 
         return result.Distinct().ToList();
     }
+
+    /// <summary>
+    /// Имя для сравнения: в hosts и в настройках одно и то же имя бывает записано и по-русски (vpn.пример.рф),
+    /// и в Punycode. Оба написания сводятся к IDNA ASCII; имя, которое в IDNA не переводится, сравнивается как есть.
+    /// </summary>
+    private static string Key(string name) =>
+        Core.Dns.DnsMessage.TryGetAsciiName(name, out var ascii) ? ascii : name.TrimEnd('.');
 }

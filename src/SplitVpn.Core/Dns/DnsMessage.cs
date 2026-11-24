@@ -426,14 +426,47 @@ public static class DnsMessage
             return [];
         }
 
-        var asked = question.TrimEnd('.').ToLowerInvariant();
+        var asked = QuestionKey(question);
         return Chain(message, answers, question).Where(n => n != asked).ToList();
     }
+
+    /// <summary>
+    /// Имя в записи IDNA ASCII (Punycode) без завершающей точки, в нижнем регистре — так, как оно идёт в запросе
+    /// (<see cref="BuildQuery"/>) и как его возвращает разбор ответа. false — имя на национальном алфавите не
+    /// переводится в IDNA (недопустимые символы, пустая метка): такое имя не разрешается.
+    /// </summary>
+    public static bool TryGetAsciiName(string name, out string ascii)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        ascii = name.TrimEnd('.');
+        if (!System.Text.Ascii.IsValid(ascii))
+        {
+            try
+            {
+                ascii = new IdnMapping().GetAscii(ascii);
+            }
+            catch (ArgumentException)
+            {
+                ascii = "";
+                return false;
+            }
+        }
+
+        ascii = ascii.ToLowerInvariant();
+        return true;
+    }
+
+    /// <summary>
+    /// Вопрос для сравнения с именами ответа. Имя ответа приходит в Punycode, а вопрос может быть записан
+    /// по-русски (vpn.пример.рф): без перевода в ASCII ни одна запись ответа не совпала бы с ним.
+    /// </summary>
+    private static string QuestionKey(string question) =>
+        TryGetAsciiName(question, out var ascii) ? ascii : question.TrimEnd('.').ToLowerInvariant();
 
     /// <summary>Цепочка «имя → CNAME → …» вопроса по записям ответа, включая сам вопрос.</summary>
     private static HashSet<string> Chain(ReadOnlySpan<byte> message, List<AnswerRecord> answers, string question)
     {
-        var chain = new HashSet<string>(StringComparer.Ordinal) { question.TrimEnd('.').ToLowerInvariant() };
+        var chain = new HashSet<string>(StringComparer.Ordinal) { QuestionKey(question) };
 
         var aliases = answers.Where(r => r.Type == TypeCname).ToLookup(r => r.Owner, StringComparer.Ordinal);
         var pending = new Queue<string>(chain);

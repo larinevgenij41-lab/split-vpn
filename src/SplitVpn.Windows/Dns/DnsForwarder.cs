@@ -25,9 +25,21 @@ public static class DnsForwarder
     public static Task<byte[]?> ForwardAsync(byte[] query, IReadOnlyList<IPEndPoint> upstreams, uint? interfaceIndex, TimeSpan timeout, CancellationToken cancellationToken) =>
         ForwardAsync(query, upstreams, interfaceIndex, timeout, tcpOnly: false, cancellationToken);
 
+    /// <summary>
+    /// Окончательный ответ первого сервера пути или null — «ответа нет». Окончательный ответ — любой полный
+    /// (без бита TC) ответ, кроме SERVFAIL (2) и REFUSED (5): NOERROR, NODATA и NXDOMAIN говорят об имени и
+    /// возвращаются сразу. SERVFAIL и REFUSED — отказ сервера, а не ответ об имени: пробуется следующий сервер, а
+    /// если отказали все, возвращается null, и посредник отдаёт просроченный ответ из кеша или строит SERVFAIL сам.
+    /// Усечённый ответ UDP, который не удалось добрать по TCP, тоже не окончательный: адресов в нём нет, а
+    /// TCP-клиент посредника получил бы ответ с битом TC. Ответ с TC эта функция не возвращает никогда.
+    /// </summary>
     /// <param name="tcpOnly">
     /// Не пробовать UDP вовсе. Без этого запрос через путь без UDP ждал бы весь срок и кончался отказом:
     /// на TCP пересылка переходит только после усечённого ответа по UDP, а ответа не будет.
+    /// </param>
+    /// <param name="acceptServerFailure">
+    /// Проверка пути (не разрешение имени): годится любой ответ сервера, в том числе SERVFAIL, REFUSED и
+    /// усечённый, — он доказывает, что путь до сервера работает.
     /// </param>
     public static async Task<byte[]?> ForwardAsync(byte[] query, IReadOnlyList<IPEndPoint> upstreams, uint? interfaceIndex, TimeSpan timeout, bool tcpOnly, CancellationToken cancellationToken, bool acceptServerFailure = false)
     {
@@ -36,36 +48,35 @@ public static class DnsForwarder
         byte[]? fallback = null;
         foreach (var upstream in upstreams)
         {
-            byte[]? response;
-            if (tcpOnly)
+            var response = tcpOnly
+                ? await TryTcpAsync(query, upstream, interfaceIndex, timeout, cancellationToken)
+                : await TryUdpAsync(query, upstream, interfaceIndex, timeout, cancellationToken);
+            if (response is not null && !tcpOnly && DnsMessage.IsTruncated(response))
             {
+                fallback ??= response;
                 response = await TryTcpAsync(query, upstream, interfaceIndex, timeout, cancellationToken);
             }
-            else
-            {
-                response = await TryUdpAsync(query, upstream, interfaceIndex, timeout, cancellationToken);
-                if (response is not null && DnsMessage.IsTruncated(response))
-                {
-                    fallback ??= response;
-                    response = await TryTcpAsync(query, upstream, interfaceIndex, timeout, cancellationToken);
-                }
-            }
 
-            // SERVFAIL — временная ошибка сервера, а не окончательный ответ об имени.
-            // Если отказали все серверы, вызывающий сможет воспользоваться stale-кешем.
-            if (response is not null && !acceptServerFailure && DnsMessage.GetRcode(response) == 5)
+            if (response is null)
             {
-                fallback = response;
                 continue;
             }
 
-            if (response is not null && (acceptServerFailure || DnsMessage.GetRcode(response) != 2))
+            if (acceptServerFailure)
             {
                 return response;
             }
+
+            // Усечённый ответ по TCP (сервер так не отвечает, но байты из сети) и отказ сервера — не ответ об имени.
+            if (DnsMessage.IsTruncated(response) || DnsMessage.GetRcode(response) is 2 or 5)
+            {
+                continue;
+            }
+
+            return response;
         }
 
-        return fallback;
+        return acceptServerFailure ? fallback : null;
     }
 
     private static async Task<byte[]?> TryUdpAsync(byte[] query, IPEndPoint upstream, uint? interfaceIndex, TimeSpan timeout, CancellationToken cancellationToken)
