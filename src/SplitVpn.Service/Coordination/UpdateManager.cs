@@ -638,6 +638,12 @@ internal sealed class UpdateManager(ServiceDependencies deps)
         {
             return await DownloadCoreAsync(coordinator, state, cancel.Token);
         }
+        catch (OperationCanceledException) when (cancel.IsCancellationRequested)
+        {
+            // Загрузку остановили намеренно («Пропустить версию», отключение обновлений, остановка службы): это не сбой.
+            deps.Logger.LogInformation("Загрузка обновления отменена");
+            return IpcResponse.Failure(IpcErrorCodes.Failed, "Загрузка обновления отменена.");
+        }
         catch (Exception ex)
         {
             deps.Logger.LogWarning(ex, "Обработка загруженного обновления прервана");

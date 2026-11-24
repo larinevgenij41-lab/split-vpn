@@ -312,12 +312,17 @@ public sealed partial class Coordinator
             try
             {
                 using var limit = new CancellationTokenSource(RevocationResolveLimit);
-                return await _deps.Resolver.ResolveAsync(ConnectivityCheckWebHost, servers, interfaceIndex, limit.Token);
+                var addresses = await _deps.Resolver.ResolveAsync(ConnectivityCheckWebHost, servers, interfaceIndex, limit.Token);
+                _failures.Recovered(ConnectivityPinFailureSource, "Имя проверки интернета Windows снова разрешается заранее");
+                return addresses;
             }
             catch (Exception ex)
             {
-                // Не разрешилось - не беда: адрес закрепится по запросу самой Windows, а попытка повторится.
-                _deps.Logger.LogInformation("Имя проверки интернета Windows заранее не разрешилось: {Error}", ex.Message);
+                // Не разрешилось - не беда: адрес закрепится по запросу самой Windows, а попытка повторится. DNS сети без
+                // интернета (портал авторизации) не отвечает часами: в журнал - первая неудача и смена текста ошибки, повторы
+                // каждые 30 с - только в подробный журнал.
+                _failures.Failure(ConnectivityPinFailureSource, "Имя проверки интернета Windows заранее не разрешилось", ex,
+                    LogLevel.Information, withStack: false, summarize: false);
                 return (IReadOnlyList<uint>)[];
             }
         });
@@ -328,6 +333,9 @@ public sealed partial class Coordinator
             await EnqueueAsync("ConnectivityCheckResolved", () => OnConnectivityCheckResolvedAsync(context, addresses, attempt));
         });
     }
+
+    /// <summary>Источник неудач заранее начатого разрешения имени веб-проверки в <see cref="RepeatedFailureLog"/>.</summary>
+    private const string ConnectivityPinFailureSource = "проверка интернета";
 
     /// <summary>Сколько дозвон ждёт заранее начатого разрешения имени веб-проверки, прежде чем начаться без него.</summary>
     internal static readonly TimeSpan ConnectivityPinBeforeDialLimit = TimeSpan.FromSeconds(2);

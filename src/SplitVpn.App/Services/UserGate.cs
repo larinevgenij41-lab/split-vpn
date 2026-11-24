@@ -32,23 +32,64 @@ internal static class UserGate
             throw;
         }
 
+        var key = area + "|" + mutexName + "|" + lockFile;
         if (file is null && mutex is null)
         {
-            Warn(area, $"файловая блокировка {lockFile} ({fileProblem}) и блокировка {mutexName} ({problem}) недоступны; " +
+            Report(key, area, Degraded.Both, $"файловая блокировка {lockFile} ({fileProblem}) и блокировка {mutexName} ({problem}) недоступны; " +
                 "действие выполняется без межпроцессной блокировки");
             return null;
         }
 
         if (file is null)
         {
-            Warn(area, $"файловая блокировка {lockFile} недоступна ({fileProblem}); действие выполняется под блокировкой {mutexName}");
+            Report(key, area, Degraded.File, $"файловая блокировка {lockFile} недоступна ({fileProblem}); действие выполняется под блокировкой {mutexName}");
         }
         else if (mutex is null)
         {
-            Warn(area, $"блокировка {mutexName} недоступна ({problem}); действие выполняется под файловой блокировкой {lockFile}");
+            Report(key, area, Degraded.Mutex, $"блокировка {mutexName} недоступна ({problem}); действие выполняется под файловой блокировкой {lockFile}");
+        }
+        else
+        {
+            Report(key, area, Degraded.None, $"блокировки {lockFile} и {mutexName} снова доступны");
         }
 
         return new Held(file, mutex);
+    }
+
+    /// <summary>Какая из блокировок недоступна.</summary>
+    private enum Degraded
+    {
+        None,
+        File,
+        Mutex,
+        Both,
+    }
+
+    private static readonly Lock StatesGate = new();
+
+    /// <summary>Последнее состояние блокировок по месту вызова (область, мьютекс, файл): мест вызова - единицы.</summary>
+    private static readonly Dictionary<string, Degraded> States = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Предупреждение - один раз на смену состояния блокировок, а не на каждый вход: занятый посторонним мьютекс
+    /// иначе давал бы строку в журнале интерфейса на каждое обновление статуса. Возврат к обеим блокировкам после
+    /// предупреждения тоже записывается - один раз.
+    /// </summary>
+    private static void Report(string key, string area, Degraded state, string text)
+    {
+        lock (StatesGate)
+        {
+            var previous = States.GetValueOrDefault(key, Degraded.None);
+            if (previous == state)
+            {
+                return;
+            }
+
+            if (state == Degraded.None) { States.Remove(key); }
+            else { States[key] = state; }
+        }
+
+        Warn(area, text);
     }
 
     /// <summary>Какие блокировки получены (для проверок).</summary>

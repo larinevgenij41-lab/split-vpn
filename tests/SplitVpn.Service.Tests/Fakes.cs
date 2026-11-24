@@ -835,8 +835,16 @@ internal sealed class FakeRas(FakeInventory inventory) : IRasOps
         }
     }
 
+    /// <summary>Опрос состояния падает этим исключением (RasMan остановлен или завис).</summary>
+    public Exception? StatusFailure { get; set; }
+
     public RasConnectionStatus GetStatus(RasConnectionHandle handle)
     {
+        if (StatusFailure is { } failure)
+        {
+            throw failure;
+        }
+
         var entry = EntryOf(handle);
         if (entry is not null && StatusOverride.TryGetValue(entry, out var status))
         {

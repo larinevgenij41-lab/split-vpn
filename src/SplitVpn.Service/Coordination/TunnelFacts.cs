@@ -169,6 +169,9 @@ internal sealed class TunnelFacts(Guid profileId, string entryName)
     /// <summary>Сколько тиков подряд соединение стоит в «подключается»: RAS пересогласует канал, это ещё не обрыв.</summary>
     public int ConnectingTicks { get; set; }
 
+    /// <summary>Сколько опросов состояния RAS подряд не удалось: после нескольких соединение считается потерянным.</summary>
+    public int StatusFailures { get; set; }
+
     /// <summary>Сеанс помощника AnyConnect: от запуска процесса до его завершения.</summary>
     public AnyConnectLink? AnyConnect { get; set; }
 
@@ -224,6 +227,7 @@ internal sealed class TunnelFacts(Guid profileId, string entryName)
         SessionStartedUtc = null;
         Statistics = null;
         ConnectingTicks = 0;
+        StatusFailures = 0;
         NextDialAt = now;
         if (stable)
         {

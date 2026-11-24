@@ -25,9 +25,61 @@ public sealed partial class Coordinator
 
     /// <summary>
     /// Узлы кластера шлюза, о которых спрашивал помощник: их имена есть в журнале. Отчёт читает набор
-    /// вне очереди актора, поэтому он потокобезопасный.
+    /// вне очереди актора, поэтому он потокобезопасный. Значение - номер последнего события журнала, после которого имя
+    /// ещё может в нём встречаться: имя, ушедшее из журнала, маскировать незачем, и набор подрезается
+    /// (<see cref="RememberGatewayNodeHost"/>), как и прежние личные значения настроек.
     /// </summary>
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _gatewayNodeHosts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _gatewayNodeHosts = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Предел набора имён узлов шлюза: каждое имя участвует в маскировании каждого отчёта.</summary>
+    internal const int MaxGatewayNodeHosts = 512;
+
+    /// <summary>Имена узлов шлюза, которые маскирует отчёт (для проверок).</summary>
+    internal IReadOnlyCollection<string> GatewayNodeHosts => _gatewayNodeHosts.Keys.ToList();
+
+    /// <summary>
+    /// Запоминает имя узла шлюза для маскирования отчёта и подрезает набор: имена, чьё последнее упоминание ушло из
+    /// журнала событий, забываются. Сверх предела (помощник спрашивает о множестве имён, а журнал стоит) первыми
+    /// уходят давние имена, которых в журнале нет; имена, ещё упомянутые в журнале, остаются.
+    /// </summary>
+    internal void RememberGatewayNodeHost(string host)
+    {
+        var retained = _deps.Journal.Since(0);
+        if (!_gatewayNodeHosts.TryAdd(host, retained.Count == 0 ? 0 : retained[^1].Id))
+        {
+            return;
+        }
+
+        var oldest = retained.Count == 0 ? long.MaxValue : retained[0].Id;
+        foreach (var item in _gatewayNodeHosts.Where(item => item.Value < oldest && !string.Equals(item.Key, host, StringComparison.OrdinalIgnoreCase)).ToList())
+        {
+            var lastReference = retained.LastOrDefault(e => e.Text.Contains(item.Key, StringComparison.OrdinalIgnoreCase));
+            if (lastReference is null) _gatewayNodeHosts.TryRemove(item.Key, out _);
+            else _gatewayNodeHosts[item.Key] = lastReference.Id;
+        }
+
+        var excess = _gatewayNodeHosts.Count - MaxGatewayNodeHosts;
+        if (excess <= 0)
+        {
+            return;
+        }
+
+        var candidates = _gatewayNodeHosts.Where(item => !string.Equals(item.Key, host, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(item => item.Value).Select(item => item.Key).ToList();
+        foreach (var name in candidates.Where(name => !retained.Any(e => e.Text.Contains(name, StringComparison.OrdinalIgnoreCase))))
+        {
+            if (excess <= 0) break;
+            if (_gatewayNodeHosts.TryRemove(name, out _)) excess--;
+        }
+
+        // Все оставшиеся ещё в журнале: предел всё равно соблюдается, уходят самые давние.
+        foreach (var name in candidates)
+        {
+            if (excess <= 0) break;
+            if (_gatewayNodeHosts.TryRemove(name, out _)) excess--;
+        }
+    }
+
     private const int MaxFormFields = 32;
     private const int MaxFormValueLength = 1024;
 
@@ -421,7 +473,7 @@ public sealed partial class Coordinator
         else
         {
             // Узел кластера шлюза попадает в журнал: маскированный отчёт должен скрыть и его.
-            _gatewayNodeHosts.TryAdd(host, 0);
+            RememberGatewayNodeHost(host);
             // Имя с сотней адресов открыло бы сотню прямых путей: адресов одного узла берётся не больше предела.
             if (resolved is null && Facts.Primary is { } primary)
             {

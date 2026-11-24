@@ -243,9 +243,11 @@ public sealed partial class Coordinator
     {
         var started = Stopwatch.GetTimestamp();
         var waited = Stopwatch.GetElapsedTime(work.EnqueuedTimestamp, started);
+        var source = "работа:" + work.Kind;
         try
         {
             await work.Run();
+            _failures.Recovered(source, $"Очередь службы: работа {work.Kind} снова выполняется без ошибок");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -253,7 +255,8 @@ public sealed partial class Coordinator
         }
         catch (Exception ex)
         {
-            _deps.Logger.LogError(ex, "Очередь службы: необработанная ошибка в работе {Kind}; служба продолжает работу", work.Kind);
+            // Работа, падающая на каждом тике, пишется со стеком один раз, дальше - редкой сводкой.
+            _failures.Failure(source, $"Очередь службы: необработанная ошибка в работе {work.Kind}; служба продолжает работу", ex);
             // Работа могла прерваться посреди применения: следующая сверка проверит всё, а не только изменения.
             Facts.ForceProtection = true;
         }

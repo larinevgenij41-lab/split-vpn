@@ -1428,7 +1428,18 @@ public sealed partial class Coordinator
                     Facts.Tunnels.GetValueOrDefault(entry.ProfileId)?.ServerAddresses.Count is null or 0))
                 .ToList(),
         };
-        _deps.Stores.SaveState(_state);
+        // Кеш адресов нужен только после перезапуска службы: занятый файл состояния (антивирус) не должен обрывать
+        // обработку нового адреса сервера до сверки - иначе политика и фильтры жили бы со старыми адресами до
+        // периодической сверки. Состояние в памяти уже новое, запись повторит тик (_recoveryWritePending).
+        try
+        {
+            _deps.Stores.SaveState(_state);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _recoveryWritePending = true;
+            _deps.Logger.LogWarning(ex, "Адреса VPN-серверов не сохранены в файл состояния: повтор на следующем тике");
+        }
     }
 
     /// <summary>
@@ -1908,6 +1919,24 @@ public sealed partial class Coordinator
 
     private bool _dnsFlushPending;
 
+    /// <summary>
+    /// Сброс системного кеша DNS вне настройки посредника. ipconfig /flushdns может не завершиться за отведённое время или
+    /// вернуть ошибку: тогда сброс откладывается (<see cref="_dnsFlushPending"/>) и выполняется при ближайшей настройке
+    /// посредника - в той же или следующей сверке, - а действие, ради которого он делался, не обрывается.
+    /// </summary>
+    private void FlushDnsCacheSafely(string reason)
+    {
+        try
+        {
+            _deps.Dns.FlushCache();
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+        {
+            _dnsFlushPending = true;
+            _deps.Logger.LogWarning(ex, "Кеш DNS не сброшен ({Reason}): повтор при ближайшей сверке", reason);
+        }
+    }
+
     /// <summary>Сеть (<see cref="CoordinatorFacts.NetworkFingerprint"/>), при которой кеш посредника последний раз сброшен.</summary>
     private string? _dnsCacheNetwork;
 
@@ -1973,18 +2002,29 @@ public sealed partial class Coordinator
         var changed = false;
         foreach (var tunnel in Facts.Tunnels.Values.ToList())
         {
+            var source = "опрос:" + tunnel.ProfileId.ToString("N");
             try
             {
                 changed |= await MonitorConnectionAsync(tunnel, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _deps.Logger.LogWarning(ex, "Ошибка опроса подключения {Profile}", tunnel.Name);
+                // Опрос, падающий на каждом тике, пишется со стеком один раз, дальше - редкой сводкой.
+                _failures.Failure(source, $"Ошибка опроса подключения «{tunnel.Name}»", ex, LogLevel.Warning);
+                continue;
             }
+
+            _failures.Recovered(source, $"Опрос подключения «{tunnel.Name}» снова выполняется");
         }
 
         return changed;
     }
+
+    /// <summary>
+    /// Сколько опросов состояния RAS подряд может не удаться, прежде чем соединение считается потерянным: RasMan
+    /// остановлен или завис, и без этого туннель навсегда числился бы поднятым, а нового дозвона не было бы.
+    /// </summary>
+    internal const int StatusFailuresAllowed = 3;
 
     /// <summary>Сколько тиков подряд «подключается» ещё не считается обрывом: RAS успевает пересогласовать канал.</summary>
     private const int ConnectingTicksAllowed = 2;
@@ -2006,7 +2046,25 @@ public sealed partial class Coordinator
             return false;
         }
 
-        var status = _deps.Ras.GetStatus(handle);
+        RasConnectionStatus status;
+        try
+        {
+            status = _deps.Ras.GetStatus(handle);
+        }
+        catch (NativeCallException ex) when (++tunnel.StatusFailures >= StatusFailuresAllowed)
+        {
+            // Состояние не читается который тик подряд: соединение считается потерянным, а дозвон идёт по обычной
+            // нарастающей паузе. Сервер о разрыве не узнал - обрыв нечистый.
+            tunnel.StatusFailures = 0;
+            _deps.Logger.LogWarning("RAS handle {Handle} ({Name}): состояние не читается {Count} опроса подряд (код {Code}), соединение считается потерянным",
+                handle, tunnel.Name, StatusFailuresAllowed, ex.Code);
+            await ReleaseDeadConnectionAsync(tunnel, handle, cancellationToken);
+            OnConnectionLost(tunnel, string.Create(CultureInfo.InvariantCulture,
+                $"служба RAS не сообщает состояние соединения (код {ex.Code})"), unclean: true);
+            return true;
+        }
+
+        tunnel.StatusFailures = 0;
         if (status == RasConnectionStatus.Connected)
         {
             tunnel.ConnectingTicks = 0;

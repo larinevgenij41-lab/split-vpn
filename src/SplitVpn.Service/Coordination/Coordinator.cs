@@ -40,9 +40,13 @@ public sealed partial class Coordinator
     private volatile string? _settingsReadError;
     private ServiceStateFile _state;
 
+    /// <summary>Устойчивые сбои шагов тика, опроса туннелей и работ очереди: в журнал без повторов на каждом тике.</summary>
+    private readonly RepeatedFailureLog _failures;
+
     public Coordinator(ServiceDependencies deps)
     {
         _deps = deps;
+        _failures = new RepeatedFailureLog(deps.Logger, deps.Time);
         _wifiRecorder = new WifiIncidentRecorder(deps.WifiIncidentDirectory, deps.Time, deps.Logger);
         // Повреждённый служебный файл не мешает запуску: хранилище откладывает его копию и работает со
         // значениями по умолчанию, а находка идёт в журнал событий сразу и в предупреждения статуса — пока
@@ -224,31 +228,45 @@ public sealed partial class Coordinator
 
     private bool TickStep(string name, Func<bool> step, CancellationToken cancellationToken)
     {
+        bool result;
         try
         {
-            return step();
+            result = step();
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             return TickStepFailed(name, ex);
         }
+
+        TickStepSucceeded(name);
+        return result;
     }
 
     private async Task<bool> TickStepAsync(string name, Func<Task<bool>> step, CancellationToken cancellationToken)
     {
+        bool result;
         try
         {
-            return await step();
+            result = await step();
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             return TickStepFailed(name, ex);
         }
+
+        TickStepSucceeded(name);
+        return result;
     }
+
+    private static string TickStepSource(string name) => "тик:" + name;
+
+    private void TickStepSucceeded(string name) =>
+        _failures.Recovered(TickStepSource(name), $"Тик службы: шаг «{name}» снова выполняется");
 
     private bool TickStepFailed(string name, Exception ex)
     {
-        _deps.Logger.LogError(ex, "Тик службы: сбой шага «{Step}»; остальные шаги выполняются", name);
+        // Шаг, падающий на каждом тике, пишется полностью один раз, дальше - редкой сводкой (RepeatedFailureLog).
+        _failures.Failure(TickStepSource(name), $"Тик службы: сбой шага «{name}»; остальные шаги выполняются", ex);
         // Шаг мог прерваться посреди применения: следующая сверка проверит всё, а не только изменения.
         Facts.ForceProtection = true;
         // Сбой - не изменение сети и не повод сверяться на каждом тике: сверку назначает TickFailureRetryDue

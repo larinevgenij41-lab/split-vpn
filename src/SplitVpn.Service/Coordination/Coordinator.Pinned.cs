@@ -477,7 +477,9 @@ public sealed partial class Coordinator
         // политике, и тогда не спросит посредника - закрепления по запросу не будет. Сброс кеша заставит спросить.
         if (revocation.Except(_revocationSuffixes).Any())
         {
-            _deps.Dns.FlushCache();
+            // Сбой сброса не должен обрывать сборку политики (иначе он повторялся бы на каждой сверке и защита не
+            // перестраивалась): сброс повторит настройка посредника в этой же сверке.
+            FlushDnsCacheSafely("проверка отзыва снова нужна");
         }
 
         _revocationSuffixes = revocation;

@@ -17,6 +17,7 @@ public sealed class ProxyService : IDisposable
     private readonly IProxySettings _settings;
     private readonly string _directoryPath;
     private readonly string _leasePath;
+    private readonly string _backupPath;
     private readonly ProxyApplier _applier;
     private readonly object _gate = new();
     private FileStream? _lease;
@@ -31,8 +32,23 @@ public sealed class ProxyService : IDisposable
         _settings = settings;
         _directoryPath = directoryPath;
         _leasePath = Path.Combine(directoryPath, "proxy-session.lock");
-        _applier = new ProxyApplier(settings, Path.Combine(directoryPath, "proxy-backup.json"));
+        _backupPath = Path.Combine(directoryPath, "proxy-backup.json");
+        _applier = new ProxyApplier(settings, _backupPath);
     }
+
+    /// <summary>Последняя синхронизация прошла успешно: прокси приведён к <see cref="_syncedPac"/>.</summary>
+    private bool _synced;
+
+    private string? _syncedPac;
+
+    /// <summary>
+    /// Делать нечего: желаемый PAC тот же, что при последней успешной синхронизации, и копия исходного прокси на месте,
+    /// только пока PAC применён. Статус приходит раз в 1,5-5 с, и без этой проверки каждый раз брались бы межпроцессные
+    /// блокировки (мьютекс - с ожиданием до 2 с). Копия, оставшаяся после аварийного выхода или от другой копии
+    /// интерфейса, и пропавшая копия при применённом PAC ведут к обычной синхронизации; первый вызов идёт всегда.
+    /// </summary>
+    private bool UpToDate(string? pac) =>
+        _synced && string.Equals(_syncedPac, pac, StringComparison.Ordinal) && File.Exists(_backupPath) == (pac is not null);
 
     public async Task<string?> UpdateAsync(StatusDto? status, bool stopped)
     {
@@ -44,8 +60,11 @@ public sealed class ProxyService : IDisposable
         {
             lock (_gate)
             {
-                if (_closed || version != Interlocked.Read(ref _version)) { return null; }
-                return Sync(pac, exiting: false);
+                if (_closed || version != Interlocked.Read(ref _version) || UpToDate(pac)) { return null; }
+                var error = Sync(pac, exiting: false);
+                _synced = error is null;
+                _syncedPac = pac;
+                return error;
             }
         }).ConfigureAwait(false);
     }

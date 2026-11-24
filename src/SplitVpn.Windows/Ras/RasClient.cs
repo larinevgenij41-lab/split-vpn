@@ -224,6 +224,13 @@ public static class RasClient
             return (RasConnectionStatus.Gone, 0);
         }
 
+        if (RasUnavailable(code))
+        {
+            // Служба удалённого доступа остановлена или не запускается: её соединений больше нет. Ошибка здесь на каждом
+            // тике оставляла бы туннель навсегда «поднятым», без нового дозвона (как и при перечислении соединений).
+            return (RasConnectionStatus.Gone, code);
+        }
+
         NativeCallException.ThrowIfFailed(code, "RasGetConnectStatus");
         var state = (uint)status.rasconnstate;
         return state switch

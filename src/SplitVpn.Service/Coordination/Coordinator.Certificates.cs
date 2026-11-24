@@ -103,6 +103,12 @@ public sealed partial class Coordinator
                     // С каким именем шла проба: к приходу результата сервер профиля мог смениться.
                     return found is null ? null : found with { ProbedHost = host };
                 }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    // Пробу остановила сама служба (сервер профиля сменился, VPN отключён, остановка): это не сбой.
+                    _deps.Logger.LogDebug("Проба сертификата сервера {Address} отменена", Ipv4.Format(address));
+                    return null;
+                }
                 catch (Exception ex)
                 {
                     _deps.Logger.LogWarning(ex, "Проба сертификата сервера {Address} не удалась", Ipv4.Format(address));
@@ -445,7 +451,9 @@ public sealed partial class Coordinator
 
             if (pinned)
             {
-                _deps.Dns.FlushCache();
+                // Сбой сброса кеша (ipconfig /flushdns завис или вернул ошибку) не отменяет повтор дозвона: адреса уже
+                // открыты, а сброс повторит ближайшая сверка (FlushDnsCacheSafely).
+                FlushDnsCacheSafely("открытие адресов проверки отзыва");
                 RetryAfterRevocationPin(tunnel);
             }
         }
