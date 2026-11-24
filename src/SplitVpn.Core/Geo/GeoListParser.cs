@@ -45,6 +45,13 @@ public static class GeoListParser
             {
                 return new GeoParseResult([], [], [], 0, true);
             }
+
+            line = WithoutComment(line);
+            if (line.Length == 0)
+            {
+                continue;
+            }
+
             var reason = ParseLine(line, v4, v6);
             if (reason is null)
             {
@@ -59,6 +66,23 @@ public static class GeoListParser
         }
 
         return new GeoParseResult(v4, v6, errors, errorCount, false);
+    }
+
+    /// <summary>
+    /// Строка без комментария в конце: «1.2.3.0/24 # RU», «1.2.3.0/24 ; SBL123», «1.2.3.0/24 // заметка». В записи
+    /// подсети (IPv4 и IPv6) этих знаков не бывает, поэтому всё после первого из них — пояснение, а не часть адреса.
+    /// Иначе одна строка с пояснением считалась бы ошибкой разбора и браковала весь список.
+    /// </summary>
+    private static string WithoutComment(string line)
+    {
+        var end = line.IndexOfAny(['#', ';']);
+        var slashes = line.IndexOf("//", StringComparison.Ordinal);
+        if (slashes >= 0 && (end < 0 || slashes < end))
+        {
+            end = slashes;
+        }
+
+        return end < 0 ? line : line[..end].Trim();
     }
 
     private static string? ParseLine(string line, List<Ipv4Cidr> v4, List<IPNetwork> v6)

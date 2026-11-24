@@ -816,9 +816,9 @@ public sealed partial class Coordinator
         if (_settings.AutoConnect && _state.Intent == Intent.Connected && _deps.SystemUptime() < AutoConnectBootWindow)
         {
             var currentBoot = BootTime();
-            if (_state.AutoConnectBootUtc is not { } seen || (currentBoot - seen).Duration() > BootTimeTolerance)
+            if (!AppliedInThisBoot(currentBoot))
             {
-                _state = _state with { AutoConnectBootUtc = currentBoot };
+                _state = WithBootMark(_state, currentBoot);
                 _deps.Stores.SaveState(_state);
             }
             return;
@@ -846,14 +846,53 @@ public sealed partial class Coordinator
         // Автоподключение применяется один раз за загрузку: иначе перезапуск службы в первые 10 минут после
         // включения компьютера отменил бы команду «Отключить», которую пользователь только что дал.
         var boot = BootTime();
-        if (_state.AutoConnectBootUtc is { } applied && (boot - applied).Duration() <= BootTimeTolerance)
+        if (AppliedInThisBoot(boot))
         {
             return;
         }
 
-        _state = _state with { Intent = Intent.Connected, AutoConnectBootUtc = boot };
+        _state = WithBootMark(_state with { Intent = Intent.Connected }, boot);
         _deps.Stores.SaveState(_state);
         Journal("Сведения", "Автоподключение при запуске Windows.");
+    }
+
+    /// <summary>
+    /// Отметка автоподключения относится к текущей загрузке Windows. Если идентификатор загрузки записан вместе с
+    /// этой отметкой и доступен сейчас, решает он: от настенных часов он не зависит. Иначе — прежнее сравнение
+    /// времени загрузки с допуском <see cref="BootTimeTolerance"/>.
+    /// </summary>
+    private bool AppliedInThisBoot(DateTimeOffset currentBoot)
+    {
+        if (_state.AutoConnectBootUtc is not { } applied)
+        {
+            return false;
+        }
+
+        if (_state.AutoConnectBootId is { } savedId && _state.AutoConnectBootIdUtc == applied && CurrentBootId() is { } currentId)
+        {
+            return string.Equals(savedId, currentId, StringComparison.Ordinal);
+        }
+
+        return (currentBoot - applied).Duration() <= BootTimeTolerance;
+    }
+
+    /// <summary>Отметка автоподключения для этой загрузки: время загрузки и, если доступен, её идентификатор.</summary>
+    private ServiceStateFile WithBootMark(ServiceStateFile state, DateTimeOffset boot)
+    {
+        var id = CurrentBootId();
+        return state with { AutoConnectBootUtc = boot, AutoConnectBootId = id, AutoConnectBootIdUtc = id is null ? null : boot };
+    }
+
+    private string? CurrentBootId()
+    {
+        try
+        {
+            return _deps.BootId() is { Length: > 0 } id ? id : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            return null;
+        }
     }
 
     /// <summary>Время загрузки, которое служба видела на прошлом тике; null - не отслеживается (окно автоподключения прошло).</summary>
@@ -863,9 +902,9 @@ public sealed partial class Coordinator
     /// Время загрузки здесь - настенное время минус время работы системы, и поправка часов Windows после загрузки
     /// сдвигает его на величину поправки. Тот же сеанс Windows после перезапуска службы выглядел бы новой загрузкой, и
     /// автоподключение отменило бы команду «Отключить». Пока служба работает в окне автоподключения, она замечает такой
-    /// сдвиг (в любую сторону) и переписывает отметку применённого автоподключения на новое время загрузки. Отдельный
-    /// идентификатор загрузки в файле состояния потребовал бы нового поля в его формате (SplitVpn.Core). Поправку,
-    /// пришедшую, пока служба не работала, это не покрывает.
+    /// сдвиг (в любую сторону) и переписывает отметку применённого автоподключения на новое время загрузки. Поправку,
+    /// пришедшую, пока служба не работала, покрывает идентификатор загрузки (<see cref="AppliedInThisBoot"/>); без
+    /// него остаётся только это отслеживание.
     /// </summary>
     private void TrackBootTimeShift()
     {
@@ -884,8 +923,9 @@ public sealed partial class Coordinator
             return;
         }
 
-        // Отметка относилась к этой же загрузке по прежним часам: переносим её на время загрузки по новым.
-        var updated = _state with { AutoConnectBootUtc = current };
+        // Отметка относилась к этой же загрузке по прежним часам: переносим её на время загрузки по новым
+        // (идентификатор загрузки тот же и остаётся при отметке).
+        var updated = WithBootMark(_state, current);
         try
         {
             _deps.Stores.SaveState(updated);

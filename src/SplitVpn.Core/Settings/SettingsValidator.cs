@@ -141,6 +141,20 @@ public static class SettingsValidator
             appUpdate = appUpdate with { ManifestMirrors = manifestMirrors, PackageMirrors = packageMirrors };
         }
 
+        // Неизвестный вид цели (число вместо имени) компилятор политики блокирует, а сохранение отклоняет:
+        // цель заменяется блокировкой сразу, чтобы настройки снова сохранялись и ничего не ушло мимо VPN.
+        var defaultTarget = KnownTarget(model.DefaultTarget, "«Остальной интернет»", found);
+        var geoTarget = KnownTarget(model.GeoTarget, "«Россия (RU-база)»", found);
+        RouteTarget? bypassTarget = model.BypassTarget is { } bypassValue ? KnownTarget(bypassValue, "«Обход блокировок»", found) : null;
+        var folders = model.RoutingFolders.Select(f => Enum.IsDefined(f.Target.Kind) ? f
+            : f with { Target = KnownTarget(f.Target, Text($"папки «{f.Name}»"), found) }).ToList();
+        var rules = model.Rules.Select(r => Enum.IsDefined(r.Target.Kind) ? r
+            : r with { Target = KnownTarget(r.Target, "подсеть " + r.Cidr, found) }).ToList();
+        var domainRules = model.DomainRules.Select(r => Enum.IsDefined(r.Target.Kind) ? r
+            : r with { Target = KnownTarget(r.Target, "домен " + r.Suffix, found) }).ToList();
+        var profiles = model.Profiles.Select(p => p.AnyConnect.ServerNetworksTarget is not { } networks || Enum.IsDefined(networks.Kind) ? p
+            : p with { AnyConnect = p.AnyConnect with { ServerNetworksTarget = KnownTarget(networks, Text($"сети шлюза «{p.Name}»"), found) } }).ToList();
+
         repairs = found;
         return found.Count == 0 ? settings : model with
         {
@@ -149,7 +163,26 @@ public static class SettingsValidator
             GeoUpdate = geo,
             BypassUpdate = bypass,
             AppUpdate = appUpdate,
+            DefaultTarget = defaultTarget,
+            GeoTarget = geoTarget,
+            BypassTarget = bypassTarget,
+            RoutingFolders = folders,
+            Rules = rules,
+            DomainRules = domainRules,
+            Profiles = profiles,
         };
+    }
+
+    /// <summary>Цель известного вида остаётся; неизвестная становится блокировкой, о чём пишется строка в <paramref name="found"/>.</summary>
+    private static RouteTarget KnownTarget(RouteTarget target, string where, List<string> found)
+    {
+        if (Enum.IsDefined(target.Kind))
+        {
+            return target;
+        }
+
+        found.Add(Text($"для {where} задана неизвестная цель, трафик блокируется."));
+        return RouteTarget.Blocked;
     }
 
     private static GeoUpdateSettings RepairGeoSource(GeoUpdateSettings geo, GeoUpdateSettings defaults, string title, List<string> found)
@@ -219,6 +252,18 @@ public static class SettingsValidator
     {
         foreach (var profile in settings.Profiles)
         {
+            if (UnknownSettingValues.HasPreservedValues(profile))
+            {
+                // Подключение записано более новой версией программы: его протокол, роль или способ входа здесь
+                // подставлены вместо неизвестных, проверять их бессмысленно, а поднимать такое подключение нельзя.
+                if (profile.Role != ProfileRole.Off)
+                {
+                    errors.Add(Text($"Подключение «{profile.Name}» записано более новой версией программы, и часть его параметров этой версии неизвестна: включить его можно только в той версии."));
+                }
+
+                continue;
+            }
+
             ValidateProfile(profile, errors);
         }
 

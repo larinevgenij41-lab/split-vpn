@@ -374,7 +374,9 @@ public static class PolicyCompiler
         TargetKind.Block => new Classification(Decision.Block, source, rule),
         // Цель без указанного туннеля или группы до службы не доходит (валидатор настроек), но безопаснее блокировать.
         TargetKind.Tunnel or TargetKind.Group => new Classification(Decision.Block, source, rule),
-        _ => new Classification(Decision.Direct, source, rule),
+        TargetKind.Direct => new Classification(Decision.Direct, source, rule),
+        // Неизвестный вид цели (число вместо имени в файле или запросе) не должен молча уходить мимо VPN.
+        _ => new Classification(Decision.Block, source, rule),
     };
 
     internal static RangeSet OnLinkSet(IEnumerable<Ipv4Cidr> prefixes)

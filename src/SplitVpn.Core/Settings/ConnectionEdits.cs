@@ -1,3 +1,4 @@
+using System.Globalization;
 using SplitVpn.Core.Policy;
 
 namespace SplitVpn.Core.Settings;
@@ -93,7 +94,8 @@ public static class ConnectionEdits
     {
         ArgumentNullException.ThrowIfNull(existingNames);
         ArgumentNullException.ThrowIfNull(imported);
-        var names = existingNames.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        // Занятые названия сравниваются так же, как в проверке настроек: без пробелов по краям и без учёта регистра.
+        var names = existingNames.Select(n => (n ?? "").Trim()).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var result = new List<ConnectionProfile>();
         var profiles = imported.OfType<ConnectionProfile>().Select(SettingsSerializer.NormalizeProfile).ToList();
         // Прежний идентификатор из файла -> новый: ссылки между подключениями файла (цель сетей шлюза) переносятся вместе с ними.
@@ -168,24 +170,40 @@ public static class ConnectionEdits
         return value.Kind == TargetKind.Group ? null : value;
     }
 
-    /// <summary>Название, не совпадающее с занятыми: «Имя», «Имя 2», «Имя 3»…</summary>
+    /// <summary>
+    /// Название, не совпадающее с занятыми: «Имя», «Имя 2», «Имя 3»… Сравнение то же, что у проверки настроек:
+    /// без пробелов по краям и без учёта регистра, — иначе «Office» при занятом «Office » прошло бы здесь и было бы
+    /// отклонено при сохранении. Результат не длиннее <see cref="SettingsValidator.MaxNameLength"/>.
+    /// </summary>
     public static string UniqueName(IReadOnlySet<string> taken, string name)
     {
         ArgumentNullException.ThrowIfNull(taken);
-        var candidate = name;
-        for (var i = 2; taken.Contains(candidate); i++)
+        var used = taken.Select(t => (t ?? "").Trim()).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var basis = (name ?? "").Trim();
+        var candidate = Fit(basis, SettingsValidator.MaxNameLength);
+        for (var i = 2; used.Contains(candidate); i++)
         {
-            var suffix = $" {i}";
-            var length = Math.Min(name.Length, SettingsValidator.MaxNameLength - suffix.Length);
-            if (length > 0 && char.IsHighSurrogate(name[length - 1]))
-            {
-                length--;
-            }
-
-            candidate = name[..length] + suffix;
+            var suffix = string.Create(CultureInfo.InvariantCulture, $" {i}");
+            candidate = Fit(basis, SettingsValidator.MaxNameLength - suffix.Length) + suffix;
         }
 
         return candidate;
+    }
+
+    /// <summary>Начало названия длиной не больше <paramref name="length"/>, не разрезая суррогатную пару.</summary>
+    private static string Fit(string name, int length)
+    {
+        if (name.Length <= length)
+        {
+            return name;
+        }
+
+        if (length > 0 && char.IsHighSurrogate(name[length - 1]))
+        {
+            length--;
+        }
+
+        return name[..length].TrimEnd();
     }
 
     /// <summary>

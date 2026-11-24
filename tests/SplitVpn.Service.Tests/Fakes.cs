@@ -86,6 +86,9 @@ internal sealed class FakeWorld : IDisposable
 
     public TimeSpan Uptime { get; set; } = TimeSpan.FromHours(3);
 
+    /// <summary>Идентификатор загрузки Windows; по умолчанию недоступен — загрузка узнаётся по времени.</summary>
+    public string? BootId { get; set; }
+
     public bool Metered { get; set; }
 
     public List<SplitVpn.Core.Ipc.StatusWarning> Conflicts { get; } = [];
@@ -141,6 +144,7 @@ internal sealed class FakeWorld : IDisposable
             ? new RasTermination(TerminationReason, TerminationTimeUtc ?? Time.GetUtcNow())
             : null,
         SystemUptime = () => Uptime,
+        BootId = () => BootId,
         IsMeteredNetwork = () => Metered,
         DetectConflicts = _ => Conflicts.ToList(),
         ProductVersion = ProductVersion,

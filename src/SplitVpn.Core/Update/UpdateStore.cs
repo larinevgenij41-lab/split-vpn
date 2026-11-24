@@ -1,5 +1,6 @@
 ﻿using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using SplitVpn.Core.Settings;
 
 namespace SplitVpn.Core.Update;
@@ -36,10 +37,47 @@ public sealed class UpdateStore
 
     public UpdateState LoadState() => SafeFile.Load(
         StatePath,
-        text => JsonSerializer.Deserialize<UpdateState>(text, JsonDefaults.Options),
+        ParseState,
         () => new UpdateState(),
         "Состояние обновления программы было повреждено и заменено значениями по умолчанию",
         OnCorrupt);
+
+    /// <summary>
+    /// Разбор состояния. Фаза, которой эта версия не знает (файл более новой версии после отката, ручная правка),
+    /// становится «Idle», а не делает весь файл повреждённым: иначе вместе с ним пропала бы
+    /// <see cref="UpdateState.HighestSeenVersion"/> — защита от подмены ответа старым манифестом.
+    /// </summary>
+    internal static UpdateState? ParseState(string text)
+    {
+        UpdateState? state;
+        try
+        {
+            state = JsonSerializer.Deserialize<UpdateState>(text, JsonDefaults.Options);
+        }
+        catch (JsonException) when (JsonNode.Parse(text) is JsonObject root
+            && root.Select(p => p.Key).FirstOrDefault(k => string.Equals(k, "phase", StringComparison.OrdinalIgnoreCase)) is { } key
+            && !IsKnownPhase(root[key]))
+        {
+            // Исключение в условии (сам JSON не разбирается) оставляет исходную ошибку: файл повреждён.
+            root[key] = nameof(UpdatePhase.Idle);
+            state = root.Deserialize<UpdateState>(JsonDefaults.Options);
+        }
+
+        // Неопределённое число вместо имени фазы разбирается без ошибки, но значит то же самое.
+        return state is not null && !Enum.IsDefined(state.Phase) ? state with { Phase = UpdatePhase.Idle } : state;
+    }
+
+    private static bool IsKnownPhase(JsonNode? node)
+    {
+        try
+        {
+            return node is not null && Enum.IsDefined(node.Deserialize<UpdatePhase>(JsonDefaults.Options));
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
 
     /// <summary>Каталог перенаправлен (см. <see cref="RedirectionProblem"/>) — состояние не пишется: оно остаётся в памяти службы.</summary>
     public void SaveState(UpdateState state)

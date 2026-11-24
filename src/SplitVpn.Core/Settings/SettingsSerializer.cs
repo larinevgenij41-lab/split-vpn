@@ -22,7 +22,22 @@ public static class SettingsSerializer
     public static string Revision(AppSettings settings) => Convert.ToHexString(
         System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(Serialize(settings))));
 
-    public static string Serialize(AppSettings settings) => JsonSerializer.Serialize(settings, JsonDefaults.Options);
+    /// <summary>
+    /// Текст файла настроек. Исходные значения, которых эта версия не знает (см. <see cref="UnknownSettingValues"/>),
+    /// возвращаются на свои места: файл, записанный более новой версией, переживает откат без потерь.
+    /// </summary>
+    public static string Serialize(AppSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        if (settings.Profiles?.Any(UnknownSettingValues.HasPreservedValues) != true)
+        {
+            return JsonSerializer.Serialize(settings, JsonDefaults.Options);
+        }
+
+        var root = JsonSerializer.SerializeToNode(settings, JsonDefaults.Options)!.AsObject();
+        UnknownSettingValues.Restore(root);
+        return root.ToJsonString(JsonDefaults.Options);
+    }
 
     public static SettingsLoadResult Deserialize(string json)
     {
@@ -36,11 +51,24 @@ public static class SettingsSerializer
 
             var version = root["schemaVersion"]?.GetValue<int>() ?? 0;
             var migrated = false;
+            string? migrationWarning = null;
             if (version is 1 or 2 && version != AppSettings.CurrentSchemaVersion)
             {
-                MigrateToCurrent(root, version);
+                migrationWarning = MigrateToCurrent(root, version);
                 version = AppSettings.CurrentSchemaVersion;
                 migrated = true;
+            }
+
+            string? futureWarning = null;
+            if (version > AppSettings.CurrentSchemaVersion)
+            {
+                // Файл более новой версии программы (откат после обновления): известные разделы читаются по тем же
+                // правилам, неизвестные поля сохраняются в Extra, неизвестные значения обезвреживаются ниже. Отбросить
+                // файл значило бы потерять все подключения и правила при первом же сохранении.
+                futureWarning = string.Create(CultureInfo.InvariantCulture,
+                    $"Настройки записаны более новой версией программы (схема {version}, эта версия знает схему {AppSettings.CurrentSchemaVersion}): прочитано то, что эта версия понимает.");
+                root["schemaVersion"] = AppSettings.CurrentSchemaVersion;
+                version = AppSettings.CurrentSchemaVersion;
             }
 
             if (version != AppSettings.CurrentSchemaVersion)
@@ -50,6 +78,7 @@ public static class SettingsSerializer
                     $"Неподдерживаемая версия схемы настроек: {version}. Ожидается {AppSettings.CurrentSchemaVersion}."));
             }
 
+            var unknown = UnknownSettingValues.Sanitize(root);
             var settings = root.Deserialize<AppSettings>(JsonDefaults.Options);
             if (settings is null)
             {
@@ -57,8 +86,12 @@ public static class SettingsSerializer
             }
 
             var normalized = LegacyIpv4.Canonicalize(Normalize(settings), out var ipv4Warning);
-            var warnings = new[] { DuplicateIdsWarning(normalized), ipv4Warning }.OfType<string>().ToList();
-            return new SettingsLoadResult(DropDuplicateIds(normalized), null, migrated,
+            var duplicates = DuplicateIdsWarning(normalized);
+            var loaded = UnknownSettingValues.BlockTargetsOfDisabled(DropDuplicateIds(normalized), unknown);
+            var unknownWarning = unknown.Count == 0 ? null
+                : "Значения, неизвестные этой версии программы, обезврежены: " + string.Join("; ", unknown) + ".";
+            var warnings = new[] { futureWarning, migrationWarning, unknownWarning, duplicates, ipv4Warning }.OfType<string>().ToList();
+            return new SettingsLoadResult(loaded, null, migrated,
                 warnings.Count == 0 ? null : string.Join(" ", warnings));
         }
         catch (JsonException ex)
@@ -247,7 +280,8 @@ public static class SettingsSerializer
     /// а активное подключение становится опорным туннелем. Схема 2 существовала в двух видах — с протоколами
     /// и с целями; распознаётся по наличию полей «activeProfileId» и «routingMode».
     /// </summary>
-    internal static void MigrateToCurrent(JsonObject root, int version)
+    /// <returns>Предупреждение о целях, заменённых блокировкой (см. <see cref="MigrateTargets"/>); null, если таких нет.</returns>
+    internal static string? MigrateToCurrent(JsonObject root, int version)
     {
         ArgumentNullException.ThrowIfNull(root);
         if (version <= 1)
@@ -255,12 +289,14 @@ public static class SettingsSerializer
             ResetProtocols(root);
         }
 
+        string? warning = null;
         if (root["activeProfileId"] is not null || root["routingMode"] is not null)
         {
-            MigrateTargets(root);
+            warning = MigrateTargets(root);
         }
 
         root["schemaVersion"] = AppSettings.CurrentSchemaVersion;
+        return warning;
     }
 
     /// <summary>Профили схемы 1: протоколов и EAP она не знала, поля из файла новой конфигурацией не считаем.</summary>
@@ -275,24 +311,50 @@ public static class SettingsSerializer
         }
     }
 
-    /// <summary>Активное подключение становится опорным туннелем, режим и действия правил — целями.</summary>
-    private static void MigrateTargets(JsonObject root)
+    /// <summary>
+    /// Активное подключение становится опорным туннелем, режим и действия правил — целями. Если активного
+    /// подключения нет (поле пусто, не разбирается или указывает на подключение, которого нет в списке), всё, что
+    /// схема 2 направляла в VPN, блокируется: правила «Vpn», RU-база в режиме «AllViaVpn» и «остальной интернет»
+    /// (если подключения в файле есть). Прямой выход молча пустил бы этот трафик мимо VPN, а цель на
+    /// несуществующее подключение отклоняла бы каждое сохранение.
+    /// </summary>
+    /// <returns>Что заблокировано — для предупреждения загрузки; null, если ничего.</returns>
+    private static string? MigrateTargets(JsonObject root)
     {
         var active = root["activeProfileId"]?.GetValue<string>();
         var hasActive = Guid.TryParse(active, out var activeId);
-        if (root["profiles"] is JsonArray profiles)
+        var profiles = (root["profiles"] as JsonArray ?? []).OfType<JsonObject>().ToList();
+        var activeExists = false;
+        foreach (var profile in profiles)
         {
-            foreach (var profile in profiles.OfType<JsonObject>())
-            {
-                var isActive = hasActive && Guid.TryParse(profile["id"]?.GetValue<string>(), out var id) && id == activeId;
-                profile["role"] = isActive ? nameof(ProfileRole.Primary) : nameof(ProfileRole.Off);
-            }
+            var isActive = hasActive && Guid.TryParse(profile["id"]?.GetValue<string>(), out var id) && id == activeId;
+            activeExists |= isActive;
+            profile["role"] = isActive ? nameof(ProfileRole.Primary) : nameof(ProfileRole.Off);
         }
 
-        var tunnel = hasActive ? Target(TargetKind.Tunnel, activeId) : Target(TargetKind.Direct, null);
+        var tunnel = activeExists ? Target(TargetKind.Tunnel, activeId) : Target(TargetKind.Block, null);
+        var blocked = new List<string>();
         var allViaVpn = string.Equals(root["routingMode"]?.GetValue<string>(), "AllViaVpn", StringComparison.OrdinalIgnoreCase);
-        root["defaultTarget"] = tunnel.DeepClone();
+        if (activeExists || profiles.Count > 0)
+        {
+            root["defaultTarget"] = tunnel.DeepClone();
+            if (!activeExists)
+            {
+                blocked.Add("«Остальной интернет»");
+            }
+        }
+        else
+        {
+            // Подключений нет вовсе: через VPN ничего не шло и идти не могло — «остальной интернет», как в новых настройках.
+            root["defaultTarget"] = Target(TargetKind.Direct, null);
+        }
+
         root["geoTarget"] = allViaVpn ? tunnel.DeepClone() : Target(TargetKind.Direct, null);
+        if (allViaVpn && !activeExists)
+        {
+            blocked.Add("«Россия (RU-база)»");
+        }
+
         root.Remove("activeProfileId");
         root.Remove("routingMode");
 
@@ -305,8 +367,23 @@ public static class SettingsSerializer
                 "Direct" => Target(TargetKind.Direct, null),
                 _ => tunnel.DeepClone(),
             };
+            if (action is not ("Block" or "Direct") && !activeExists)
+            {
+                blocked.Add("подсеть " + (rule["cidr"] is JsonValue cidr && cidr.TryGetValue<string>(out var text) ? text : "без адреса"));
+            }
+
             rule.Remove("action");
         }
+
+        if (blocked.Count == 0)
+        {
+            return null;
+        }
+
+        var reason = hasActive
+            ? "активное подключение из прежних настроек не найдено в списке"
+            : "в прежних настройках не выбрано активное подключение";
+        return $"При переводе настроек на новую схему {reason}: то, что шло через VPN, теперь блокируется ({string.Join(", ", blocked)}). Выберите подключение для этих целей.";
     }
 
     private static JsonObject Target(TargetKind kind, Guid? tunnelId)

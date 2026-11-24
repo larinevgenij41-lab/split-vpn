@@ -77,6 +77,12 @@ public sealed record ServiceDependencies
     /// <summary>Время с загрузки Windows: автоподключение срабатывает только при запуске системы.</summary>
     public Func<TimeSpan> SystemUptime { get; init; } = () => TimeSpan.FromMilliseconds(Environment.TickCount64);
 
+    /// <summary>
+    /// Идентификатор текущей загрузки Windows, не зависящий от настенных часов; null — недоступен (тогда загрузка
+    /// узнаётся по времени). По нему автоподключение срабатывает один раз за загрузку.
+    /// </summary>
+    public Func<string?> BootId { get; init; } = WindowsBootId.Read;
+
     /// <summary>Конфликты с другими программами: чужие VPN-соединения, маршруты на туннеле, жёсткие разрешения WFP.</summary>
     public Func<Windows.Diagnostics.ConflictInputs, IReadOnlyList<Core.Ipc.StatusWarning>> DetectConflicts { get; init; } = _ => [];
 
@@ -112,4 +118,29 @@ public sealed record ServiceDependencies
 
     /// <summary>Собранные архивы до выдачи интерфейсу.</summary>
     public Diagnostics.DiagnosticsPackages? DiagnosticsPackages { get; init; }
+}
+
+/// <summary>
+/// Номер загрузки Windows: значение BootId в PrefetchParameters диспетчера памяти. Windows увеличивает его при каждой
+/// загрузке, и от настенных часов оно не зависит.
+/// </summary>
+internal static class WindowsBootId
+{
+    private const string Key = @"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters";
+
+    public static string? Read()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(Key);
+            return key?.GetValue("BootId") is int value
+                ? value.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                : null;
+        }
+        catch (Exception ex) when (ex is System.Security.SecurityException or UnauthorizedAccessException or IOException)
+        {
+            // Нет значения или доступа: загрузка узнаётся по времени, как прежде.
+            return null;
+        }
+    }
 }

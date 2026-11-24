@@ -29,8 +29,9 @@ public class SettingsTests
         Assert.Equal(settings.Rules[0].Target, loaded.Settings.Rules[0].Target);
     }
 
+    // Схема новее текущей теперь читается с предупреждением (UnknownSettingValuesTests.NewerSchema_IsRead_WithWarning).
     [Theory]
-    [InlineData("{\"schemaVersion\":7}")]
+    [InlineData("{\"schemaVersion\":0}")]
     [InlineData("{}")]
     [InlineData("{broken")]
     public void Serializer_RejectsUnknownSchemaOrCorruption(string json)

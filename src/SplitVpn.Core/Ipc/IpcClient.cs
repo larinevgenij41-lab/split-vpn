@@ -81,6 +81,22 @@ public sealed partial class IpcClient : IAsyncDisposable
     private readonly NamedPipeClientStream _pipe;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
+    /// <summary>Отменяется при освобождении клиента: ожидающие очереди канала просыпаются, а не ждут вечно.</summary>
+    private readonly CancellationTokenSource _closing = new();
+
+    /// <summary>Вызовы внутри <see cref="SendPayloadAsync"/>: семафор освобождается, только когда им никто не пользуется.</summary>
+    private int _active;
+
+    private int _disposed;
+    private int _released;
+
+    /// <summary>
+    /// Канал сломан: обмен прерван посреди кадра (таймаут, отмена, обрыв, неверная длина) или клиент освобождён.
+    /// Следующий кадр прочитался бы с середины чужого ответа, поэтому канал закрыт, а новые запросы сразу получают
+    /// <see cref="ServiceUnavailableException"/> и открывают новое соединение.
+    /// </summary>
+    private volatile bool _broken;
+
     internal IpcClient(NamedPipeClientStream pipe)
     {
         _pipe = pipe;
@@ -178,7 +194,34 @@ public sealed partial class IpcClient : IAsyncDisposable
     public async Task<IpcResponse> SendPayloadAsync(byte[] requestPayload, TimeSpan timeout, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(requestPayload);
-        using var timed = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (requestPayload.Length > FrameCodec.MaxFrameBytes)
+        {
+            // Ошибка самого запроса: в канал ничего не записано, соединение остаётся рабочим.
+            throw new IpcProtocolException("Сообщение превышает допустимый размер.");
+        }
+
+        Interlocked.Increment(ref _active);
+        try
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                throw Closed(null);
+            }
+
+            return await ExchangeAsync(requestPayload, timeout, cancellationToken);
+        }
+        finally
+        {
+            if (Interlocked.Decrement(ref _active) == 0 && Volatile.Read(ref _disposed) != 0)
+            {
+                ReleaseResources();
+            }
+        }
+    }
+
+    private async Task<IpcResponse> ExchangeAsync(byte[] requestPayload, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        using var timed = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _closing.Token);
         if (timeout != Timeout.InfiniteTimeSpan)
         {
             timed.CancelAfter(timeout);
@@ -190,11 +233,19 @@ public sealed partial class IpcClient : IAsyncDisposable
         }
         catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new ServiceUnavailableException($"Служба не ответила за {timeout.TotalSeconds:0} с.", ex, ServiceUnavailableReason.Timeout);
+            // Очередь не подошла: канал не тронут — его держит другой запрос.
+            throw _closing.IsCancellationRequested ? Closed(ex)
+                : new ServiceUnavailableException($"Служба не ответила за {timeout.TotalSeconds:0} с.", ex, ServiceUnavailableReason.Timeout);
         }
 
+        byte[]? payload;
         try
         {
+            if (_broken)
+            {
+                throw Closed(null);
+            }
+
             try
             {
                 await FrameCodec.WriteAsync(_pipe, requestPayload, timed.Token);
@@ -203,7 +254,9 @@ public sealed partial class IpcClient : IAsyncDisposable
             {
                 // Служба отказывает клиенту без прав сразу после подключения: ответ уже лежит в канале,
                 // а запись в закрытый ею канал не проходит. Без ответа — обычный разрыв связи.
-                if (await TryReadPendingAsync(timed.Token) is { } pending)
+                var pending = await TryReadPendingAsync(timed.Token);
+                await BreakAsync();
+                if (pending is not null)
                 {
                     return pending;
                 }
@@ -212,28 +265,56 @@ public sealed partial class IpcClient : IAsyncDisposable
                 throw new ServiceUnavailableException("Связь со службой прервана.", ex) { RequestNotSent = true };
             }
 
-            var payload = await FrameCodec.ReadAsync(_pipe, timed.Token)
-                ?? throw new ServiceUnavailableException("Служба закрыла канал.");
-            return IpcSerializer.DeserializeResponse(payload);
+            payload = await FrameCodec.ReadAsync(_pipe, timed.Token);
+            if (payload is null)
+            {
+                await BreakAsync();
+                throw new ServiceUnavailableException("Служба закрыла канал.");
+            }
         }
-        catch (IOException ex)
+        catch (ServiceUnavailableException)
         {
-            throw new ServiceUnavailableException("Связь со службой прервана.", ex);
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            await BreakAsync();
+            throw _closing.IsCancellationRequested ? Closed(ex) : new ServiceUnavailableException("Связь со службой прервана.", ex);
         }
         catch (OperationCanceledException ex)
         {
-            await _pipe.DisposeAsync();
+            await BreakAsync();
             if (cancellationToken.IsCancellationRequested)
             {
                 throw;
             }
 
-            throw new ServiceUnavailableException($"Служба не ответила за {timeout.TotalSeconds:0} с.", ex, ServiceUnavailableReason.Timeout);
+            throw _closing.IsCancellationRequested ? Closed(ex)
+                : new ServiceUnavailableException($"Служба не ответила за {timeout.TotalSeconds:0} с.", ex, ServiceUnavailableReason.Timeout);
+        }
+        catch
+        {
+            // Неверная длина кадра, обрыв посреди кадра и прочее: граница кадров потеряна, канал больше не годится.
+            await BreakAsync();
+            throw;
         }
         finally
         {
             _lock.Release();
         }
+
+        // Кадр прочитан целиком: ошибка разбора его содержимого не сдвигает границы кадров, канал остаётся рабочим.
+        return IpcSerializer.DeserializeResponse(payload);
+    }
+
+    /// <summary>Запрос не отправлен: клиент освобождён или канал уже сломан прежним обменом.</summary>
+    private static ServiceUnavailableException Closed(Exception? inner) =>
+        new("Соединение со службой закрыто: нужно новое подключение.", inner) { RequestNotSent = true };
+
+    private async ValueTask BreakAsync()
+    {
+        _broken = true;
+        await _pipe.DisposeAsync();
     }
 
     private async Task<IpcResponse?> TryReadPendingAsync(CancellationToken cancellationToken)
@@ -248,10 +329,34 @@ public sealed partial class IpcClient : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Закрывает канал. Запрос, который держит очередь, и запросы, ждущие её, завершаются
+    /// <see cref="ServiceUnavailableException"/>; семафор и источник отмены освобождает последний из них.
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        _broken = true;
+        await _closing.CancelAsync();
         await _pipe.DisposeAsync();
-        _lock.Dispose();
+        if (Volatile.Read(ref _active) == 0)
+        {
+            ReleaseResources();
+        }
+    }
+
+    /// <summary>Один раз и только когда очередью никто не пользуется: Release на освобождённом семафоре бросил бы.</summary>
+    private void ReleaseResources()
+    {
+        if (Interlocked.Exchange(ref _released, 1) == 0)
+        {
+            _lock.Dispose();
+            _closing.Dispose();
+        }
     }
 
     private static void VerifyServer(NamedPipeClientStream pipe, string serviceName)

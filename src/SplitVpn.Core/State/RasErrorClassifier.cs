@@ -34,6 +34,7 @@ public static class RasErrorClassifier
         [813] = ErrorCategory.ServerUnreachable,
         [-2146762487] = ErrorCategory.Certificate, // 0x800B0109 недоверенный корень
         [-2146762481] = ErrorCategory.Certificate, // 0x800B010F имя не совпадает
+        [-2146762480] = ErrorCategory.Certificate, // 0x800B0110 сертификат не годится для запрошенного использования
         [-2146762495] = ErrorCategory.Certificate, // 0x800B0101 срок действия истёк
         [-2146885613] = ErrorCategory.Certificate, // 0x80092013 проверка отзыва недоступна
         [-2146885616] = ErrorCategory.Certificate, // 0x80092010 сертификат отозван
