@@ -204,6 +204,10 @@ internal sealed class FakeInventory : INetInventory
     }
 
     public bool FailCapture { get; set; }
+
+    /// <summary>Снимок сети падает этим исключением (нет доступа, сокет): не только IOException.</summary>
+    public Exception? CaptureFailure { get; set; }
+
     public bool TunnelHasAddress { get; set; } = true;
     public uint TunnelType { get; set; } = 23;
 
@@ -245,6 +249,9 @@ internal sealed class FakeInventory : INetInventory
 
     public string WiFiDescription { get; set; } = "Intel(R) Wi-Fi 6 AX200 160MHz";
 
+    /// <summary>LUID адаптера Wi-Fi: другой адаптер (или пересозданный драйвером) получает новый.</summary>
+    public ulong WiFiLuid { get; set; } = FakeWorld.WiFiLuid;
+
     /// <summary>Адрес Radmin есть; false — адаптер на месте, но адрес пропал (переподключение Radmin).</summary>
     public bool RadminHasAddress { get; set; } = true;
 
@@ -284,6 +291,7 @@ internal sealed class FakeInventory : INetInventory
     public NetSnapshot Capture()
     {
         if (FailCapture) throw new IOException("Снимок сети недоступен.");
+        if (CaptureFailure is { } failure) throw failure;
         var snapshot = BuildSnapshot();
         if (CaptureGate is { } gate)
         {
@@ -306,7 +314,7 @@ internal sealed class FakeInventory : INetInventory
         {
             new()
             {
-                InterfaceGuid = WiFiGuid, Luid = FakeWorld.WiFiLuid, InterfaceIndex = 8, Name = "Беспроводная сеть", IfType = 71, Description = WiFiDescription,
+                InterfaceGuid = WiFiGuid, Luid = WiFiLuid, InterfaceIndex = 8, Name = "Беспроводная сеть", IfType = 71, Description = WiFiDescription,
                 IsHardware = true, IsUp = WiFiUp, DefaultGateway = FakeWorld.Gateway, DefaultRouteMetric = 35,
                 OnLinkPrefixes = [Ipv4Cidr.Parse("192.168.1.0/24")], Addresses = [WiFiAddress], DnsServers = WiFiDnsServers,
             },
@@ -472,7 +480,11 @@ internal sealed class FakeDns : IDnsOps
 
     public string ReadSearchList(Guid interfaceGuid) => SearchLists.GetValueOrDefault(interfaceGuid, "");
 
-    public void SetSearchList(Guid interfaceGuid, string searchList) => SearchLists[interfaceGuid] = searchList;
+    /// <summary>Запись списка суффиксов DNS падает (реестр адаптера недоступен).</summary>
+    public bool FailSetSearchList { get; set; }
+
+    public void SetSearchList(Guid interfaceGuid, string searchList) =>
+        SearchLists[interfaceGuid] = FailSetSearchList ? throw new IOException("реестр адаптера недоступен") : searchList;
 
     public string ReadNameServer(Guid interfaceGuid)
     {
@@ -876,7 +888,12 @@ internal sealed class FakeSecrets : ISecretOps
         _ => throw new ArgumentOutOfRangeException(nameof(kind)),
     };
 
-    public char[]? TryLoad(Guid profileId, SecretKind kind = SecretKind.Password) => !Unreadable.Contains(profileId) && Store(kind).TryGetValue(profileId, out var value) ? value.ToCharArray() : null;
+    public char[]? TryLoad(Guid profileId, SecretKind kind = SecretKind.Password) =>
+        FailLoad.Contains(profileId) ? throw new IOException("Файл secrets.bin занят другим процессом.")
+        : !Unreadable.Contains(profileId) && Store(kind).TryGetValue(profileId, out var value) ? value.ToCharArray() : null;
+
+    /// <summary>Профили, чтение секрета которых падает (secrets.bin держит антивирус).</summary>
+    public HashSet<Guid> FailLoad { get; } = [];
 
     /// <summary>Запись секрета падает (диск, DPAPI).</summary>
     public bool FailSave { get; set; }
@@ -1117,10 +1134,13 @@ internal sealed class FakeAnyConnect : IAnyConnectOps
     /// <summary>Отпечатки, копии которых служба удаляла из хранилища SYSTEM.</summary>
     public List<string> RemovedCopies { get; } = [];
 
+    /// <summary>Удаление копии падает (хранилище SYSTEM недоступно).</summary>
+    public Exception? RemoveFailure { get; set; }
+
     public int RemoveCertificateCopies(string thumbprint)
     {
         RemovedCopies.Add(thumbprint);
-        return 1;
+        return RemoveFailure is { } failure ? throw failure : 1;
     }
 }
 
@@ -1203,6 +1223,26 @@ internal sealed class FakeSshTunnelSession(SplitVpn.Core.SshTunnel.SingBoxParame
             ExitSource.TrySetResult();
         }
     }
+}
+
+/// <summary>
+/// Часы, которые можно перевести назад: настенное время - время фейковых часов плюс сдвиг, а монотонный счётчик и
+/// таймеры - от фейковых часов без сдвига, как у настоящего Stopwatch при переводе системных часов.
+/// </summary>
+internal sealed class ShiftedTimeProvider(FakeTimeProvider inner) : TimeProvider
+{
+    public TimeSpan Offset { get; set; }
+
+    public override DateTimeOffset GetUtcNow() => inner.GetUtcNow() + Offset;
+
+    public override long GetTimestamp() => inner.GetTimestamp();
+
+    public override long TimestampFrequency => inner.TimestampFrequency;
+
+    public override TimeZoneInfo LocalTimeZone => inner.LocalTimeZone;
+
+    public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) =>
+        inner.CreateTimer(callback, state, dueTime, period);
 }
 
 internal sealed class FakeAnyConnectSession(Action<SplitVpn.Core.OpenConnect.HelperEvent> onEvent) : IAnyConnectSession

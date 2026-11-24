@@ -162,7 +162,16 @@ public static partial class HelperCertificateStore
     public static int RemoveCopies(string thumbprint)
     {
         using var account = new X509Store(StoreName.My, StoreLocation.CurrentUser);
-        account.Open(OpenFlags.ReadWrite | OpenFlags.OpenExistingOnly);
+        try
+        {
+            account.Open(OpenFlags.ReadWrite | OpenFlags.OpenExistingOnly);
+        }
+        catch (System.Security.Cryptography.CryptographicException)
+        {
+            // Хранилища нет (как в HasCopy): копий в нём нет, удалять нечего.
+            return 0;
+        }
+
         var all = account.Certificates;
         var found = all.Find(X509FindType.FindByThumbprint, thumbprint, validOnly: false);
         using var machine = new X509Store(StoreName.My, StoreLocation.LocalMachine);

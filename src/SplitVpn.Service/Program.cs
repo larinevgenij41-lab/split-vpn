@@ -191,7 +191,10 @@ internal sealed class CoordinatorHost(Coordinator coordinator, ILogger<Coordinat
             // Движок «VPN поверх SSH» службу не переживает (он в её Job): завершаем его сами и ждём выхода.
             // Синхронная часть (снятие сетей AnyConnect, команды выхода) идёт в прежнем порядке, а ожидание выхода
             // процессов — параллельно: друг от друга они не зависят, и последовательные пределы не складываются.
-            await WaitExitAsync(coordinator.ShutdownAnyConnect(), coordinator.ShutdownSshTunnels());
+            // Каждая остановка вызывается независимо: исключение одной не должно оставить другую без вызова.
+            var anyConnect = StopSafely(coordinator.ShutdownAnyConnect, "помощников AnyConnect");
+            var ssh = StopSafely(coordinator.ShutdownSshTunnels, "движка «VPN поверх SSH»");
+            await WaitExitAsync(anyConnect, ssh);
             logger.LogInformation("Служба останавливается; системные объекты сохранены для подхвата.");
         }
         catch (Exception ex)
@@ -202,6 +205,20 @@ internal sealed class CoordinatorHost(Coordinator coordinator, ILogger<Coordinat
             logger.LogCritical(ex, "Цикл координатора остановлен ошибкой: служба завершается для перезапуска");
             await Log.CloseAndFlushAsync();
             Environment.Exit(1);
+        }
+    }
+
+    /// <summary>Синхронная часть остановки; её сбой - запись в журнал и завершённая задача, а не срыв остальной остановки.</summary>
+    private Task StopSafely(Func<Task> stop, string name)
+    {
+        try
+        {
+            return stop();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Остановка {Name} завершилась ошибкой", name);
+            return Task.CompletedTask;
         }
     }
 

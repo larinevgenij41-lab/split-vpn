@@ -107,6 +107,13 @@ public sealed partial class Coordinator
                 continue;
             }
 
+            // Свои соединения RAS на этом проходе не перечислились: сеанс записи может быть жив, а дозвон поверх него
+            // дал бы второй сеанс или ошибку 756. Дозвон - на следующей сверке, остальные туннели поднимаются.
+            if (_rasConnectionsUnknown)
+            {
+                continue;
+            }
+
             if (!held && CanStartDial(tunnel, out var profile, out var password))
             {
                 StartDial(tunnel, profile, password);

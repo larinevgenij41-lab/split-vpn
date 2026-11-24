@@ -121,9 +121,14 @@ public sealed partial class Coordinator
     internal async Task TickAsync(CancellationToken cancellationToken)
     {
         var now = _deps.Time.GetUtcNow();
+        // Часы перевели назад: сроки, заданные по прежним часам, сдвигаются раньше всех проверок этого тика.
+        DetectClockJumpBack(now);
         // Каждый шаг тика изолирован: исключение в одном (сбой опроса RAS, чтения адаптеров) не отменяет
         // остальные, иначе одна ошибка останавливала бы и сверку, и обновление списков, и проверку выпусков.
-        // Сбой шага считается изменением: сверка всё равно пройдёт и проверит фактическое состояние.
+        // Сбой шага - не изменение сети: сверка, которая проверит фактическое состояние, идёт по своей нарастающей
+        // паузе (TickFailureRetryDue), а не на каждом тике, и проверки SSH он не ускоряет.
+        _tickStepFailed = false;
+        TrackBootTimeShift();
         if (_recoveryWritePending)
             TickStep("сохранение восстановления", () => { _deps.Stores.SaveState(_state); _recoveryWritePending = false; return false; }, cancellationToken);
         if (_settingsReadError is not null)
@@ -178,7 +183,8 @@ public sealed partial class Coordinator
         // После неполного применения сверка повторяется с растущей паузой (2→4→…→60 с), иначе служба
         // перебирает все фильтры BFE каждые 2 с. Изменения в сети и периодическая сверка паузу не ждут.
         var paused = Facts.PartialError is not null && now < Facts.PartialErrorRetryAt;
-        if (changed || periodic || Facts.ReconcilePending || (!paused && (Facts.PartialError is not null || DialDue(now) || VerifyDue(now))))
+        var stepRetry = TickFailureRetryDue(now, paused);
+        if (changed || periodic || Facts.ReconcilePending || (!paused && (Facts.PartialError is not null || stepRetry || DialDue(now) || VerifyDue(now))))
         {
             Facts.ForceProtection |= periodic;
             if (_deps.Logger.IsEnabled(LogLevel.Debug))
@@ -189,6 +195,7 @@ public sealed partial class Coordinator
                     periodic ? "периодическая" : null,
                     Facts.ReconcilePending ? "назначена" : null,
                     !paused && Facts.PartialError is not null ? "повтор после ошибки: " + Facts.PartialError : null,
+                    !paused && stepRetry ? "сбой шага тика" : null,
                     !paused && DialDue(now) ? "пора дозвона" : null,
                     !paused && VerifyDue(now) ? "проверка туннеля" : null,
                 }.OfType<string>()));
@@ -244,6 +251,43 @@ public sealed partial class Coordinator
         _deps.Logger.LogError(ex, "Тик службы: сбой шага «{Step}»; остальные шаги выполняются", name);
         // Шаг мог прерваться посреди применения: следующая сверка проверит всё, а не только изменения.
         Facts.ForceProtection = true;
+        // Сбой - не изменение сети и не повод сверяться на каждом тике: сверку назначает TickFailureRetryDue
+        // с нарастающей паузой, а проверки SSH по сбою не ускоряются.
+        _tickStepFailed = true;
+        return false;
+    }
+
+    /// <summary>На этом тике упал хотя бы один шаг до решения о сверке.</summary>
+    private bool _tickStepFailed;
+
+    /// <summary>Пауза между сверками из-за сбоев шагов тика: растёт 2→4→…→60 с, сбрасывается тиком без сбоев.</summary>
+    private TimeSpan _tickFailureDelay;
+
+    private DateTimeOffset _tickFailureRetryAt;
+
+    /// <summary>
+    /// Пора ли сверке проверить фактическое состояние после сбоя шага тика. Шаг, падающий на каждом тике (снимок сети,
+    /// опрос RAS), иначе запускал бы полную сверку каждые 2 с в обход паузы после ошибки. Пока идёт пауза после
+    /// неполного применения (<paramref name="paused"/>), счёт не расходуется: повтор назначен самой сверкой.
+    /// </summary>
+    private bool TickFailureRetryDue(DateTimeOffset now, bool paused)
+    {
+        if (!_tickStepFailed)
+        {
+            _tickFailureDelay = TimeSpan.Zero;
+            _tickFailureRetryAt = default;
+            return false;
+        }
+
+        if (paused || now < _tickFailureRetryAt)
+        {
+            return false;
+        }
+
+        _tickFailureDelay = _tickFailureDelay <= TimeSpan.Zero
+            ? TickInterval
+            : TimeSpan.FromTicks(Math.Min(_tickFailureDelay.Ticks * 2, MaxPartialErrorDelay.Ticks));
+        _tickFailureRetryAt = now + _tickFailureDelay;
         return true;
     }
 
@@ -810,6 +854,51 @@ public sealed partial class Coordinator
         _state = _state with { Intent = Intent.Connected, AutoConnectBootUtc = boot };
         _deps.Stores.SaveState(_state);
         Journal("Сведения", "Автоподключение при запуске Windows.");
+    }
+
+    /// <summary>Время загрузки, которое служба видела на прошлом тике; null - не отслеживается (окно автоподключения прошло).</summary>
+    private DateTimeOffset? _observedBootUtc;
+
+    /// <summary>
+    /// Время загрузки здесь - настенное время минус время работы системы, и поправка часов Windows после загрузки
+    /// сдвигает его на величину поправки. Тот же сеанс Windows после перезапуска службы выглядел бы новой загрузкой, и
+    /// автоподключение отменило бы команду «Отключить». Пока служба работает в окне автоподключения, она замечает такой
+    /// сдвиг (в любую сторону) и переписывает отметку применённого автоподключения на новое время загрузки. Отдельный
+    /// идентификатор загрузки в файле состояния потребовал бы нового поля в его формате (SplitVpn.Core). Поправку,
+    /// пришедшую, пока служба не работала, это не покрывает.
+    /// </summary>
+    private void TrackBootTimeShift()
+    {
+        if (!_settings.AutoConnect || _deps.SystemUptime() >= AutoConnectBootWindow)
+        {
+            _observedBootUtc = null;
+            return;
+        }
+
+        var current = BootTime();
+        var previous = _observedBootUtc;
+        _observedBootUtc = current;
+        if (previous is not { } seen || (current - seen).Duration() <= BootTimeTolerance
+            || _state.AutoConnectBootUtc is not { } applied || (applied - seen).Duration() > BootTimeTolerance)
+        {
+            return;
+        }
+
+        // Отметка относилась к этой же загрузке по прежним часам: переносим её на время загрузки по новым.
+        var updated = _state with { AutoConnectBootUtc = current };
+        try
+        {
+            _deps.Stores.SaveState(updated);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Запись повторит тик (_recoveryWritePending); до неё отметка живёт в памяти.
+            _recoveryWritePending = true;
+            _deps.Logger.LogWarning(ex, "Отметка автоподключения после поправки часов не записана: повтор на следующем тике");
+        }
+
+        _state = updated;
+        _deps.Logger.LogInformation("Часы Windows поправлены: время загрузки по ним {Previous:O} → {Current:O}, отметка автоподключения перенесена", seen, current);
     }
 
     /// <summary>Время загрузки системы, округлённое до минуты: признак текущей загрузки в файле состояния.</summary>

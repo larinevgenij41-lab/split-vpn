@@ -52,6 +52,13 @@ internal sealed class GeoManager(ServiceDependencies deps, GeoListKind kind = Ge
 
     private static readonly TimeSpan ReloadRetry = TimeSpan.FromMinutes(1);
 
+    /// <summary>
+    /// Активная версия на диске повреждена (не прошла проверку): рабочим набором служит предыдущая версия или пустой
+    /// набор, пока источник не отдаст список заново. Пока признак стоит, ETag не отправляется (иначе ответ 304 оставил
+    /// бы повреждённую версию), а то же содержимое, что у активной версии, восстанавливает её.
+    /// </summary>
+    private bool _activeDamaged;
+
     public void LoadActive()
     {
         _reloadAt = null;
@@ -69,6 +76,7 @@ internal sealed class GeoManager(ServiceDependencies deps, GeoListKind kind = Ge
 
     private void LoadActiveCore()
     {
+        _activeDamaged = false;
         var state = _state = _store.LoadState();
         if (state.Active is null || !_store.HasRevision(state.Active))
         {
@@ -78,14 +86,43 @@ internal sealed class GeoManager(ServiceDependencies deps, GeoListKind kind = Ge
         }
 
         var validation = GeoUpdateEvaluator.LoadRevision(_store, state.Active, GeoValidationOptions.For(kind));
-        ActiveSet = validation.IsValid ? validation.V4 : RangeSet.Empty;
-        ActiveRevision = validation.IsValid ? _store.ReadRevisionMeta(state.Active) : null;
+        if (validation.IsValid)
+        {
+            ActiveSet = validation.V4;
+            ActiveRevision = _store.ReadRevisionMeta(state.Active);
+            return;
+        }
+
+        // Повреждённый список активной версии иначе оставлял бы базу пустой до плановой проверки (до IntervalDays суток):
+        // всё это время её адреса шли бы в цель по умолчанию. Рабочим набором становится предыдущая версия, если она
+        // цела; на диске ничего не меняется - откат пометил бы повреждённую копию пропускаемой, и то же содержимое из
+        // источника потом не применилось бы. Проверка источника назначается сразу.
+        _activeDamaged = true;
+        ActiveSet = RangeSet.Empty;
+        ActiveRevision = null;
+        var fallback = "";
+        if (state.Previous is { } previous && previous != state.Active && _store.HasRevision(previous))
+        {
+            var previousValidation = GeoUpdateEvaluator.LoadRevision(_store, previous, GeoValidationOptions.For(kind));
+            if (previousValidation.IsValid)
+            {
+                ActiveSet = previousValidation.V4;
+                ActiveRevision = _store.ReadRevisionMeta(previous);
+                fallback = " Пока используется предыдущая версия.";
+            }
+        }
+
+        var text = $"{Title}: активная версия повреждена ({string.Join(" ", validation.Problems)}).{fallback} Список будет загружен заново при ближайшей проверке.";
+        deps.Journal.Add("Ошибка", text);
+        deps.Logger.LogWarning("{Event}", text);
+        Save(state with { NextCheckUtc = deps.Time.GetUtcNow() });
     }
 
     /// <summary>Плановая проверка: по сроку, только при обычной сети или поднятом туннеле.</summary>
     public Task TickAsync(Coordinator coordinator, CancellationToken cancellationToken)
     {
-        if (_reloadAt is { } reloadAt && deps.Time.GetUtcNow() >= reloadAt)
+        // Срок повтора дальше своего интервала - часы перевели назад: повтор не ждёт величину перевода.
+        if (_reloadAt is { } reloadAt && (deps.Time.GetUtcNow() >= reloadAt || reloadAt - deps.Time.GetUtcNow() > ReloadRetry))
         {
             var before = ActiveSet;
             LoadActive();
@@ -150,7 +187,7 @@ internal sealed class GeoManager(ServiceDependencies deps, GeoListKind kind = Ge
         }
 
         var generation = _contentGeneration;
-        var etag = HasBase && StoreState.Active is { } active && _store.HasRevision(active) && source.Urls.Count > 0 && StoreState.LastETagUrl == source.Urls[0].AbsoluteUri
+        var etag = !_activeDamaged && HasBase && StoreState.Active is { } active && _store.HasRevision(active) && source.Urls.Count > 0 && StoreState.LastETagUrl == source.Urls[0].AbsoluteUri
             ? StoreState.LastETag : null;
         _fetch = Task.Run(() => FetchAsync(coordinator, source, generation, etag, cancellationToken), CancellationToken.None);
         return _fetch;
@@ -322,7 +359,15 @@ internal sealed class GeoManager(ServiceDependencies deps, GeoListKind kind = Ge
 
         var source = sourceOverride ?? GeoSourceFactory.Create(UpdateSettings(coordinator));
         var info = new GeoRevisionInfo(fetch.Url, deps.Time.GetUtcNow(), fetch.LastModified, fetch.ETag);
-        var evaluation = GeoUpdateEvaluator.Evaluate(fetch.Content, source, StoreState, StoreState.Active is { } current && _store.HasRevision(current) ? ActiveSet : RangeSet.Empty, info,
+        var baseline = StoreState.Active is { } current && _store.HasRevision(current) ? ActiveSet : RangeSet.Empty;
+        if (_activeDamaged && GeoStore.ComputeId(fetch.Content) == StoreState.Active)
+        {
+            // Источник отдал содержимое повреждённой активной версии: оно её восстанавливает, а не считается «неизменным»
+            // рядом с предыдущей версией, служащей пока рабочим набором.
+            baseline = RangeSet.Empty;
+        }
+
+        var evaluation = GeoUpdateEvaluator.Evaluate(fetch.Content, source, StoreState, baseline, info,
             validation: GeoValidationOptions.For(kind), thresholds: GeoAnomalyThresholds.For(kind), isManual: isManual, prepared: fetch.Prepared);
         return evaluation.Outcome switch
         {
@@ -387,6 +432,7 @@ internal sealed class GeoManager(ServiceDependencies deps, GeoListKind kind = Ge
 
             cancellationToken.ThrowIfCancellationRequested();
             _state = commit();
+            _activeDamaged = false;
             return null;
         }
         catch (Exception ex)

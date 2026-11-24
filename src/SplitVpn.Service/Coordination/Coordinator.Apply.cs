@@ -147,8 +147,12 @@ public sealed partial class Coordinator
     {
         // Сверка идёт в очереди актора: пока она длится, запросы интерфейса ждут. Долгие этапы видны в журнале.
         var timing = new ApplyTiming();
+        // Сбой RAS (RasMan перезапускается или завис) не должен останавливать защиту, маршруты, DNS и туннели,
+        // которым RAS не нужен (AnyConnect, SSH): иначе после смены сети защита не перестраивалась бы под новый
+        // адаптер и весь трафик стоял бы заблокированным. Ошибка запоминается и уходит наружу в конце сверки.
+        _rasConnectionsUnknown = false;
         SetProgress("Подготовка подключений", 5);
-        await SyncTunnelsAsync(cancellationToken);
+        var rasFailure = await SyncTunnelsAsync(cancellationToken);
         timing.Mark("туннели");
         StartupProgress();
 
@@ -156,7 +160,20 @@ public sealed partial class Coordinator
         if (_state.Intent == Intent.Connected)
         {
             SetProgress("Подхват существующих VPN-сеансов", 10);
-            await AdoptConnectionsAsync(cancellationToken);
+            try
+            {
+                var adoptFailure = await AdoptConnectionsAsync(cancellationToken);
+                rasFailure ??= adoptFailure;
+            }
+            catch (Exception ex) when (!IsShutdown(ex, cancellationToken))
+            {
+                // Свои соединения RAS сейчас неизвестны: дозвон туннелю без известного соединения дал бы второй
+                // сеанс той же записи (ошибка 756). На этом проходе RAS-туннели не дозваниваются, остальное идёт.
+                _rasConnectionsUnknown = true;
+                _deps.Logger.LogWarning(ex, "Подхват соединений RAS не выполнен: дозвоны RAS отложены до следующей сверки");
+                rasFailure ??= ExceptionDispatchInfo.Capture(ex);
+            }
+
             timing.Mark("подхват");
             StartupProgress();
         }
@@ -226,8 +243,14 @@ public sealed partial class Coordinator
 
         timing.Mark("дозвоны");
         timing.ReportIfSlow(_deps.Logger, "Сверка заняла");
-        dnsFailure?.Throw();
+        (rasFailure ?? dnsFailure)?.Throw();
     }
+
+    /// <summary>
+    /// Перечисление своих соединений RAS на этом проходе сверки не удалось: какие сеансы живы, неизвестно, и
+    /// RAS-туннели без известного соединения не дозваниваются до следующей сверки.
+    /// </summary>
+    private bool _rasConnectionsUnknown;
 
     /// <summary>
     /// Свои RAS-соединения, о которых служба не знает: дозвон закончился после «Отключить, сохранить защиту», а его
@@ -302,8 +325,11 @@ public sealed partial class Coordinator
         }
     }
 
-    /// <summary>Приводит набор туннелей к списку активных профилей и чистит лишние записи телефонной книги.</summary>
-    private async Task SyncTunnelsAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Приводит набор туннелей к списку активных профилей и чистит лишние записи телефонной книги. Возвращает сбой
+    /// чистки записей (RAS недоступен): сверка продолжается и сообщает о нём в конце.
+    /// </summary>
+    private async Task<ExceptionDispatchInfo?> SyncTunnelsAsync(CancellationToken cancellationToken)
     {
         var profiles = ActiveProfiles;
         foreach (var stale in Facts.Tunnels.Values.Where(t => profiles.All(p => p.Id != t.ProfileId)).ToList())
@@ -349,10 +375,23 @@ public sealed partial class Coordinator
             await RetryRequiredReconnectAsync(tunnel, cancellationToken);
         }
 
-        CleanupEntries();
+        ExceptionDispatchInfo? failure = null;
+        try
+        {
+            CleanupEntries();
+        }
+        catch (Exception ex) when (!IsShutdown(ex, cancellationToken))
+        {
+            // Лишняя запись телефонной книги ничему не мешает до следующей сверки, а сбой RAS не должен
+            // останавливать защиту, маршруты и DNS.
+            _deps.Logger.LogWarning(ex, "Чистка записей телефонной книги не выполнена: повтор на следующей сверке");
+            failure = ExceptionDispatchInfo.Capture(ex);
+        }
+
         _deps.DnsProxy.RetainPins(profiles
             .Select(p => TryParseServer(p, out var server) && !server.IsIpLiteral ? server.Host : null)
             .OfType<string>());
+        return failure;
     }
 
     /// <summary>Повтор разрыва соединения со старыми параметрами, который не удался при сохранении настроек.</summary>
@@ -1690,8 +1729,28 @@ public sealed partial class Coordinator
         var desired = string.Join(",", original.Concat(gateway).Distinct(StringComparer.OrdinalIgnoreCase));
         if (string.Equals(current, desired, StringComparison.OrdinalIgnoreCase)) return false;
 
+        // Отметка записывается до самого списка (иначе удачная запись списка без отметки выглядела бы правкой
+        // пользователя), но при сбое записи списка возвращается прежней: на адаптере остался прежний список, и
+        // следующая сверка не должна принять его - с суффиксами прежнего шлюза - за исходный пользовательский.
         _deps.DnsBackups.Upsert(backup with { AppliedSearchList = desired });
-        _deps.Dns.SetSearchList(interfaceGuid, desired);
+        try
+        {
+            _deps.Dns.SetSearchList(interfaceGuid, desired);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            try
+            {
+                _deps.DnsBackups.Upsert(backup);
+            }
+            catch (Exception restore) when (restore is IOException or UnauthorizedAccessException)
+            {
+                _deps.Logger.LogWarning(restore, "Копия DNS адаптера {Interface} не возвращена после сбоя записи списка суффиксов", interfaceGuid);
+            }
+
+            throw;
+        }
+
         return true;
     }
 
@@ -2061,12 +2120,24 @@ public sealed partial class Coordinator
     /// <summary>
     /// Подхват соединений своей телефонной книги по именам записей. Соединение, поднятое с другими
     /// параметрами безопасности, чем в профиле сейчас, не подхватывается: оно разрывается, чтобы
-    /// следующий дозвон прошёл по актуальным настройкам.
+    /// следующий дозвон прошёл по актуальным настройкам. Возвращает сбой (перечисления или разрыва), который
+    /// сверка сообщит в конце; при сбое RAS-туннели на этом проходе не дозваниваются (<see cref="_rasConnectionsUnknown"/>).
     /// </summary>
-    private async Task<bool> AdoptConnectionsAsync(CancellationToken cancellationToken)
+    private async Task<ExceptionDispatchInfo?> AdoptConnectionsAsync(CancellationToken cancellationToken)
     {
-        var adopted = false;
-        var own = _deps.Ras.FindOwnConnections();
+        ExceptionDispatchInfo? failure = null;
+        IReadOnlyList<RasActiveConnection> own;
+        try
+        {
+            own = _deps.Ras.FindOwnConnections();
+        }
+        catch (Exception ex) when (!IsShutdown(ex, cancellationToken))
+        {
+            _rasConnectionsUnknown = true;
+            _deps.Logger.LogWarning(ex, "Свои соединения RAS не перечислены: дозвоны RAS отложены до следующей сверки");
+            return ExceptionDispatchInfo.Capture(ex);
+        }
+
         foreach (var tunnel in Facts.Tunnels.Values.Where(t => t is { Connection: null, Dialing: false } && VpnProtocols.UsesRas(t.Protocol)))
         {
             var match = own.FirstOrDefault(c => string.Equals(c.EntryName, tunnel.EntryName, StringComparison.OrdinalIgnoreCase));
@@ -2090,27 +2161,39 @@ public sealed partial class Coordinator
 
             if (!MatchesCurrentProfile(tunnel))
             {
-                tunnel.LastOwnHangUpUtc = _deps.Time.GetUtcNow();
-                await _deps.Ras.HangUpAsync(match.Handle, cancellationToken);
-                Journal("Сведения", $"Соединение «{tunnel.Name}» разорвано: оно было поднято с другими параметрами входа.");
+                // Сбой разрыва не обрывает сверку: остальные туннели подхватываются, защита и DNS применяются,
+                // а занятая запись не даст дозвониться поверх старого сеанса - разрыв повторит следующая сверка.
+                try
+                {
+                    tunnel.LastOwnHangUpUtc = _deps.Time.GetUtcNow();
+                    await _deps.Ras.HangUpAsync(match.Handle, cancellationToken);
+                    Journal("Сведения", $"Соединение «{tunnel.Name}» разорвано: оно было поднято с другими параметрами входа.");
+                }
+                catch (Exception ex) when (ex is NativeCallException or InvalidOperationException or IOException or TimeoutException)
+                {
+                    // Сеанс со старыми параметрами ещё держит запись: дозвон поверх него не начинается.
+                    _rasConnectionsUnknown = true;
+                    failure ??= ExceptionDispatchInfo.Capture(ex);
+                    _deps.Logger.LogWarning(ex, "Соединение {Name} с другими параметрами входа не разорвано: повтор на следующей сверке", tunnel.Name);
+                }
+
                 continue;
             }
 
-            if (TryAttachTunnel(tunnel, match.Handle) is { } failure)
+            if (TryAttachTunnel(tunnel, match.Handle) is { } attachFailure)
             {
                 // Сеанс не присоединился ни с одной попытки (обычно он умер между перечислением и подхватом): его
                 // остаток отпускается, а туннель поднимается обычным дозвоном. Без перехвата сбой обрывал бы всю
                 // сверку на каждом тике.
-                _deps.Logger.LogWarning(failure, "Подхват соединения {Name} не удался: сведения о сеансе не получены", tunnel.Name);
+                _deps.Logger.LogWarning(attachFailure, "Подхват соединения {Name} не удался: сведения о сеансе не получены", tunnel.Name);
                 await ReleaseDeadConnectionAsync(tunnel, match.Handle, cancellationToken);
                 continue;
             }
 
             Journal("Сведения", $"Подхвачено существующее соединение «{tunnel.Name}».");
-            adopted = true;
         }
 
-        return adopted;
+        return failure;
     }
 
     /// <summary>Отпечаток параметров подключения совпадает с тем, с которым соединение поднимали.</summary>
@@ -2147,8 +2230,21 @@ public sealed partial class Coordinator
             return;
         }
 
-        _state = _state with { Intent = Intent.Protected };
-        _deps.Stores.SaveState(_state);
+        // Сначала запись, потом память (как в ChangeIntentAsync): иначе при сбое записи на диске осталось бы «Подключено»,
+        // и перезапуск службы поднял бы VPN вопреки решению пользователя. Занятый файл (антивирус) не отменяет решение:
+        // оно действует в памяти, а запись повторяет тик (_recoveryWritePending).
+        var updated = _state with { Intent = Intent.Protected };
+        try
+        {
+            _deps.Stores.SaveState(updated);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _recoveryWritePending = true;
+            _deps.Logger.LogWarning(ex, "Состояние после отключения извне не записано: повтор на следующем тике");
+        }
+
+        _state = updated;
         Journal("Ошибка", $"«{tunnel.Name}» отключён из меню сети Windows или другой программой. Защита сохранена; «Подключить» — чтобы подключиться снова.");
     }
 

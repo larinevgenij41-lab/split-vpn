@@ -138,6 +138,35 @@ public sealed partial class Coordinator
             return;
         }
 
+        // Всё, что может не получиться (пароль из secrets.bin, который держит антивирус, хранилище сертификатов), - до
+        // запуска процесса: иначе помощник оставался бы без команды Start, срок подъёма не взводился, и через минуты
+        // туннель падал бы с ложной причиной «шлюз не ответил». Сбой - не ошибка настроек: вход не отменяется,
+        // следующая сверка попробует снова.
+        var settings = profile.AnyConnect;
+        StartCommand start;
+        bool foreignCopy;
+        try
+        {
+            // Копию, которая лежала в хранилище SYSTEM до первого запуска помощника с этим сертификатом, сделала не
+            // служба: её служба не запоминает и потом не удаляет. Проверка — до команды помощнику, иначе он успел бы
+            // скопировать сам.
+            foreignCopy = settings.ClientCertificateThumbprint.Length > 0 && IsForeignCertificateCopy(settings.ClientCertificateThumbprint);
+            start = new StartCommand(
+                gateway.Url,
+                settings.Group,
+                settings.UserAgent,
+                settings.UseDtls,
+                settings.ClientCertificateThumbprint.Length > 0 ? settings.ClientCertificateThumbprint : null,
+                InterfaceNameFor(profile),
+                string.IsNullOrWhiteSpace(profile.UserName) ? null : profile.UserName,
+                LoadGatewayPassword(profile));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ReportAnyConnectStartFailure(tunnel, $"«{tunnel.Name}»: не удалось подготовить вход в шлюз AnyConnect (пароль или сертификат не прочитаны): {ex.Message}. Повтор на следующей сверке.");
+            return;
+        }
+
         var generation = tunnel.DialGeneration = ++_attemptGeneration;
         var profileId = tunnel.ProfileId;
         IAnyConnectSession session;
@@ -168,29 +197,45 @@ public sealed partial class Coordinator
         tunnel.HelperStarts++;
         var link = new AnyConnectLink(session, generation) { ProgressUtc = _deps.Time.GetUtcNow() };
         tunnel.AnyConnect = link;
-        tunnel.SessionServerAddresses = tunnel.ServerAddresses.ToArray();
-        tunnel.AnyConnectStartedUtc = _deps.Time.GetUtcNow();
-        tunnel.PasswordRequired = false;
-        tunnel.SignIn = null;
-        var settings = profile.AnyConnect;
-        // Копию, которая лежала в хранилище SYSTEM до первого запуска помощника с этим сертификатом, сделала не служба:
-        // её служба не запоминает и потом не удаляет. Проверка — до команды помощнику, иначе он успел бы скопировать сам.
-        var foreignCopy = settings.ClientCertificateThumbprint.Length > 0 && IsForeignCertificateCopy(settings.ClientCertificateThumbprint);
-        session.Send(new StartCommand(
-            gateway.Url,
-            settings.Group,
-            settings.UserAgent,
-            settings.UseDtls,
-            settings.ClientCertificateThumbprint.Length > 0 ? settings.ClientCertificateThumbprint : null,
-            InterfaceNameFor(profile),
-            string.IsNullOrWhiteSpace(profile.UserName) ? null : profile.UserName,
-            LoadGatewayPassword(profile)));
-        Journal("Сведения", $"Подключение к «{profile.Name}» (AnyConnect, шлюз {gateway.Host}).");
-        ArmEstablishDeadline(tunnel, link);
-        if (settings.ClientCertificateThumbprint.Length > 0 && !foreignCopy)
+        try
         {
-            RecordCertificateCopy(settings.ClientCertificateThumbprint);
+            tunnel.SessionServerAddresses = tunnel.ServerAddresses.ToArray();
+            tunnel.AnyConnectStartedUtc = _deps.Time.GetUtcNow();
+            tunnel.PasswordRequired = false;
+            tunnel.SignIn = null;
+            session.Send(start);
+            Journal("Сведения", $"Подключение к «{profile.Name}» (AnyConnect, шлюз {gateway.Host}).");
+            ArmEstablishDeadline(tunnel, link);
+            if (settings.ClientCertificateThumbprint.Length > 0 && !foreignCopy)
+            {
+                RecordCertificateCopy(settings.ClientCertificateThumbprint);
+            }
         }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Помощник без команды Start и без срока подъёма висел бы до ложного «шлюз не ответил»: он отпускается
+            // сразу, а туннель ждёт следующей сверки с настоящей причиной в тексте ошибки.
+            link.DeadlineTimer?.Dispose();
+            ReleaseHelper(profileId, session);
+            tunnel.AnyConnect = null;
+            ReportAnyConnectStartFailure(tunnel, $"«{tunnel.Name}»: помощник AnyConnect не получил команду входа: {ex.Message}. Повтор на следующей сверке.");
+        }
+    }
+
+    /// <summary>
+    /// Запуск помощника сорвался не по вине настроек (файл паролей занят, хранилище недоступно). Вход, одобренный
+    /// пользователем (<see cref="CoordinatorFacts.SignInApproved"/>), не снимается: следующая сверка попробует снова.
+    /// </summary>
+    private void ReportAnyConnectStartFailure(TunnelFacts tunnel, string text)
+    {
+        tunnel.LastErrorCategory = ErrorCategory.Other;
+        tunnel.LastErrorCode = null;
+        if (tunnel.LastErrorText != text)
+        {
+            Journal("Ошибка", text);
+        }
+
+        tunnel.LastErrorText = text;
     }
 
     /// <summary>Имя адаптера Wintun: постоянное для профиля.</summary>
@@ -645,14 +690,22 @@ public sealed partial class Coordinator
             RefreshTunnelAdapters(_deps.Inventory.Capture());
             EnsureRoutesSafe();
         }
-        catch (Exception ex) when (ex is Windows.Native.NativeCallException or InvalidOperationException or IOException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            // Любой сбой (нет доступа, сокет, BFE) не должен отменять прощание помощников со шлюзом ниже.
             _deps.Logger.LogWarning(ex, "Не удалось применить политику перед остановкой AnyConnect");
         }
 
         foreach (var tunnel in sessions)
         {
-            StopAnyConnect(tunnel);
+            try
+            {
+                StopAnyConnect(tunnel);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _deps.Logger.LogWarning(ex, "Помощник AnyConnect {Name} не остановлен", tunnel.Name);
+            }
         }
 
         Journal("Сведения", "Служба останавливается: сеансы AnyConnect завершены.");
@@ -1043,10 +1096,11 @@ public sealed partial class Coordinator
         var unused = copies.Where(t => !selected.Contains(t)).ToList();
         foreach (var thumbprint in unused)
         {
+            // Из списка - до попытки: неудачное удаление не повторяется на каждой сверке (см. выше).
+            copies.Remove(thumbprint);
             try
             {
                 var removed = _deps.AnyConnect.RemoveCertificateCopies(thumbprint);
-                copies.Remove(thumbprint);
                 if (removed > 0)
                 {
                     _deps.Logger.LogInformation("Удалена копия клиентского сертификата {Thumbprint}: он больше не выбран ни в одном подключении", thumbprint);

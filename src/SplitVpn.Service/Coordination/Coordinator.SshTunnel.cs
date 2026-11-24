@@ -38,7 +38,11 @@ public sealed partial class Coordinator
     internal static readonly TimeSpan SshEngineExitWait = TimeSpan.FromSeconds(10);
 
     /// <summary>Выход прежних процессов движка по профилям.</summary>
-    private sealed record SshExit(Task Exited, string Name, DateTimeOffset Deadline);
+    private sealed record SshExit(Task Exited, string Name, DateTimeOffset Deadline)
+    {
+        /// <summary>Срок ожидания; сдвигается при переводе часов назад (<see cref="ShiftDeadlines"/>).</summary>
+        public DateTimeOffset Deadline { get; set; } = Deadline;
+    }
     private readonly Dictionary<Guid, SshExit> _sshExits = [];
 
     /// <summary>Туннель «VPN поверх SSH» без сеанса: запустить движок, если ничто не мешает.</summary>
