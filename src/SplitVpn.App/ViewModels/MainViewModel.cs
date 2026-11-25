@@ -55,7 +55,11 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     public MainViewModel(ServiceConnection service, UiPreferences preferences, TimeProvider? time = null)
     {
         _time = time ?? TimeProvider.System;
+        _ui = SynchronizationContext.Current;
         Service = service;
+        Emergency = new EmergencyViewModel(this);
+        Emergency.PropertyChanged += OnEmergencyChanged;
+        Service.EmergencyOffRefused += OnEmergencyOffRefused;
         Preferences = preferences;
         Home = new HomeViewModel(this);
         Connections = new ConnectionsViewModel(this);
@@ -81,6 +85,12 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     public Func<Guid, bool>? ActivateSignIn { get; set; }
 
     public ServiceConnection Service { get; }
+
+    /// <summary>Экстренное выключение: состояние «выключена», команды выключения и включения, итог.</summary>
+    public EmergencyViewModel Emergency { get; }
+
+    /// <summary>Поток интерфейса: отказ «emergency-off» может прийти из фонового запроса.</summary>
+    private readonly SynchronizationContext? _ui;
 
     /// <summary>Блок «Служба» в меню: состояние службы Windows и её запуск, остановка, перезапуск.</summary>
     public ServiceHostViewModel ServiceHost { get; }
@@ -125,7 +135,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private StatusDto? _status;
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(ShowServiceRecovery))]
+    [NotifyPropertyChangedFor(nameof(ShowServiceRecovery), nameof(ShowServiceError))]
     [NotifyCanExecuteChangedFor(nameof(ConnectCommand), nameof(DisconnectCommand), nameof(DisconnectAndRestoreCommand), nameof(ToggleConnectionCommand))]
     private bool _serviceAvailable;
 
@@ -140,8 +150,15 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     [NotifyPropertyChangedFor(nameof(ShowServiceRecovery))]
     private ServiceUnavailableReason? _unavailableReason;
 
-    public bool ShowServiceRecovery => !ServiceAvailable
+    /// <summary>
+    /// «Запустить службу» и «Перезапустить службу» рядом с ошибкой. После экстренного выключения не предлагаются: служба
+    /// запустилась бы «пустой», а включает программу «Включить программу».
+    /// </summary>
+    public bool ShowServiceRecovery => !ServiceAvailable && !Emergency.IsOff
         && UnavailableReason is ServiceUnavailableReason.NotRunning or ServiceUnavailableReason.Timeout;
+
+    /// <summary>Красная плашка «Служба недоступна»; после экстренного выключения вместо неё спокойный баннер.</summary>
+    public bool ShowServiceError => !ServiceAvailable && !Emergency.IsOff;
 
     [ObservableProperty]
     private string _stateText = "Подключение к службе…";
@@ -326,6 +343,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             page.PropertyChanged -= OnPageChanged;
         }
 
+        Service.EmergencyOffRefused -= OnEmergencyOffRefused;
+        Emergency.PropertyChanged -= OnEmergencyChanged;
+
         ServiceHost.Dispose();
     }
 
@@ -360,7 +380,8 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private void Navigate(PageViewModel page) => NavigateTo(page);
 
-    private bool CanRunCommand => !IsBusy && ServiceAvailable;
+    /// <summary>Команды службе недоступны, пока идёт другая, служба не отвечает или программа экстренно выключена.</summary>
+    private bool CanRunCommand => !IsBusy && ServiceAvailable && !Emergency.IsOff;
 
     /// <summary>«Подключить» и «Повторить»: служба сбрасывает остановленные повторы и дозванивается заново.</summary>
     [RelayCommand(CanExecute = nameof(CanRunCommand))]
@@ -419,7 +440,8 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             var response = await Service.SendAsync(request);
             _statusGeneration++;
             accepted = response.Ok;
-            if (!response.Ok)
+            // Отказ «программа экстренно выключена» показывает баннер (ServiceConnection.EmergencyOffRefused), а не ошибку.
+            if (!response.Ok && response.ErrorCode != IpcErrorCodes.EmergencyOff)
             {
                 ShowCommandError(origin, UiText.ServiceRejected(response, "Служба отклонила команду."));
             }
@@ -527,6 +549,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         _responsiveness.OnSuccess(DateTimeOffset.UnixEpoch + _elapsed.Elapsed);
         _failures = 0;
         _nextPollAt = TimeSpan.Zero;
+        Emergency.ApplyStatus(status);
         ServiceAvailable = true;
         ServiceError = "";
         UnavailableReason = null;
@@ -536,6 +559,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         ApplyProgress(status.Progress);
         StateText = StatusText.StateName(status.State);
         SummaryText = UiText.StatusSummary(status);
+        ApplyEmergencyText();
         SpeedText = Speed(status);
         ClearStaleCommandError(previous, status);
         NotifyTransitions(previous, status);
@@ -551,11 +575,55 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private void UpdateVerboseBadge() =>
         VerboseBadge = UiVerbose.Until is { } until ? $"Подробный журнал до {until.ToLocalTime():HH:mm}" : "";
 
+    /// <summary>Программа экстренно выключена: в шапке меню, на главной и в трее — это, а не «Служба недоступна».</summary>
+    private void ApplyEmergencyText()
+    {
+        if (Emergency.IsOff)
+        {
+            StateText = UiText.EmergencyStateText;
+            SummaryText = UiText.EmergencySummaryText;
+        }
+    }
+
+    private void OnEmergencyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName != nameof(EmergencyViewModel.IsOff))
+        {
+            return;
+        }
+
+        OnPropertyChanged(nameof(ShowServiceRecovery));
+        OnPropertyChanged(nameof(ShowServiceError));
+        ConnectCommand.NotifyCanExecuteChanged();
+        DisconnectCommand.NotifyCanExecuteChanged();
+        DisconnectAndRestoreCommand.NotifyCanExecuteChanged();
+        ToggleConnectionCommand.NotifyCanExecuteChanged();
+        ServiceHost.OnEmergencyChanged();
+        ApplyEmergencyText();
+        Home.ApplyEmergency();
+        Diagnostics.OnEmergencyChanged();
+    }
+
+    /// <summary>Служба отказала с кодом «emergency-off»: показываем состояние «выключена», а не ошибку.</summary>
+    private void OnEmergencyOffRefused()
+    {
+        if (_ui is null || SynchronizationContext.Current == _ui)
+        {
+            Emergency.OnRefused();
+        }
+        else
+        {
+            _ui.Post(_ => Emergency.OnRefused(), null);
+        }
+    }
+
     private void ApplyUnavailable(ServiceUnavailableException error)
     {
         // Уведомление — только о потере уже работавшей службы: при входе в Windows она может стартовать позже интерфейса.
         // Остановку или перезапуск из блока «Служба» пользователь сделал сам — о ней не уведомляем.
-        var lost = ServiceAvailable && Status is not null && !_lossExpected;
+        // После экстренного выключения служба остановлена намеренно: о «потере» не уведомляем, вместо ошибки — баннер.
+        Emergency.ApplyUnavailable();
+        var lost = ServiceAvailable && Status is not null && !_lossExpected && !Emergency.IsOff;
         UiVerbose.RefreshFromRegistry();
         UpdateVerboseBadge();
         _failures++;
@@ -574,6 +642,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         ApplyProgress(null);
         StateText = title;
         SummaryText = text;
+        ApplyEmergencyText();
         SpeedText = "—";
         _lastBytes = null;
         foreach (var page in Pages)

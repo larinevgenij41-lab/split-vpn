@@ -144,11 +144,22 @@ public sealed partial class ServiceHostViewModel : ObservableObject, IDisposable
         }
     }
 
-    private bool CanStart() => View.CanStart;
+    /// <summary>
+    /// После экстренного выключения запуск и перезапуск недоступны: служба запустилась бы «пустой», и это выглядело бы
+    /// как включение программы. Включает её «Включить программу». Остановка остаётся.
+    /// </summary>
+    private bool CanStart() => View.CanStart && !_main.Emergency.IsOff;
 
     private bool CanStop() => View.CanStop;
 
-    private bool CanRestart() => View.CanRestart;
+    private bool CanRestart() => View.CanRestart && !_main.Emergency.IsOff;
+
+    /// <summary>Программа экстренно выключена или включена снова: доступность кнопок меняется.</summary>
+    internal void OnEmergencyChanged()
+    {
+        StartCommand.NotifyCanExecuteChanged();
+        RestartCommand.NotifyCanExecuteChanged();
+    }
 
     private async Task RunAsync(ServiceHostAction action)
     {

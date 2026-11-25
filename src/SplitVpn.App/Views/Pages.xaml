@@ -131,7 +131,14 @@
                         <!-- Подключать нечего (подключений нет или все выключены): кнопка ведёт на «Подключения», а не в ошибку. -->
                         <ui:Button Height="52" FontSize="16" Appearance="Primary" HorizontalAlignment="Stretch" Margin="0"
                                    AutomationProperties.Name="{Binding ButtonText}" Command="{Binding PrimaryActionCommand}"
-                                   Content="{Binding ButtonText}" IsEnabled="{Binding Main.ServiceAvailable}" />
+                                   Content="{Binding ButtonText}" IsEnabled="{Binding Main.ServiceAvailable}"
+                                   Visibility="{Binding Main.Emergency.IsOff, Converter={StaticResource VisibleWhen}, ConverterParameter=invert}" />
+                        <!-- Программа экстренно выключена: подключать нечего, главная кнопка включает программу. «Подключить» — после. -->
+                        <ui:Button Height="52" FontSize="16" Appearance="Primary" HorizontalAlignment="Stretch" Margin="0"
+                                   Content="Включить программу" Icon="{ui:SymbolIcon Power24}" Command="{Binding Main.Emergency.TurnOnCommand}"
+                                   AutomationProperties.Name="Включить программу"
+                                   AutomationProperties.HelpText="Снять экстренное выключение и запустить службу. Windows запросит права администратора"
+                                   Visibility="{Binding Main.Emergency.IsOff, Converter={StaticResource VisibleWhen}}" />
                         <TextBlock Style="{StaticResource Hint}" Text="{Binding SetupHint}"
                                    Visibility="{Binding SetupHint, Converter={StaticResource VisibleWhen}}" />
                         <ui:Button Margin="0,8,0,0" HorizontalAlignment="Stretch" Appearance="Secondary" Content="Отключить и восстановить интернет"
@@ -1133,11 +1140,13 @@
     <DataTemplate DataType="{x:Type vm:DiagnosticsViewModel}">
         <StackPanel Style="{StaticResource PageLayout}">
             <TextBlock Style="{StaticResource PageTitle}" Text="Диагностика" />
-            <TextBlock Style="{StaticResource PageSubtitle}" Text="События службы, подробный журнал, архив для разбора и аварийное восстановление сети." />
-            <views:CardRow Title="Восстановить сеть" Description="Аварийное действие: снимает защиту, маршруты и DNS приложения и разрывает VPN, даже если служба не отвечает — тогда с правами администратора. В обычной работе то же делает «Отключить и восстановить интернет» на главной" Icon="{ui:SymbolIcon ArrowReset24}">
-                <ui:Button Appearance="Danger" Margin="0" Content="Восстановить сеть" Command="{Binding RecoverNetworkCommand}" />
+            <TextBlock Style="{StaticResource PageSubtitle}" Text="События службы, подробный журнал, архив для разбора и экстренное выключение программы." />
+            <views:CardRow Title="Экстренно выключить" Description="{x:Static vm:UiText.EmergencyOffHint}" Icon="{ui:SymbolIcon Power24}">
+                <ui:Button Appearance="Danger" Margin="0" Content="Экстренно выключить" Command="{Binding Emergency.TurnOffCommand}"
+                           AutomationProperties.Name="Экстренно выключить"
+                           AutomationProperties.HelpText="Отключить VPN, снять защиту и остановить службу без её участия. Спросит подтверждение, затем права администратора" />
             </views:CardRow>
-            <views:CardRow Title="Запустить службу" Description="Служба не отвечает: например, остановлена восстановлением сети. Запуск — с правами администратора"
+            <views:CardRow Title="Запустить службу" Description="Служба не отвечает: например, остановлена из «Служб» Windows. Запуск — с правами администратора"
                            Icon="{ui:SymbolIcon Play24}" Visibility="{Binding CanStartService, Converter={StaticResource VisibleWhen}}">
                 <ui:Button Appearance="Primary" Margin="0" Content="Запустить службу" Command="{Binding StartServiceCommand}" />
             </views:CardRow>

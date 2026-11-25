@@ -87,7 +87,7 @@ public sealed partial class CoordinatorTests
         foreach (var request in new IpcRequest[]
         {
             new ConnectRequest(null, null), new DisconnectRequest(KeepProtection: true), new TestProfileRequest(_profile.Id),
-            new SetTunnelPausedRequest(_profile.Id, Paused: false), new GeoUpdateNowRequest(), new CheckUpdateRequest(),
+            new SetTunnelPausedRequest(_profile.Id, Paused: false), new GeoUpdateNowRequest(),
         })
         {
             var direct = await coordinator.HandleRequestAsync(request, CancellationToken.None);
@@ -109,6 +109,41 @@ public sealed partial class CoordinatorTests
         Assert.True(recover.Ok);
         Assert.Empty(_world.Wfp.Groups);
         Assert.Equal(0, _world.Ras.Dials);
+    }
+
+    /// <summary>
+    /// Программу могли выключить из-за ошибки, которую исправляет обновление: проверка и загрузка по команде
+    /// пользователя работают, а сама «пустая» служба выпуски не проверяет.
+    /// </summary>
+    [Fact]
+    public async Task Emergency_UserUpdateRequests_Work_BackgroundCheckStaysOff()
+    {
+        var source = new UpdateSource(Manifest());
+        _world.HttpHandler = source;
+        var coordinator = await StartInertAsync();
+
+        for (var i = 0; i < 3; i++)
+        {
+            _world.Time.Advance(TimeSpan.FromDays(2));
+            await TickAsync(coordinator);
+        }
+
+        await PumpAsync(coordinator);
+        Assert.Equal(0, source.ManifestCalls);
+
+        var check = coordinator.HandleRequestAsync(new CheckUpdateRequest(), CancellationToken.None);
+        await PumpAsync(coordinator, check);
+        var checkResponse = await check;
+        Assert.True(checkResponse.Ok, checkResponse.ErrorMessage);
+        Assert.True(source.ManifestCalls > 0);
+        Assert.Equal("0.9.0", Status(coordinator).AvailableVersion);
+
+        foreach (var request in new IpcRequest[] { new CheckUpdateRequest(), new DownloadUpdateRequest("0.9.0"), new InstallUpdateRequest("0.9.0") })
+        {
+            var queued = coordinator.SubmitAsync(request, CancellationToken.None);
+            await PumpAsync(coordinator, queued);
+            Assert.NotEqual(IpcErrorCodes.EmergencyOff, (await queued).ErrorCode);
+        }
     }
 
     [Fact]

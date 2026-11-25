@@ -274,6 +274,7 @@ public sealed partial class HomeViewModel : PageViewModel
             Tunnels.Clear();
             _tunnelBytes.Clear();
             Profile = Adapter = VpnAddress = Duration = Sent = Received = "—";
+            ApplyEmergency();
             return;
         }
 
@@ -321,6 +322,26 @@ public sealed partial class HomeViewModel : PageViewModel
         };
         SyncTunnels(status);
         SyncWarnings(status.Warnings);
+        ApplyEmergency();
+    }
+
+    /// <summary>
+    /// Программа экстренно выключена: спокойное «внимание», а не ошибка — Windows работает без программы, как и просили.
+    /// Подключать, повторять и снимать защиту нечего; вместо главной кнопки — «Включить программу».
+    /// </summary>
+    internal void ApplyEmergency()
+    {
+        if (!Main.Emergency.IsOff)
+        {
+            return;
+        }
+
+        (Tone, StateSymbol, IsTransitioning) = (StateTone.Caution, SymbolRegular.Power24, false);
+        ErrorText = null;
+        SyncErrorDetails(null);
+        CanRetry = false;
+        HasErrorAction = false;
+        CanRestore = false;
     }
 
     /// <summary>Надпись кнопки: во время команды — что идёт, иначе — что произойдёт по нажатию.</summary>

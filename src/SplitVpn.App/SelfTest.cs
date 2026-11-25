@@ -165,6 +165,7 @@ internal static class SelfTest
         window.Width = width;
         Settle(root);
         Log("Блок «Служба» отрисован.");
+        CheckEmergencyWindow(main, window, root, shots, errors);
         CheckTrayWindow(main, root, errors);
 
         // Доска маршрутизации узнаёт об изменениях маршрутизации в другом месте по снимку её части настроек.
@@ -187,6 +188,21 @@ internal static class SelfTest
         }
 
         CheckHomeSetup(main, host, shots, errors);
+
+        // Главная после экстренного выключения: вместо «Подключить» — «Включить программу» и пояснение.
+        var (homeTone, homeSymbol, homeState, homeSummary) = (main.Home.Tone, main.Home.StateSymbol, main.StateText, main.SummaryText);
+        main.Emergency.Show(new Core.Recovery.EmergencyFlag(DateTimeOffset.UtcNow.AddHours(-3)));
+        host.Content = null;
+        host.Content = main.Home;
+        Settle(host);
+        Shot(host, shots, "home-emergency");
+        if (!HasVisibleText(host, "Включить программу") || HasVisibleText(host, "Подключить"))
+        {
+            errors.AppendLine("Главная после экстренного выключения: нет «Включить программу» или видна «Подключить».");
+        }
+
+        main.Emergency.Show(null);
+        (main.Home.Tone, main.Home.StateSymbol, main.StateText, main.SummaryText) = (homeTone, homeSymbol, homeState, homeSummary);
 
         // Шаблоны, которые применяются только с данными: строки туннелей и предупреждения главной, редактор подключения, мастер.
         main.Home.Tunnels.Add(TunnelRow.From(
@@ -639,6 +655,7 @@ internal static class SelfTest
             main.ShowCommandProgress, main.ShowServiceProgress, main.ServiceProgressStage,
             main.ServiceProgressDetail, main.ServiceProgressPercent, main.ServiceProgressIndeterminate,
             main.ProxyError, main.ServiceAvailable, main.ShowServiceRecovery, main.ServiceErrorTitle, main.ServiceError, main.CurrentPage, main.Wizard, main.VerboseBadge,
+            main.Emergency, main.ShowServiceError,
         };
         // Несохранённая правка настроек службы: у пункта меню «Настройки» видна отметка, у блока «Работа VPN» — бейдж.
         main.Settings.AutoConnect = !main.Settings.AutoConnect;
@@ -672,6 +689,76 @@ internal static class SelfTest
         Log("Ошибки самопроверки:");
         Log(errors.ToString());
         return 1;
+    }
+
+    /// <summary>
+    /// Экстренно выключена, служба остановлена: спокойный баннер с «Включить программу» вместо красной «Служба недоступна»,
+    /// без «Запустить службу»; затем итог команды со списком шагов — при обычной и минимальной высоте окна.
+    /// </summary>
+    private static void CheckEmergencyWindow(MainViewModel main, MainWindow window, FrameworkElement root, string? shots, StringBuilder errors)
+    {
+        var (stateText, summaryText) = (main.StateText, main.SummaryText);
+        main.UnavailableReason = Core.Ipc.ServiceUnavailableReason.NotRunning;
+        main.ServiceAvailable = false;
+        (main.ServiceErrorTitle, _, main.ServiceError) = MainViewModel.Describe(main.UnavailableReason.Value);
+        main.ServiceHost.Show(Core.State.ServiceHostState.Stopped, "0.3.9");
+        main.Emergency.Show(new Core.Recovery.EmergencyFlag(DateTimeOffset.UtcNow.AddMinutes(-42)));
+        Settle(root);
+        Shot(root, shots, "window-emergency-off");
+        if (!window.EmergencyBanner.IsVisible || window.ServiceRecoveryActions.IsVisible || main.ShowServiceError
+            || main.ServiceHost.StartCommand.CanExecute(null) || main.ConnectCommand.CanExecute(null) || !main.Emergency.TurnOnCommand.CanExecute(null))
+        {
+            errors.AppendLine("Экстренно выключена: нет баннера с «Включить программу» или видны ошибка службы и её запуск.");
+        }
+
+        if (main.StateText != UiText.EmergencyStateText || main.Home.Tone != Views.StateTone.Caution)
+        {
+            errors.AppendLine("Экстренно выключена: состояние в шапке меню или тон главной не «экстренно выключен».");
+        }
+
+        var report = new Core.Recovery.EmergencyReport
+        {
+            Command = Core.Recovery.EmergencyCommands.Off,
+            StartedUtc = DateTimeOffset.UtcNow.AddMinutes(-1),
+            FinishedUtc = DateTimeOffset.UtcNow,
+            ExitCode = 3,
+            Summary = "Сеть возвращена не полностью.",
+            Steps =
+            [
+                new("flag", "Отметка отключения", Core.Recovery.EmergencyStepOutcome.Done, @"HKLM\Software\SplitVpn: EmergencyOff = 1", 12),
+                new("start-type", "Ручной запуск службы", Core.Recovery.EmergencyStepOutcome.Done, "был тип запуска auto", 30),
+                new("service", "Остановка службы", Core.Recovery.EmergencyStepOutcome.Done, "служба остановлена штатно", 2100),
+                new("wfp", "Фильтры защиты (WFP)", Core.Recovery.EmergencyStepOutcome.Timeout, "не завершился за 120 с", 120000),
+                new("routes", "Маршруты программы", Core.Recovery.EmergencyStepOutcome.Already, "своих маршрутов нет", 40),
+                new("flush-dns", "Кеш DNS", Core.Recovery.EmergencyStepOutcome.Failed, "ipconfig /flushdns: код 1", 900, Required: false),
+            ],
+        };
+        main.Emergency.Result = EmergencyRunResult.FromExitCode(on: false, 3, report, Core.Recovery.EmergencyReportFiles.LastPath);
+        Settle(root);
+        Shot(root, shots, "window-emergency-result");
+        if (!window.EmergencyResult.IsVisible || !main.Emergency.Result.Advice.Contains("Перезагрузите", StringComparison.Ordinal))
+        {
+            errors.AppendLine("Итог экстренного выключения не показан или без совета перезагрузить компьютер.");
+        }
+
+        var height = window.Height;
+        window.Height = window.MinHeight;
+        Settle(root);
+        Shot(root, shots, "window-emergency-result-min-height");
+        if (window.HeaderScroll.ActualHeight / window.ActualHeight > 0.41)
+        {
+            errors.AppendLine("Итог экстренного выключения при минимальной высоте занимает больше 40 % окна.");
+        }
+
+        window.Height = height;
+        main.Emergency.Result = null;
+        main.Emergency.Show(null);
+        main.UnavailableReason = null;
+        main.ServiceAvailable = true;
+        (main.StateText, main.SummaryText) = (stateText, summaryText);
+        main.ServiceHost.Show(Core.State.ServiceHostState.Running, "0.3.9");
+        Settle(root);
+        Log("Экстренное выключение в окне проверено.");
     }
 
     /// <summary>

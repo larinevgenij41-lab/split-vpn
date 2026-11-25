@@ -180,15 +180,21 @@
       </Component>
     </ComponentGroup>
 
+    <!-- Ярлыки «Экстренно выключить Раздельный VPN» (в прежних версиях — «Восстановить сеть» на recover-network.cmd) запускают
+         «SplitVpn.exe ‐‐emergency-off»: приложение сразу, до окон и канала службы, запрашивает права администратора и
+         выполняет «SplitVpn.Service.exe emergency-off», а итог показывает окном сообщения. Компоненты и Id ярлыков
+         прежние: MajorUpgrade (afterInstallInitialize) сначала удаляет старый продукт вместе с его ярлыками
+         (RemoveShortcuts), поэтому прежний «Восстановить сеть.lnk» не остаётся. recover-network.cmd по-прежнему
+         устанавливается в scripts как последнее средство (docs\RECOVERY.md). -->
     <ComponentGroup Id="ShortcutComponents">
       <Component Id="MenuShortcuts" Directory="MenuFolder" Guid="D7E3B9A1-4C6F-4A2D-B8E5-3F1C7A9D2B64">
         <Shortcut Id="AppShortcut" Name="Раздельный VPN" Description="Российские адреса напрямую, остальные через VPN" Target="[INSTALLFOLDER]SplitVpn.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
-        <Shortcut Id="RecoverShortcut" Name="Восстановить сеть" Description="Снять защиту и вернуть обычный интернет (нужны права администратора)" Target="[ScriptsFolder]recover-network.cmd" WorkingDirectory="ScriptsFolder" />
+        <Shortcut Id="RecoverShortcut" Name="Экстренно выключить Раздельный VPN" Description="Отключить VPN и защиту и остановить службу, даже если программа не отвечает (нужны права администратора)" Target="[INSTALLFOLDER]SplitVpn.exe" Arguments="--emergency-off" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
         <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
         <RegistryValue Root="HKCU" Key="Software\SplitVpn" Name="MenuShortcuts" Type="integer" Value="1" KeyPath="yes" />
       </Component>
       <Component Id="DesktopShortcuts" Directory="DesktopFolder" Guid="E8F4C2B6-7A1D-4E3B-9C5A-4D2F8B6E1C97">
-        <Shortcut Id="DesktopRecoverShortcut" Name="Восстановить сеть — Раздельный VPN" Description="Аварийное восстановление сети (нужны права администратора)" Target="[ScriptsFolder]recover-network.cmd" WorkingDirectory="ScriptsFolder" />
+        <Shortcut Id="DesktopRecoverShortcut" Name="Экстренно выключить Раздельный VPN" Description="Отключить VPN и защиту и остановить службу, даже если программа не отвечает (нужны права администратора)" Target="[INSTALLFOLDER]SplitVpn.exe" Arguments="--emergency-off" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
         <RegistryValue Root="HKCU" Key="Software\SplitVpn" Name="DesktopShortcuts" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </ComponentGroup>

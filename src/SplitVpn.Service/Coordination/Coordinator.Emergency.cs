@@ -11,8 +11,9 @@ namespace SplitVpn.Service.Coordination;
 /// Служба после экстренного отключения («пустая»). Флаг EmergencyOff в HKLM\Software\SplitVpn ставит команда
 /// emergency-off, снимает emergency-on (она же перезапускает службу). Служба с флагом запускается — иначе установщик,
 /// запускающий её при обновлении, сообщил бы об ошибке, — но ничего не применяет: ни настройки Wi-Fi Windows, ни
-/// автоподключения, ни сверки, ни DNS-посредника, ни загрузки списков и обновлений. Канал управления работает и
-/// сообщает об отключении в статусе; команды, которые меняли бы сеть, отклоняются с понятным текстом.
+/// автоподключения, ни сверки, ни DNS-посредника, ни фоновой загрузки списков и обновлений. Канал управления работает и
+/// сообщает об отключении в статусе; команды, которые меняли бы сеть, отклоняются с понятным текстом. Обновление
+/// программы по команде пользователя (проверка, загрузка, установка) работает.
 /// </summary>
 public sealed partial class Coordinator
 {
@@ -216,13 +217,14 @@ public sealed partial class Coordinator
 
     /// <summary>
     /// Отказ «пустой» службы: команды, которые подключали бы, меняли сеть или ходили в интернет (дозвон, вход, проверка
-    /// подключения, загрузка списков и обновлений). Настройки, журнал, статус, диагностика и локальные действия со
-    /// списками работают. «Восстановить сеть» не отказывается: она повторяет очистку.
+    /// подключения, загрузка списков). Настройки, журнал, статус, диагностика и локальные действия со списками работают.
+    /// «Восстановить сеть» не отказывается: она повторяет очистку. Проверка, загрузка и установка обновления по команде
+    /// пользователя тоже работают: программу могли выключить из-за ошибки, которую исправляет обновление. Сама служба
+    /// при этом обновления не проверяет и не загружает (такт «пустой» службы ничего не делает).
     /// </summary>
     private IpcResponse? RefuseWhileEmergencyOff(IpcRequest request) =>
         _emergency is not null && request is ConnectRequest or DisconnectRequest or SetProfileRoleRequest or SetTunnelPausedRequest
-            or TestProfileRequest or BeginSignInRequest or SsoNavigationRequest or SubmitAuthFormRequest
-            or GeoUpdateNowRequest or CheckUpdateRequest or DownloadUpdateRequest or InstallUpdateRequest
+            or TestProfileRequest or BeginSignInRequest or SsoNavigationRequest or SubmitAuthFormRequest or GeoUpdateNowRequest
             ? IpcResponse.Failure(IpcErrorCodes.EmergencyOff, IpcErrorCodes.EmergencyOffMessage)
             : null;
 

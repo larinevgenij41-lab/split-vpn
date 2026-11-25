@@ -34,7 +34,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     catch {
         Write-Host 'Восстановление сети не запущено: нужны права администратора, а запрос прав отклонён или не удался.' -ForegroundColor Yellow
         Write-Host "Причина: $($_.Exception.Message)"
-        Write-Host 'Запустите «Восстановить сеть» ещё раз и разрешите изменения в окне контроля учётных записей.'
+        Write-Host 'Запустите recover-network.cmd ещё раз и разрешите изменения в окне контроля учётных записей.'
         Wait-Enter
         exit 1
     }

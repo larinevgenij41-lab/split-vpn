@@ -30,6 +30,14 @@ public partial class App : Application
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        if (EmergencyCommandLine.IsEmergencyOff(e.Args))
+        {
+            // Ярлык «Экстренно выключить»: раньше окон, трея, единственного экземпляра и канала службы — работает,
+            // когда приложение уже открыто и когда служба не отвечает. Код завершения — код команды.
+            Environment.Exit(EmergencyCommandLine.Run());
+            return;
+        }
+
         if (e.Args.Contains("--selftest", StringComparer.OrdinalIgnoreCase))
         {
             // Проверка разметки: окно создаётся за пределами экрана, к службе приложение не обращается.
@@ -90,6 +98,9 @@ public partial class App : Application
         _main.ActivateSignIn = signIn.Activate;
         _proxy = new ProxyService(new WinInetProxySettings());
         var main = _main;
+        var proxy = _proxy;
+        // Перед экстренным выключением свой прокси шлюза снимается сразу, не дожидаясь опроса.
+        main.Emergency.RevertProxy = async () => main.ProxyError = await proxy.UpdateAsync(null, stopped: true);
         main.StatusUpdated += () =>
         {
             // Обработчики независимы: сбой окна входа не должен оставлять прокси шлюза без обновления, и наоборот.
@@ -131,6 +142,13 @@ public partial class App : Application
 
     private static async Task UpdateProxyAsync(MainViewModel main, ProxyService proxy)
     {
+        if (main.Emergency.IsOff)
+        {
+            // Программа экстренно выключена (в том числе с ярлыка или другой копией): свой прокси шлюза снят и здесь.
+            main.ProxyError = await proxy.UpdateAsync(null, stopped: true);
+            return;
+        }
+
         if (main.Status is null && main.UnavailableReason != Core.Ipc.ServiceUnavailableReason.NotRunning) { return; }
         main.ProxyError = await proxy.UpdateAsync(main.Status, main.UnavailableReason == Core.Ipc.ServiceUnavailableReason.NotRunning);
     }

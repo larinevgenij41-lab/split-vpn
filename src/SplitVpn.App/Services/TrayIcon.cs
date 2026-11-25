@@ -27,6 +27,12 @@ public sealed class TrayIcon : IDisposable
     private readonly MenuItem _restore = new() { Header = "Отключить и восстановить интернет" };
     // Пункт и включает выключенное подключение (дополнительным), и выключает дополнительное: название про оба действия.
     private readonly MenuItem _profiles = new() { Header = "Включить или выключить подключения" };
+
+    /// <summary>
+    /// «Экстренно выключить…» доступен всегда — и когда служба не отвечает: команда идёт мимо неё, с правами
+    /// администратора. Когда программа выключена, пункт включает её.
+    /// </summary>
+    private readonly MenuItem _emergency = new();
     private string _currentIcon = "";
     private bool _filling;
 
@@ -57,6 +63,13 @@ public sealed class TrayIcon : IDisposable
             }
         };
         _profiles.Items.Add(new MenuItem { Header = "…", IsEnabled = false });
+        _emergency.Click += async (_, _) =>
+        {
+            // Подтверждение и итог видны в окне. Пока команда идёт, повторный выбор пункта только показывает окно.
+            _showWindow();
+            var emergency = _main.Emergency;
+            await RunAsync(emergency.IsOff ? emergency.TurnOnCommand : emergency.TurnOffCommand);
+        };
 
         var open = new MenuItem { Header = "Открыть «Раздельный VPN»", FontWeight = FontWeights.SemiBold };
         open.Click += (_, _) => showWindow();
@@ -64,7 +77,7 @@ public sealed class TrayIcon : IDisposable
         quit.Click += (_, _) => exit();
 
         var menu = new ContextMenu();
-        foreach (var item in new object[] { _state, new Separator(), _connect, _disconnect, _restore, _profiles, new Separator(), open, quit })
+        foreach (var item in new object[] { _state, new Separator(), _connect, _disconnect, _restore, _profiles, new Separator(), _emergency, new Separator(), open, quit })
         {
             menu.Items.Add(item);
         }
@@ -94,6 +107,7 @@ public sealed class TrayIcon : IDisposable
 
         _main.StatusUpdated += Update;
         _main.PropertyChanged += OnMainChanged;
+        _main.Emergency.PropertyChanged += OnEmergencyChanged;
         _main.Notify += ShowNotification;
         Update();
     }
@@ -102,6 +116,7 @@ public sealed class TrayIcon : IDisposable
     {
         _main.StatusUpdated -= Update;
         _main.PropertyChanged -= OnMainChanged;
+        _main.Emergency.PropertyChanged -= OnEmergencyChanged;
         _main.Notify -= ShowNotification;
         _icon.Dispose();
     }
@@ -114,6 +129,14 @@ public sealed class TrayIcon : IDisposable
         }
     }
 
+    private void OnEmergencyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(EmergencyViewModel.IsOff) or nameof(EmergencyViewModel.IsRunning))
+        {
+            Update();
+        }
+    }
+
     /// <summary>Команда из меню — те же правила, что у кнопок окна: пока идёт другая команда, не выполняется.</summary>
     private static Task RunAsync(IAsyncRelayCommand command) =>
         command.CanExecute(null) ? command.ExecuteAsync(null) : Task.CompletedTask;
@@ -121,8 +144,10 @@ public sealed class TrayIcon : IDisposable
     private void Update()
     {
         var status = _main.Status;
+        var emergencyOff = _main.Emergency.IsOff;
         var iconName = status switch
         {
+            _ when emergencyOff => "off",
             null => "blocked",
             { State: ConnectionState.Connected } => "connected",
             { State: ConnectionState.Error or ConnectionState.PartiallyApplied or ConnectionState.TrafficBlocked or ConnectionState.PasswordRequired } => "blocked",
@@ -136,9 +161,12 @@ public sealed class TrayIcon : IDisposable
             _currentIcon = iconName;
         }
 
-        _icon.ToolTipText = Tooltip(_main.StateText, status);
+        _icon.ToolTipText = Tooltip(_main.StateText, status, emergencyOff);
         _state.Header = _main.StateText;
-        var ready = _main.ServiceAvailable && !_main.IsBusy;
+        _emergency.Header = _main.Emergency.TrayActionText;
+        AutomationProperties.SetName(_emergency, _main.Emergency.TrayActionText);
+        _emergency.IsEnabled = true;
+        var ready = _main.ServiceAvailable && !_main.IsBusy && !emergencyOff;
         var connected = MainViewModel.IsConnectedIntent(status);
         var error = status?.State == ConnectionState.Error;
         _connect.Header = error && connected ? "Повторить подключение" : "Подключить";
@@ -152,8 +180,14 @@ public sealed class TrayIcon : IDisposable
     /// Подсказка значка ограничена 127 символами: состояние защиты ставится сразу после состояния,
     /// чтобы при обрезке терялись подробности маршрутов, а не главное.
     /// </summary>
-    internal static string Tooltip(string stateText, StatusDto? status)
+    internal static string Tooltip(string stateText, StatusDto? status, bool emergencyOff = false)
     {
+        if (emergencyOff)
+        {
+            // Пути трафика и «защита выключена» здесь лишние: программа выключена целиком.
+            return "Раздельный VPN: " + UiText.EmergencyStateText.ToLowerInvariant();
+        }
+
         // Туннелю AnyConnect нужен не пароль, а вход на шлюзе: подсказка говорит, что именно ждёт пользователя.
         if (status is { State: ConnectionState.PasswordRequired } && status.Tunnels.Any(t => t.SignIn is not null))
         {

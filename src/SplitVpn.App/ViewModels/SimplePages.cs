@@ -851,74 +851,19 @@ public sealed partial class DiagnosticsViewModel(MainViewModel main) : PageViewM
         return "Отчёт сохранён.";
     });
 
-    /// <summary>Восстановить сеть: через службу, а если она недоступна — «recover» с правами администратора.</summary>
-    [RelayCommand]
-    private Task RecoverNetworkAsync() => RunAsync(async () =>
-    {
-        if (!await Main.Confirm("Восстановить сеть?",
-                "Защита будет снята: VPN разорвётся, фильтры, маршруты и DNS приложения вернутся к исходным, трафик пойдёт напрямую. Вернуть защиту — «Подключить».",
-                "Восстановить сеть"))
-        {
-            return;
-        }
+    /// <summary>
+    /// «Экстренно выключить» в «Диагностике» — та же команда, что в меню трея и на ярлыке: одно подтверждение и окно UAC,
+    /// без обращения к службе (<see cref="EmergencyViewModel"/>).
+    /// </summary>
+    public EmergencyViewModel Emergency => Main.Emergency;
 
-        if (Main.UnavailableReason == ServiceUnavailableReason.Untrusted)
-        {
-            // Имя канала занял посторонний процесс: снимать защиту по его вине нельзя.
-            ShowMessage(Main.ServiceError, isError: true);
-            return;
-        }
+    /// <summary>
+    /// Кнопка «Запустить службу» видна, когда канал службы не открывается. После экстренного выключения — нет: программу
+    /// включает «Включить программу».
+    /// </summary>
+    public bool CanStartService => Main.UnavailableReason == ServiceUnavailableReason.NotRunning && !Main.Emergency.IsOff;
 
-        if (Main.ServiceAvailable || Main.UnavailableReason == ServiceUnavailableReason.Timeout)
-        {
-            try
-            {
-                // Запрос идёт по своему соединению и ждёт не дольше RequestTimeouts.Recover: очередь команд
-                // («Подключить») аварийный путь не задерживает.
-                var response = await Service.SendAsync(new RecoverNetworkRequest());
-                // Прежняя служба возвращала успешный ответ и сообщала о незавершённой очистке только в статусе.
-                var status = response.Ok ? response.ResultAs<StatusDto>() : null;
-                var partial = status?.State == SplitVpn.Core.State.ConnectionState.PartiallyApplied;
-                if (response.Ok && !partial)
-                {
-                    ShowMessage("Защита снята, обычный интернет восстановлен.", isError: false);
-                    return;
-                }
-
-                var problem = response.ErrorMessage ?? status?.ErrorText ?? "Служба не подтвердила восстановление сети.";
-                if ((!partial && response.ErrorCode != IpcErrorCodes.RecoveryIncomplete) ||
-                    !await ConfirmStandaloneRecoveryAsync("Сеть восстановлена не полностью", problem))
-                {
-                    ShowMessage(problem, isError: true);
-                    return;
-                }
-            }
-            catch (ServiceUnavailableException ex) when (ex.Reason == ServiceUnavailableReason.Timeout)
-            {
-                // Служба, скорее всего, занята применением настроек и сама снимет защиту через несколько секунд.
-                // Аварийный путь останавливает службу до перезагрузки — молча туда не уходим.
-                if (!await ConfirmStandaloneRecoveryAsync("Служба не ответила", "Истекло время ожидания ответа службы."))
-                {
-                    ShowMessage("Повторите через несколько секунд.", isError: false);
-                    return;
-                }
-            }
-            catch (ServiceUnavailableException ex) when (ex.Reason == ServiceUnavailableReason.NotRunning)
-            {
-                // Служба пропала (остановлена, канал закрыт) — аварийный путь ниже.
-            }
-        }
-
-        var result = await NetworkRecovery.RunElevatedAsync();
-        ShowMessage(result.Text, isError: !result.Success);
-    });
-
-    private Task<bool> ConfirmStandaloneRecoveryAsync(string title, string problem) => Main.Confirm(title,
-        problem + Environment.NewLine + "Восстановить сеть с правами администратора? Служба будет остановлена и сама не запустится до перезагрузки.",
-        "Восстановить с правами администратора");
-
-    /// <summary>Кнопка «Запустить службу» видна, когда канал службы не открывается (например, после аварийного восстановления).</summary>
-    public bool CanStartService => Main.UnavailableReason == ServiceUnavailableReason.NotRunning;
+    internal void OnEmergencyChanged() => OnPropertyChanged(nameof(CanStartService));
 
     /// <summary>Сеансы AnyConnect: транспорт, MTU, срок сеанса, сети и DNS шлюза. Cookie и токены сюда не попадают.</summary>
     public ObservableCollection<GatewaySessionRow> GatewaySessions { get; } = [];

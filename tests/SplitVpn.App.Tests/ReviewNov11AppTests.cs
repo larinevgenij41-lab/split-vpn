@@ -8,27 +8,8 @@ using SplitVpn.Core.State;
 namespace SplitVpn.App.Tests;
 public sealed class ReviewNov11AppTests
 {
-    [Theory]
-    [InlineData(IpcErrorCodes.RecoveryIncomplete, 2)]
-    [InlineData(null, 2)]
-    [InlineData(IpcErrorCodes.Denied, 1)]
-    public Task RecoverNetworkOffersStandaloneOnlyForIncompleteCleanup(string? errorCode, int expectedPrompts) => RunStaAsync(async () =>
-    {
-        const string problem = "Не удалось восстановить сеть.";
-        var response = errorCode is null
-            ? IpcResponse.Success(new StatusDto { State = ConnectionState.PartiallyApplied, ErrorText = problem })
-            : IpcResponse.Failure(errorCode, problem);
-        using var service = new ServiceConnection((_, _) => Task.FromResult(response));
-        using var main = new MainViewModel(service, new UiPreferences()) { ServiceAvailable = true };
-        var prompts = 0;
-        main.Confirm = (_, _, _) => Task.FromResult(++prompts == 1);
-
-        await main.Diagnostics.RecoverNetworkCommand.ExecuteAsync(null);
-
-        Assert.Equal(expectedPrompts, prompts);
-        Assert.True(main.Diagnostics.MessageIsError);
-        Assert.Equal(problem, main.Diagnostics.Message);
-    });
+    // «Восстановить сеть» через канал службы с повторным подтверждением заменена экстренным выключением мимо службы:
+    // проверки — в EmergencyAppTests.
 
     [Fact]
     public Task OldPollMustNotOverwriteCompletedDisconnect() => RunStaAsync(async () =>

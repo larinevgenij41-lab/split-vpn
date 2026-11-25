@@ -6,14 +6,22 @@ using SplitVpn.Core.State;
 namespace SplitVpn.App.Services;
 
 /// <summary>
-/// «Восстановить сеть», когда служба недоступна: запуск «SplitVpn.Service.exe recover» с повышением (UAC).
+/// Файл службы для команд с правами администратора (экстренное выключение — <see cref="EmergencyLauncher"/>) и запуск
+/// службы из «Диагностики».
 /// </summary>
 public static class NetworkRecovery
 {
-    /// <summary>Файл службы по её регистрации; известные пути установки — запасной вариант, если регистрация не читается.</summary>
-    public static string? FindServiceExecutable()
+    private const string ServiceFileName = "SplitVpn.Service.exe";
+
+    /// <summary>
+    /// Файл службы: по её регистрации (путь пишет установщик, каталог закрыт для записи пользователям); если регистрация
+    /// не читается или службы нет — из каталога установки рядом с приложением, затем известные пути установки.
+    /// </summary>
+    public static string? FindServiceExecutable() => FindServiceExecutable(WindowsServiceHost.RegisteredExecutable(), AppContext.BaseDirectory, File.Exists);
+
+    internal static string? FindServiceExecutable(string? registered, string appDirectory, Func<string, bool> exists)
     {
-        if (WindowsServiceHost.RegisteredExecutable() is { } registered)
+        if (registered is not null)
         {
             return registered;
         }
@@ -21,46 +29,11 @@ public static class NetworkRecovery
         var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
         return new[]
         {
-            Path.Combine(programFiles, "SplitVpn", "SplitVpn.Service.exe"),
-            Path.Combine(programFiles, "SplitVpn.Dev", "service", "SplitVpn.Service.exe"),
-        }.FirstOrDefault(File.Exists);
-    }
-
-    /// <summary>Возвращает текст результата для пользователя.</summary>
-    public static async Task<(bool Success, string Text)> RunElevatedAsync()
-    {
-        var exe = FindServiceExecutable();
-        if (exe is null)
-        {
-            return (false, "Служба не установлена: восстановление недоступно. Используйте recover-network.cmd.");
-        }
-
-        try
-        {
-            using var process = Process.Start(new ProcessStartInfo(exe, "recover")
-            {
-                UseShellExecute = true,
-                Verb = "runas",
-                WindowStyle = ProcessWindowStyle.Hidden,
-                WorkingDirectory = Environment.SystemDirectory,
-            })!;
-            // Сама команда recover ограничена тремя минутами и коротким сроком завершения.
-            using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(4));
-            await process.WaitForExitAsync(deadline.Token);
-            return process.ExitCode == 0
-                ? (true, "Сеть восстановлена: защита снята, служба остановлена и сама не запустится до перезагрузки. Чтобы вернуть защиту, нажмите «Запустить службу», затем «Подключить».")
-                : (false, $"Восстановление завершилось с ошибкой (код {process.ExitCode}). Перезагрузите компьютер.");
-        }
-        catch (OperationCanceledException)
-        {
-            return (false, "Восстановление ещё не подтвердилось. Проверьте состояние службы и сети.");
-        }
-        catch (Win32Exception ex)
-        {
-            SplitVpn.Core.Diagnostics.Verbose.Write("Ui", "восстановление не запущено: " + ex.Message);
-            return (false, ex.NativeErrorCode == 1223 ? "Запуск с правами администратора отменён."
-                : $"Не удалось запустить восстановление сети с правами администратора (код {ex.NativeErrorCode}). Перезагрузите компьютер.");
-        }
+            Path.Combine(appDirectory, ServiceFileName),
+            Path.Combine(appDirectory, "service", ServiceFileName),
+            Path.Combine(programFiles, "SplitVpn", ServiceFileName),
+            Path.Combine(programFiles, "SplitVpn.Dev", "service", ServiceFileName),
+        }.FirstOrDefault(exists);
     }
 
     /// <summary>Запуск службы после аварийного восстановления: «sc start» с повышением (UAC). Возвращает текст для пользователя.</summary>

@@ -13,7 +13,7 @@ namespace SplitVpn.App.Services;
 /// <item>чтение — настройки, адаптеры, отчёт: не ждут команду и не задерживают опрос;</item>
 /// <item>проверка адреса и вход AnyConnect — короткие запросы пользователя, не ждут долгих команд;</item>
 /// <item>команды — всё, что меняет состояние службы, по одной за раз;</item>
-/// <item>пробный дозвон и «Восстановить сеть» — своё соединение на каждый запрос.</item>
+/// <item>пробный дозвон, восстановление сети службой (запрос командной строки) и сбор архива — своё соединение на каждый запрос.</item>
 /// </list>
 /// Каждый канал переподключается при следующем запросе после разрыва. У каждого запроса предел ожидания
 /// по его типу (<see cref="RequestTimeouts"/>): зависшая служба не замораживает интерфейс. Все ошибки связи
@@ -54,7 +54,24 @@ public sealed class ServiceConnection : IDisposable
 
     public ServiceUnavailableReason? LastReason { get; private set; }
 
+    /// <summary>
+    /// Служба отказала с кодом <see cref="IpcErrorCodes.EmergencyOff"/>: программа экстренно выключена. Интерфейс
+    /// показывает это состояние, а не ошибку запроса. Вызывается в потоке, где завершился запрос.
+    /// </summary>
+    public event Action? EmergencyOffRefused;
+
     public async Task<IpcResponse> SendAsync(IpcRequest request, CancellationToken cancellationToken = default)
+    {
+        var response = await SendTracedAsync(request, cancellationToken);
+        if (!response.Ok && response.ErrorCode == IpcErrorCodes.EmergencyOff)
+        {
+            EmergencyOffRefused?.Invoke();
+        }
+
+        return response;
+    }
+
+    private async Task<IpcResponse> SendTracedAsync(IpcRequest request, CancellationToken cancellationToken)
     {
         if (_transport is not null)
         {
@@ -102,7 +119,7 @@ public sealed class ServiceConnection : IDisposable
         var timeout = RequestTimeouts.For(request);
         if (request is TestProfileRequest or RecoverNetworkRequest or CollectDiagnosticsRequest)
         {
-            // Пробный дозвон длится до минуты, «Восстановить сеть» — аварийная команда, сбор архива — минуты:
+            // Пробный дозвон длится до минуты, восстановление сети — аварийная команда, сбор архива — минуты:
             // у каждого запроса своё соединение, чтобы они не стояли в очереди за «Подключить» и не задерживали её.
             return await GuardAsync(async () =>
             {

@@ -116,6 +116,9 @@ public abstract partial class PageViewModel(MainViewModel main, string title, Sy
 
     public void ShowError(string text) => ShowMessage(text, isError: true);
 
+    /// <summary>Сообщение без ошибки (например, «отменено»): короткое скрывается само.</summary>
+    public void ShowInfo(string text) => ShowMessage(text, isError: false);
+
     protected void ShowMessage(string text, bool isError)
     {
         Message = text;
