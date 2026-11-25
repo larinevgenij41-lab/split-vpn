@@ -144,13 +144,16 @@ public static class PrimaryAdapterSelector
         return new(null, PrimaryAdapterStatus.PinnedMissing);
     }
 
-    /// <summary>Публичные on-link-сети чужих интерфейсов (например, Radmin VPN 26.0.0.0/8).</summary>
+    /// <summary>
+    /// Не частные on-link-сети интерфейсов (например, Radmin VPN 26.0.0.0/8 или публичная /24 провайдера). У
+    /// недоверенного адаптера такая сеть локальной не считается (<see cref="Policy.PolicyCompiler.SelectOnLinkPrefixes"/>).
+    /// </summary>
     public static IEnumerable<(AdapterCandidate Adapter, Ipv4Cidr Prefix)> PublicOnLinkConflicts(IEnumerable<AdapterCandidate> adapters)
     {
         ArgumentNullException.ThrowIfNull(adapters);
         return adapters
             .Where(a => a.IsUp)
             .SelectMany(a => a.OnLinkPrefixes.Select(p => (Adapter: a, Prefix: p)))
-            .Where(x => x.Prefix.PrefixLength >= 8 && !Policy.SpecialRanges.AllNonPublic.Covers(x.Prefix.ToRange()));
+            .Where(x => x.Prefix.PrefixLength >= Policy.PolicyCompiler.MinOnLinkPrefix && !Policy.PolicyCompiler.IsPrivateOnLink(x.Prefix));
     }
 }

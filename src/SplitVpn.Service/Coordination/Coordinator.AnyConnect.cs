@@ -684,6 +684,17 @@ public sealed partial class Coordinator
                 yield return new StatusWarning("gateway-dns-lan", $"«{tunnel.Name}»: {DnsLanConflictText(link.DnsLanConflicts)}", null);
             }
 
+            if (tunnel.AnyConnect is { DnsRuleConflicts.Count: > 0 } ruled)
+            {
+                yield return new StatusWarning("gateway-dns-rule", $"«{tunnel.Name}»: {DnsRuleConflictText(ruled.DnsRuleConflicts)}", null);
+            }
+
+            if (tunnel.Session!.Ipv6NotDisabled)
+            {
+                yield return new StatusWarning("gateway-ipv6",
+                    $"«{tunnel.Name}»: не удалось отключить IPv6 в туннеле AnyConnect. Подключение работает только по IPv4: трафик IPv6 через него блокируется.", null);
+            }
+
             if (tunnel.Session!.Truncated is { Count: > 0 } truncated)
             {
                 yield return new StatusWarning("gateway-session-truncated",
@@ -742,7 +753,21 @@ public sealed partial class Coordinator
 
         var all = session.DnsAddresses();
         var conflicts = all.Where(onLink.Contains).ToList();
-        tunnel.VpnDns = conflicts.Count == 0 ? all : all.Except(conflicts).ToList();
+        // «Ручные правила важнее сетей шлюза»: адрес DNS, который правило пользователя направило в другую цель (напрямую,
+        // в другой туннель, «Блокировать»), не уводится в этот туннель ради DNS - он убирается из DNS туннеля.
+        var ruled = _settings.Profile(tunnel.ProfileId) is { AnyConnect.UserRulesOverrideServerNetworks: true }
+            ? all.Except(conflicts).Where(a => DnsRuleConflict(a, tunnel.ProfileId)).ToList()
+            : [];
+        tunnel.VpnDns = conflicts.Count == 0 && ruled.Count == 0 ? all : all.Except(conflicts).Except(ruled).ToList();
+        if (!ruled.SequenceEqual(link.DnsRuleConflicts))
+        {
+            link.DnsRuleConflicts = ruled;
+            if (ruled.Count > 0)
+            {
+                Journal("Предупреждение", $"«{tunnel.Name}»: {DnsRuleConflictText(ruled)}");
+            }
+        }
+
         if (conflicts.SequenceEqual(link.DnsLanConflicts))
         {
             return;
@@ -755,9 +780,26 @@ public sealed partial class Coordinator
         }
     }
 
+    /// <summary>
+    /// Действующее ручное правило для адреса (то, что ложится в политике последним: по приоритету, затем самое узкое)
+    /// направляет его не в этот туннель.
+    /// </summary>
+    private bool DnsRuleConflict(uint address, Guid tunnel)
+    {
+        var (rules, _) = ParsedRules();
+        var rule = rules.Where(r => r.Cidr.Contains(address))
+            .OrderBy(r => r.Priority).ThenBy(r => r.Cidr.PrefixLength).LastOrDefault();
+        return rule is not null && rule.Target != RouteTarget.Tunnel(tunnel);
+    }
+
     private static string DnsLanConflictText(IReadOnlyList<uint> conflicts) =>
         $"адрес DNS-сервера шлюза {string.Join(", ", conflicts.Select(Ipv4.Format))} совпадает с локальной сетью — "
         + "запросы имён к нему не отправляются, этот адрес остаётся в локальной сети.";
+
+    private static string DnsRuleConflictText(IReadOnlyList<uint> conflicts) =>
+        $"адрес DNS-сервера шлюза {string.Join(", ", conflicts.Select(Ipv4.Format))} попадает под ручное правило с другой целью — "
+        + "запросы имён к нему не отправляются, адрес идёт по правилу. Чтобы DNS шлюза работал, измените правило "
+        + "или снимите галочку «Ручные правила важнее сетей шлюза».";
 
     /// <summary>
     /// Почему адрес туннеля, выданный шлюзом, нельзя принять; null — адрес годится. Адаптер получает его как /32 с
@@ -1050,7 +1092,12 @@ public sealed partial class Coordinator
         }
 
         return Facts.Tunnels.Values.Where(t => t.Luid is not null)
-            .SelectMany(t => t.VpnDns.Select(address => new TunnelHost(t.ProfileId, address)))
+            .SelectMany(t =>
+            {
+                var userRulesWin = t.Protocol == VpnProtocol.AnyConnect
+                    && _settings.Profile(t.ProfileId) is { AnyConnect.UserRulesOverrideServerNetworks: true };
+                return t.VpnDns.Select(address => new TunnelHost(t.ProfileId, address, userRulesWin));
+            })
             .Distinct()
             .ToList();
     }

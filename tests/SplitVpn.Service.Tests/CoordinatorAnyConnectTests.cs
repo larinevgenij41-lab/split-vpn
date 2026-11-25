@@ -170,13 +170,13 @@ public sealed partial class CoordinatorTests
         await ConnectAsync(coordinator);
 
         var pinned = coordinator.ObservePinnedAsync(
-            new PinnedRouteNotice(Gateway, "example.org", RouteTarget.Tunnel(_profile.Id), [GatewayAddress, Ipv4.Parse("203.0.113.5")], TimeSpan.FromMinutes(5)),
+            new PinnedRouteNotice(Gateway, "example.org", RouteTarget.Tunnel(_profile.Id), [GatewayAddress, Ipv4.Parse("151.101.1.5")], TimeSpan.FromMinutes(5)),
             CancellationToken.None);
         await CompleteDialAsync(coordinator);
         Assert.True(await pinned);
 
         var sstp = _world.Routes.On(FakeWorld.TunnelLuid).ToList();
-        Assert.Contains(Ipv4Cidr.Parse("203.0.113.5/32"), sstp);
+        Assert.Contains(Ipv4Cidr.Parse("151.101.1.5/32"), sstp);
         Assert.DoesNotContain(new Ipv4Cidr(GatewayAddress, 32), sstp);
     }
 

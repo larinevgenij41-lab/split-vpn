@@ -316,6 +316,12 @@ internal sealed class AnyConnectLink(IAnyConnectSession session, int generation)
 
     /// <summary>DNS-серверы шлюза из локальной сети: убраны из DNS туннеля (локальная сеть важнее), о них - предупреждение.</summary>
     public IReadOnlyList<uint> DnsLanConflicts { get; set; } = [];
+
+    /// <summary>
+    /// DNS-серверы шлюза под ручным правилом пользователя с другой целью при «Ручные правила важнее сетей шлюза»:
+    /// убраны из DNS туннеля (правило важнее), о них - предупреждение.
+    /// </summary>
+    public IReadOnlyList<uint> DnsRuleConflicts { get; set; } = [];
 }
 
 /// <summary>Адрес, закреплённый за целью правилом для домена, и срок его действия.</summary>

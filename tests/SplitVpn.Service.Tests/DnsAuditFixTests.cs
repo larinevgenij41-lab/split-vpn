@@ -76,7 +76,66 @@ public sealed class DnsAuditFixTests : IAsyncDisposable
         Assert.Equal(1, _general.Received);
     }
 
-    /// <summary>Имена с правилами «VPN» и «Напрямую» ведут к одному каноническому имени: оно наследует VPN в любом порядке.</summary>
+    /// <summary>
+    /// Итерация 12: ответ с CNAME и адресами связи не создаёт. Чужой DNS (x.evil.ru CNAME mail.google.com + A) иначе
+    /// увёл бы постороннее имя под правило: его следующий запрос ушёл бы путём правила, а адреса закрепились за ним.
+    /// </summary>
+    [Fact]
+    public async Task CnameWithAddresses_DoesNotLinkCanonicalName()
+    {
+        var sink = new RecordingSink();
+        _proxy.RouteSink = sink;
+        _proxy.Configuration = RuleConfiguration(RouteTarget.Tunnel(Corporate));
+        _rule.Respond = query => Response(query, 0,
+            [Cname("x.alias.example", "mail.google.com", 300), Record("mail.google.com", DnsMessage.TypeA, 300, [142, 250, 1, 17])]);
+        _general.Respond = query => DnsMessage.BuildAddressResponse(query, [Ipv4.Parse("142.250.1.18")], 300);
+
+        Assert.Equal(0, DnsMessage.GetRcode(await Ask("x.alias.example")));
+        Assert.Equal([Ipv4.Parse("142.250.1.17")], sink.Last!.Addresses);
+        Assert.Null(_cache.TryGetCanonicalLink("mail.google.com"));
+
+        var before = sink.Last;
+        await Ask("mail.google.com");
+        Assert.Equal(1, _general.Received);
+        Assert.Same(before, sink.Last);
+    }
+
+    /// <summary>Итерация 12: цель «напрямую» не наследуется - каноническое имя разрешается своим путём.</summary>
+    [Fact]
+    public async Task CnameOnlyAnswer_DirectRuleIsNotInherited()
+    {
+        var sink = new RecordingSink();
+        _proxy.RouteSink = sink;
+        _proxy.Configuration = RuleConfiguration(RouteTarget.Direct);
+        _rule.Respond = query => Response(query, 0, [Cname("x.alias.example", "mail.google.com", 300)]);
+        _general.Respond = query => DnsMessage.BuildAddressResponse(query, [Ipv4.Parse("142.250.1.18")], 300);
+
+        Assert.Equal(0, DnsMessage.GetRcode(await Ask("x.alias.example")));
+        Assert.Null(_cache.TryGetCanonicalLink("mail.google.com"));
+        await Ask("mail.google.com");
+        Assert.Equal(1, _general.Received);
+        Assert.Null(sink.Last);
+    }
+
+    /// <summary>Итерация 12: CNAME-связь живёт TTL ответа, но не дольше 30 секунд (и не меньше 5).</summary>
+    [Theory]
+    [InlineData(300U, 30)]
+    [InlineData(12U, 12)]
+    [InlineData(0U, 5)]
+    public async Task CnameOnlyAnswer_LinkIsShortLived(uint ttl, int seconds)
+    {
+        _proxy.RouteSink = new RecordingSink();
+        _proxy.Configuration = RuleConfiguration(RouteTarget.Tunnel(Corporate));
+        _rule.Respond = query => Response(query, 0, [Cname("www.alias.example", "cdn.other.net", ttl)]);
+
+        await Ask("www.alias.example");
+        _time.Advance(TimeSpan.FromSeconds(seconds) - TimeSpan.FromMilliseconds(500));
+        Assert.Equal("alias.example", _cache.TryGetCanonicalLink("cdn.other.net"));
+        _time.Advance(TimeSpan.FromSeconds(1));
+        Assert.Null(_cache.TryGetCanonicalLink("cdn.other.net"));
+    }
+
+    /// <summary>Имена с правилами в разные туннели ведут к одному каноническому имени: оно сохраняет первую цель.</summary>
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -84,6 +143,8 @@ public sealed class DnsAuditFixTests : IAsyncDisposable
     {
         var sink = new RecordingSink();
         _proxy.RouteSink = sink;
+        // Итерация 12: цель «напрямую» CNAME-связей не создаёт, поэтому конфликт - между двумя туннелями.
+        var other = RouteTarget.Tunnel(new Guid("eeeeeeee-0000-0000-0000-000000000005"));
         _proxy.Configuration = new DnsProxyConfiguration
         {
             Mode = DnsProxyMode.DirectAllowed,
@@ -91,7 +152,7 @@ public sealed class DnsAuditFixTests : IAsyncDisposable
             DomainRoutes =
             [
                 new DomainRoute("vpn.example", RouteTarget.Tunnel(Corporate), new DnsRoute([_rule.EndPoint], null)),
-                new DomainRoute("direct.example", RouteTarget.Direct, new DnsRoute([_general.EndPoint], null)),
+                new DomainRoute("direct.example", other, new DnsRoute([_general.EndPoint], null)),
             ],
         };
         Func<byte[], byte[]> respond = query => DnsMessage.TryReadQuestion(query, out var q) && q.Name != "cdn.shared.net"
@@ -106,7 +167,7 @@ public sealed class DnsAuditFixTests : IAsyncDisposable
         await Ask("cdn.shared.net");
 
         Assert.Equal(vpnFirst ? "vpn.example" : "direct.example", sink.Last!.Suffix);
-        Assert.Equal(vpnFirst ? RouteTarget.Tunnel(Corporate) : RouteTarget.Direct, sink.Last.Target);
+        Assert.Equal(vpnFirst ? RouteTarget.Tunnel(Corporate) : other, sink.Last.Target);
     }
 
     [Fact]

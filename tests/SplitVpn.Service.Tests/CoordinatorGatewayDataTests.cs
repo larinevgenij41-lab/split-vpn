@@ -211,6 +211,57 @@ public sealed partial class CoordinatorTests
         Assert.Single(_world.Journal.Since(0), e => e.Text.Contains("совпадает с локальной сетью", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// Итерация 12: при «Ручные правила важнее сетей шлюза» DNS шлюза под ручным правилом с другой целью остаётся по
+    /// правилу и уходит из DNS туннеля с предупреждением. Без галочки DNS шлюза по-прежнему важнее правила.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AnyConnect_GatewayDnsUnderUserRule_FollowsRuleWhenUserRulesWin(bool userRulesWin)
+    {
+        var otherDns = Ipv4.Parse("10.0.17.5");
+        var profile = _anyConnect with { AnyConnect = _anyConnect.AnyConnect with { UserRulesOverrideServerNetworks = userRulesWin } };
+        var coordinator = await StartWithAnyConnectAsync(Settings() with
+        {
+            Profiles = [_profile, profile],
+            Rules = [new UserRuleSetting { Cidr = "10.0.16.0/24", Target = RouteTarget.Direct }],
+        });
+        await EstablishSessionAsync(coordinator, GatewaySession() with { Dns = ["10.0.16.21", "10.0.17.5"] });
+
+        var tunnel = coordinator.Facts.Tunnels[_anyConnect.Id];
+        var label = coordinator.Facts.Policy!.Classify(GatewayDns);
+        var warnings = coordinator.BuildStatus().Warnings;
+        if (userRulesWin)
+        {
+            Assert.Equal([otherDns], tunnel.VpnDns);
+            Assert.Equal(DecisionSource.UserRule, label.Source);
+            Assert.Equal(Decision.Direct, label.Decision);
+            var warning = Assert.Single(warnings, w => w.Code == "gateway-dns-rule");
+            Assert.Contains("10.0.16.21", warning.Text, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Equal([GatewayDns, otherDns], tunnel.VpnDns);
+            Assert.Equal(DecisionSource.TunnelInfrastructure, label.Source);
+            Assert.DoesNotContain(warnings, w => w.Code == "gateway-dns-rule");
+        }
+
+        Assert.Equal(DecisionSource.TunnelInfrastructure, coordinator.Facts.Policy.Classify(otherDns).Source);
+    }
+
+    /// <summary>Итерация 12: помощник не смог отключить IPv6 - предупреждение на главной, IPv6 через туннель блокируется.</summary>
+    [Fact]
+    public async Task AnyConnect_Ipv6NotDisabled_IsWarned()
+    {
+        var coordinator = await StartWithAnyConnectAsync();
+        await EstablishSessionAsync(coordinator, GatewaySession() with { Ipv6NotDisabled = true });
+
+        Assert.Contains(coordinator.BuildStatus().Warnings, w => w.Code == "gateway-ipv6");
+        var tunnelPermit = Assert.Single(coordinator.Facts.AppliedFilters[Core.Protection.FilterGroup.Runtime].Specs, f => f.Name == "Туннель «Офис»");
+        Assert.Equal(Core.Protection.FilterFamily.V4, tunnelPermit.Family);
+    }
+
     [Fact]
     public async Task AnyConnect_OrdinaryGatewayDns_HasNoLanWarning()
     {

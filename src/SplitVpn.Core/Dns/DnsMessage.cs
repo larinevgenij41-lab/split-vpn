@@ -26,6 +26,7 @@ public static class DnsMessage
     public const ushort TypeSoa = 6;
     public const ushort TypeAaaa = 28;
     public const ushort TypeOpt = 41;
+    public const ushort TypeRrsig = 46;
     public const ushort TypeSvcb = 64;
     public const ushort TypeHttps = 65;
     public const ushort ClassIn = 1;
@@ -428,6 +429,19 @@ public static class DnsMessage
 
         var asked = QuestionKey(question);
         return Chain(message, answers, question).Where(n => n != asked).ToList();
+    }
+
+    /// <summary>
+    /// Секция ответа состоит только из CNAME (и их подписей RRSIG): адресов и других записей нет. Только такой ответ
+    /// создаёт CNAME-связь (DOMAIN-ROUTING-PLAN): ответ с адресами уже несёт всю цепочку, и связь с его каноническим
+    /// именем лишь позволила бы чужому DNS переназначить постороннее имя.
+    /// </summary>
+    public static bool IsCnameOnly(ReadOnlySpan<byte> message)
+    {
+        var answers = ReadAnswers(message);
+        return answers is { Count: > 0 }
+            && answers.Exists(r => r.Type == TypeCname)
+            && answers.TrueForAll(r => r.Type is TypeCname or TypeRrsig);
     }
 
     /// <summary>

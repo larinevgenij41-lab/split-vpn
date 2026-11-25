@@ -1,4 +1,4 @@
-﻿using SplitVpn.Core.Geo;
+using SplitVpn.Core.Geo;
 using SplitVpn.Core.Ipc;
 using SplitVpn.Core.Net;
 using SplitVpn.Core.Policy;
@@ -768,7 +768,7 @@ public sealed partial class CoordinatorTests : IDisposable
         var coordinator = await StartAsync();
         await ConnectAsync(coordinator);
 
-        var address = Ipv4.Parse("203.0.113.20");
+        var address = Ipv4.Parse("151.101.1.20");
         var pinned = coordinator.ObservePinnedAsync(
             new PinnedRouteNotice("www.example.org", "example.org", RouteTarget.Direct, [address], TimeSpan.FromMinutes(5)),
             CancellationToken.None);
@@ -796,7 +796,7 @@ public sealed partial class CoordinatorTests : IDisposable
         var coordinator = await StartAsync();
         await ConnectAsync(coordinator);
 
-        var address = Ipv4.Parse("203.0.113.20");
+        var address = Ipv4.Parse("151.101.1.20");
         var direct = new Ipv4Cidr(address, 32);
         var pinned = coordinator.ObservePinnedAsync(
             new PinnedRouteNotice("www.example.org", "example.org", RouteTarget.Direct, [address], TimeSpan.FromHours(1)),
@@ -833,7 +833,7 @@ public sealed partial class CoordinatorTests : IDisposable
         var coordinator = await StartAsync();
         await ConnectAsync(coordinator);
 
-        var address = Ipv4.Parse("198.51.100.77");
+        var address = Ipv4.Parse("151.101.2.77");
         var pinned = coordinator.ObservePinnedAsync(
             new PinnedRouteNotice("srv.corp.example", "corp.example", RouteTarget.Tunnel(second.Id), [address], TimeSpan.FromHours(1)),
             CancellationToken.None);
@@ -842,7 +842,7 @@ public sealed partial class CoordinatorTests : IDisposable
 
         // Дополнительный туннель не поднят: адрес не выпускается ни напрямую, ни в чужой туннель.
         Assert.DoesNotContain(_world.Routes.Current, r => r.Destination == new Ipv4Cidr(address, 32));
-        Assert.Contains(_world.Wfp.Group(FilterGroup.Dynamic), f => f.Action == FilterAction.Block && f.Name.Contains("198.51.100.77", StringComparison.Ordinal));
+        Assert.Contains(_world.Wfp.Group(FilterGroup.Dynamic), f => f.Action == FilterAction.Block && f.Name.Contains("151.101.2.77", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -857,7 +857,7 @@ public sealed partial class CoordinatorTests : IDisposable
 
         _world.Routes.FailNext = 1;
         var pinned = coordinator.ObservePinnedAsync(
-            new PinnedRouteNotice("www.example.org", "example.org", RouteTarget.Direct, [Ipv4.Parse("203.0.113.20")], TimeSpan.FromHours(1)),
+            new PinnedRouteNotice("www.example.org", "example.org", RouteTarget.Direct, [Ipv4.Parse("151.101.1.20")], TimeSpan.FromHours(1)),
             CancellationToken.None);
         await coordinator.DrainAsync();
 
@@ -875,7 +875,7 @@ public sealed partial class CoordinatorTests : IDisposable
         var coordinator = await StartAsync();
         await ConnectAsync(coordinator);
 
-        var addresses = Enumerable.Range(1, 5).Select(i => Ipv4.Parse("203.0.113." + i)).ToList();
+        var addresses = Enumerable.Range(1, 5).Select(i => Ipv4.Parse("151.101.3." + i)).ToList();
         var waiting = addresses
             .Select(a => coordinator.ObservePinnedAsync(
                 new PinnedRouteNotice("www.example.org", "example.org", RouteTarget.Direct, [a], TimeSpan.FromHours(1)),

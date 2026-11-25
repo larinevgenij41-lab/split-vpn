@@ -1,4 +1,4 @@
-﻿using SplitVpn.Core.Net;
+using SplitVpn.Core.Net;
 using SplitVpn.Core.Policy;
 using SplitVpn.Core.Settings;
 using SplitVpn.Core.State;
@@ -41,8 +41,8 @@ public sealed partial class CoordinatorTests
         });
         var coordinator = await StartAsync();
         await ConnectAsync(coordinator);
-        var shared = Ipv4.Parse("198.51.100.71");
-        var extra = Ipv4.Parse("198.51.100.72");
+        var shared = Ipv4.Parse("151.101.4.71");
+        var extra = Ipv4.Parse("151.101.4.72");
         var first = coordinator.ObservePinnedAsync(new PinnedRouteNotice("private.example", "private.example", vpn,
             [shared], TimeSpan.FromMinutes(5)), CancellationToken.None);
         await coordinator.DrainAsync();
@@ -80,7 +80,7 @@ public sealed partial class CoordinatorTests
         });
         var coordinator = await StartAsync();
         await ConnectAsync(coordinator);
-        var shared = Ipv4.Parse("198.51.100.71");
+        var shared = Ipv4.Parse("151.101.4.71");
         var first = coordinator.ObservePinnedAsync(new PinnedRouteNotice("private.example", "private.example", vpn,
             [shared], TimeSpan.FromMinutes(5)), CancellationToken.None);
         var second = coordinator.ObservePinnedAsync(new PinnedRouteNotice("public.example", "public.example", RouteTarget.Direct,

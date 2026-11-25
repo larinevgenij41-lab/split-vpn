@@ -66,7 +66,12 @@ public sealed class ComprehensiveDnsReviewTests
         await using var general = new ReviewUpstream();
         var cache = new DnsCache(new FakeTimeProvider());
         await using var proxy = new DnsProxyServer(IPAddress.Loopback, cache) { RouteSink = new Sink() };
-        proxy.Configuration = Config(server) with { Direct = new DnsRoute([general.EndPoint], null) };
+        // Итерация 12: наследуются только цели «туннель» и «блокировать», поэтому правило здесь ведёт в туннель.
+        proxy.Configuration = Config(server) with
+        {
+            Direct = new DnsRoute([general.EndPoint], null),
+            DomainRoutes = [new DomainRoute("alias.example", RouteTarget.Tunnel(Guid.NewGuid()), new DnsRoute([server.EndPoint], null))],
+        };
         server.Respond = q => DnsAuditFixTests.Response(q, 0, [DnsAuditFixTests.Cname("alias.example", "cdn.example.net", 300)]);
         await proxy.HandleAsync(DnsMessage.BuildQuery(1, "alias.example", DnsMessage.TypeA), TestContext.Current.CancellationToken);
         proxy.Configuration = proxy.Configuration with { LocalSuffixes = ["new.lan"] };

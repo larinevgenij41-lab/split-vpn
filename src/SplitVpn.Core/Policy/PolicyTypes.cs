@@ -100,8 +100,12 @@ public enum DecisionSource
 /// <summary>Сети шлюза и цель, в которую их направил пользователь; UserRulesWin — ручные правила важнее этих сетей.</summary>
 public sealed record ServerNetworks(RouteTarget Target, IReadOnlyList<Ipv4Cidr> Cidrs, bool UserRulesWin = true);
 
-/// <summary>Служебный адрес туннеля, который должен идти через этот туннель.</summary>
-public readonly record struct TunnelHost(Guid Tunnel, uint Address);
+/// <summary>
+/// Служебный адрес туннеля, который должен идти через этот туннель. UserRulesWin - у подключения включено «Ручные
+/// правила важнее сетей шлюза»: тогда адрес под любым ручным правилом остаётся по правилу (служба такой адрес и сама
+/// убирает из DNS туннеля с предупреждением).
+/// </summary>
+public readonly record struct TunnelHost(Guid Tunnel, uint Address, bool UserRulesWin = false);
 
 public sealed record UserRule(Ipv4Cidr Cidr, RouteTarget Target, string? Comment = null, RoutePriority Priority = RoutePriority.Normal);
 
@@ -110,6 +114,13 @@ public sealed record UserRule(Ipv4Cidr Cidr, RouteTarget Target, string? Comment
 /// цель уже раскрыта: группа заменена своим участником, если хоть один годен.
 /// </summary>
 public sealed record PinnedHost(uint Address, RouteTarget Target);
+
+/// <summary>
+/// Закрепление по домену, которое политика не приняла: адрес держит адресное решение сильнее правила для домена
+/// (запрет пользователя, локальная сеть, сеть шлюза, зарезервированный диапазон, ручное правило в туннель для цели
+/// «напрямую»). Адрес идёт по адресным правилам; причина - для журнала службы.
+/// </summary>
+public sealed record RejectedPin(uint Address, RouteTarget Target, string Reason);
 
 /// <summary>
 /// Группа туннелей с уже отобранными участниками: служба передаёт только те, что сейчас годны

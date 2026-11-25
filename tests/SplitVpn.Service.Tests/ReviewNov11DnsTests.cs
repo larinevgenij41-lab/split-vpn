@@ -71,8 +71,11 @@ public sealed class ReviewNov11DnsTests
         upstream.Respond = q => { DnsMessage.TryReadQuestion(q, out var question); return Alias(q, question.Name, "shared.net", question.Name == "first.example" ? 10U : 300U); };
         await Ask(proxy, "first.example");
         await Ask(proxy, "second.example");
-        time.Advance(TimeSpan.FromSeconds(61));
+        // Итерация 12: срок CNAME-связи - TTL ответа в пределах 5-30 с (10 с у первого, 30 с у второго правила).
+        time.Advance(TimeSpan.FromSeconds(11));
         Assert.NotNull(cache.TryGetCanonicalLink("shared.net"));
+        time.Advance(TimeSpan.FromSeconds(20));
+        Assert.Null(cache.TryGetCanonicalLink("shared.net"));
     }
 
     [Theory]

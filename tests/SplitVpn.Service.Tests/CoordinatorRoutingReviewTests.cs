@@ -40,8 +40,10 @@ public sealed partial class CoordinatorTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task DirectPin_ReplacesTunnelHostRouteAndOutageBlock(bool pause)
+    public async Task DirectPin_DoesNotOverrideUserRuleIntoTunnel(bool pause)
     {
+        // Итерация 12: закрепление «напрямую» не выводит из VPN адрес, который ручное правило направило в туннель
+        // (адрес в ответе DNS выбирает сервер имён). Ответ отдаётся, адрес идёт по правилу, отказ - в журнале.
         var second = SecondProfile();
         var host = Ipv4.Parse("13.107.1.1");
         SaveSettings(Settings() with
@@ -61,18 +63,16 @@ public sealed partial class CoordinatorTests
             [host], TimeSpan.FromMinutes(5)), CancellationToken.None);
         await c.DrainAsync();
         Assert.True(await pending);
-        var route = Assert.Single(_world.Routes.Current, r => r.Destination == new Ipv4Cidr(host, 32));
-        Assert.Equal(FakeWorld.WiFiLuid, route.InterfaceLuid);
-        Assert.Equal(FilterAction.Permit, RoutingAction(host, FakeWorld.WiFiLuid));
-        Assert.Equal(FilterAction.Block, RoutingAction(host, FakeInventory.TunnelLuid(1)));
+        Assert.DoesNotContain(_world.Routes.Current, r => r.Destination == new Ipv4Cidr(host, 32) && r.InterfaceLuid == FakeWorld.WiFiLuid);
+        Assert.Equal(FilterAction.Block, RoutingAction(host, FakeWorld.WiFiLuid));
+        Assert.Contains(c.Facts.Policy!.RejectedPins, p => p.Address == host);
+        Assert.Equal(Decision.Vpn, c.Facts.Policy.Classify(host).Decision);
 
         if (!pause)
         {
-            _world.Time.Advance(TimeSpan.FromMinutes(6));
-            await TickAsync(c);
-            var restored = Assert.Single(_world.Routes.Current, r => r.Destination == new Ipv4Cidr(host, 32));
-            Assert.Equal(FakeInventory.TunnelLuid(1), restored.InterfaceLuid);
-            Assert.Equal(FilterAction.Block, RoutingAction(host, FakeWorld.WiFiLuid));
+            var route = Assert.Single(_world.Routes.Current, r => r.Destination == new Ipv4Cidr(host, 32));
+            Assert.Equal(FakeInventory.TunnelLuid(1), route.InterfaceLuid);
+            Assert.Equal(FilterAction.Permit, RoutingAction(host, FakeInventory.TunnelLuid(1)));
         }
     }
 

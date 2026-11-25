@@ -459,6 +459,12 @@ public sealed record SessionInfo
     public int? DtlsPort { get; init; }
 
     /// <summary>
+    /// Помощник не смог отключить IPv6 в туннеле (openconnect_disable_ipv6): шлюз мог назначить адаптеру адрес IPv6.
+    /// Защита пропускает через туннель AnyConnect только IPv4, служба показывает предупреждение.
+    /// </summary>
+    public bool Ipv6NotDisabled { get; init; }
+
+    /// <summary>
     /// Суффиксы DNS шлюза: split DNS, а если шлюз его не прислал — домен по умолчанию. Так же поступает
     /// клиент Cisco: без split DNS имена домена по умолчанию разрешает DNS шлюза.
     /// </summary>

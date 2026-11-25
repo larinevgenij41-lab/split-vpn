@@ -876,6 +876,29 @@ public sealed partial class Coordinator
             _deps.Logger.LogError("Сборка политики: {Details}", ex.Details);
             throw;
         }
+
+        ReportRejectedPins(Facts.Policy);
+    }
+
+    /// <summary>О каких отказах в закреплении (суффикс правила, причина) уже сказано в журнале.</summary>
+    private readonly HashSet<(string Suffix, string Reason)> _reportedRejectedPins = [];
+
+    /// <summary>
+    /// Закрепление по домену, не принятое политикой (адресное решение сильнее), - одна запись в журнал на пару
+    /// «правило, причина». Адреса и запрошенные имена не пишутся: только суффикс правила из настроек.
+    /// </summary>
+    private void ReportRejectedPins(CompiledPolicy policy)
+    {
+        foreach (var rejected in policy.RejectedPins)
+        {
+            var suffix = Facts.Pinned.TryGetValue(rejected.Address, out var pin) ? pin.Suffix : "";
+            if (_reportedRejectedPins.Count >= 10_000 || !_reportedRejectedPins.Add((suffix, rejected.Reason)))
+            {
+                continue;
+            }
+
+            Journal("Сведения", $"Правило для домена «{suffix}»: адрес не закреплён ({rejected.Reason}) и идёт по адресным правилам.");
+        }
     }
 
     private PolicyInput BuildPolicyInput(IReadOnlyList<UserRule> rules) => new()
@@ -917,11 +940,16 @@ public sealed partial class Coordinator
         return ServerAddress.TryParse(profile?.Server, out server);
     }
 
+    /// <summary>
+    /// Сети адаптеров, которые считаются локальными: частные - у любого адаптера, публичные - только у доверенного
+    /// (<see cref="PolicyCompiler.SelectOnLinkPrefixes"/>); от недоверенного с публичной сетью - лишь его маршрутизатор.
+    /// </summary>
     private List<Ipv4Cidr> OnLinkPrefixes()
     {
         var tunnelLuids = TunnelLuids();
-        return (_snapshot?.Adapters ?? []).Where(a => a.IsUp && !tunnelLuids.Contains(a.Luid))
-            .SelectMany(a => a.OnLinkPrefixes)
+        var (local, _) = PolicyCompiler.SelectOnLinkPrefixes(
+            (_snapshot?.Adapters ?? []).Where(a => a.IsUp && !tunnelLuids.Contains(a.Luid)), IsTrusted);
+        return local
             .Concat(_trustedPrefixes.Values.SelectMany(p => p))
             .Where(p => p.PrefixLength >= PolicyCompiler.MinOnLinkPrefix)
             .Distinct()
@@ -993,7 +1021,11 @@ public sealed partial class Coordinator
         ServiceExecutablePath = _deps.ServiceExecutablePath,
         SshEngineExecutablePath = Facts.Tunnels.Values.Any(t => t.Protocol == VpnProtocol.SshVpn) ? _deps.SshTunnel.EnginePath ?? "" : "",
         OnLinkPrefixes = OnLinkPrefixes(),
-        TrustedAdapters = TrustedAdapters().Select(a => new TrustedAdapterInput(a.Luid, a.Name)).ToList(),
+        TrustedAdapters = TrustedAdapters().Select(a => new TrustedAdapterInput(a.Luid, a.Name)
+        {
+            // Запомненные сети: адаптер, на время потерявший адрес, сохраняет разрешение к своей сети.
+            Prefixes = _trustedPrefixes.GetValueOrDefault(a.Luid) ?? a.OnLinkPrefixes,
+        }).ToList(),
         RevocationEndpoints = RevocationEndpoints(),
         ConnectivityCheckEndpoints = ConnectivityCheckEndpoints(),
         ServiceFetchEndpoints = ServiceFetchEndpoints(),

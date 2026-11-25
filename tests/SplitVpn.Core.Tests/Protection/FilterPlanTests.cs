@@ -100,7 +100,7 @@ public partial class FilterPlanTests
     [Fact]
     public void TrustedAdapter_PassesWithoutLocalAccess_ButDnsAndUserBlocksStillApply()
     {
-        var filters = All(Inputs(tunnel: Tunnel) with { LocalAccess = false, TrustedAdapters = [new TrustedAdapterInput(Radmin, "Radmin VPN")] });
+        var filters = All(Inputs(tunnel: Tunnel) with { LocalAccess = false, TrustedAdapters = [RadminAdapter] });
 
         Assert.Equal(FilterAction.Permit, Evaluate(filters, Tcp(Ipv4.Parse("26.1.2.3"), 80, Radmin)));
         Assert.Equal(FilterAction.Permit, Evaluate(filters, Udp(Ipv4.Parse("26.1.2.3"), 7777, Radmin)));
@@ -112,11 +112,39 @@ public partial class FilterPlanTests
     [Fact]
     public void TrustedAdapter_PassesDuringOutageWithAllPublicBlocked()
     {
-        var filters = All(Inputs(tunnel: null) with { OutageMode = OutageMode.BlockAllPublic, TrustedAdapters = [new TrustedAdapterInput(Radmin, "Radmin VPN")] });
+        var filters = All(Inputs(tunnel: null) with { OutageMode = OutageMode.BlockAllPublic, TrustedAdapters = [RadminAdapter] });
 
         Assert.Equal(FilterAction.Permit, Evaluate(filters, Tcp(Ipv4.Parse("26.1.2.3"), 80, Radmin)));
         Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(Cloudflare, 443, WiFi)));
     }
+
+    /// <summary>
+    /// Итерация 12: разрешение доверенного адаптера ограничено его сетями и локальными диапазонами. При обрыве в режиме
+    /// «Блокировать весь публичный» публичный интернет через него (выход Tailscale, ZeroTier) не выпускается.
+    /// </summary>
+    [Fact]
+    public void TrustedAdapter_DoesNotCarryPublicInternetDuringOutage()
+    {
+        var filters = All(Inputs(tunnel: null) with { OutageMode = OutageMode.BlockAllPublic, TrustedAdapters = [RadminAdapter] });
+
+        Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(Cloudflare, 443, Radmin)));
+        Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(Yandex, 443, Radmin)));
+        Assert.Equal(FilterAction.Block, Evaluate(filters, Packet.V6("2a00:1450:4001::1", 6, 443, Radmin)));
+        Assert.Equal(FilterAction.Permit, Evaluate(filters, Tcp(Ipv4.Parse("100.100.1.2"), 443, Radmin)));
+        Assert.Equal(FilterAction.Permit, Evaluate(filters, Packet.V6("fd7a:115c:a1e0::1", 6, 443, Radmin)));
+
+        // Без запомненных сетей - только локальные диапазоны.
+        var bare = All(Inputs(tunnel: null) with
+        {
+            OutageMode = OutageMode.BlockAllPublic,
+            LocalAccess = false,
+            TrustedAdapters = [new TrustedAdapterInput(Radmin, "Radmin VPN")],
+        });
+        Assert.Equal(FilterAction.Block, Evaluate(bare, Tcp(Ipv4.Parse("26.1.2.3"), 80, Radmin)));
+        Assert.Equal(FilterAction.Permit, Evaluate(bare, Tcp(Ipv4.Parse("10.1.2.3"), 80, Radmin)));
+    }
+
+    private static readonly TrustedAdapterInput RadminAdapter = new(Radmin, "Radmin VPN") { Prefixes = [Ipv4Cidr.Parse("26.0.0.0/8")] };
 
     [Fact]
     public void PrimaryAdapter_IsNeverAddedAsTrusted()
@@ -304,19 +332,19 @@ public partial class FilterPlanTests
         var inputs = Inputs(Tunnel, SecondTunnel, pins:
         [
             new PinnedHost(Cloudflare, RouteTarget.Direct),
-            new PinnedHost(Ipv4.Parse("203.0.113.5"), RouteTarget.Blocked),
+            new PinnedHost(Ipv4.Parse("151.101.1.5"), RouteTarget.Blocked),
         ]);
         var filters = All(inputs);
 
         Assert.Equal(FilterAction.Permit, Evaluate(filters, Tcp(Cloudflare, 443, WiFi)));
-        Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(Ipv4.Parse("203.0.113.5"), 443, Tunnel)));
+        Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(Ipv4.Parse("151.101.1.5"), 443, Tunnel)));
         Assert.All(FilterPlanBuilder.BuildDynamic(inputs), f => Assert.Equal(FilterGroup.Dynamic, f.Group));
     }
 
     [Fact]
     public void DomainRule_IntoUnavailableTunnel_BlocksInsteadOfLeakingDirectly()
     {
-        var host = Ipv4.Parse("203.0.113.77");
+        var host = Ipv4.Parse("151.101.1.69");
         var filters = All(Inputs(Tunnel, second: null, pins: [new PinnedHost(host, RouteTarget.Tunnel(TunnelB))]));
 
         Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(host, 443, WiFi)));
@@ -327,7 +355,7 @@ public partial class FilterPlanTests
     [Fact]
     public void DomainRule_IntoAvailableTunnel_LeavesOnlyThroughThatTunnel()
     {
-        var host = Ipv4.Parse("203.0.113.77");
+        var host = Ipv4.Parse("151.101.1.69");
         var filters = All(Inputs(Tunnel, SecondTunnel, pins: [new PinnedHost(host, RouteTarget.Tunnel(TunnelB))]));
 
         Assert.Equal(FilterAction.Permit, Evaluate(filters, Tcp(host, 443, SecondTunnel)));
@@ -338,7 +366,7 @@ public partial class FilterPlanTests
     [Fact]
     public void DomainRule_IntoGroup_FollowsItsLiveMember_AndBlocksWhenGroupIsDown()
     {
-        var host = Ipv4.Parse("203.0.113.77");
+        var host = Ipv4.Parse("151.101.1.69");
         var live = Inputs(Tunnel, SecondTunnel, pins: [new PinnedHost(host, RouteTarget.Group(GroupAb))], group: [TunnelB]);
         var down = Inputs(Tunnel, second: null, pins: [new PinnedHost(host, RouteTarget.Group(GroupAb))], group: []);
 

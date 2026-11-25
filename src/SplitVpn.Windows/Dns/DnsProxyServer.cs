@@ -1303,7 +1303,15 @@ public sealed class DnsProxyServer : IAsyncDisposable
 
         var ttl = RouteTtl(response);
         var leaseId = Guid.NewGuid();
-        if (!_cache.TryReserveCanonicalLinks(DnsMessage.ReadCanonicalNames(response, question.Name), domain.Suffix, ttl, leaseId,
+        // CNAME-связь создаёт только ответ из одних CNAME: клиенту предстоит отдельный запрос канонического имени, и
+        // связь передаёт ему правило исходного. Ответ с адресами несёт цепочку целиком - его адреса закрепляются ниже,
+        // а связь лишь позволила бы чужому DNS (x.evil.ru CNAME mail.google.com + A) увести постороннее имя под
+        // правило. Цель «напрямую» не наследуется вовсе (см. InheritedDomain), поэтому и связь для неё не нужна.
+        // Срок связи короткий: его хватает, чтобы клиент прошёл по цепочке.
+        var links = DnsMessage.IsCnameOnly(response) && domain.Target.Kind != TargetKind.Direct
+            ? DnsMessage.ReadCanonicalNames(response, question.Name)
+            : [];
+        if (!_cache.TryReserveCanonicalLinks(links, domain.Suffix, CanonicalLinkLifetime(response), leaseId,
             suffix => configuration.DomainRoutes.FirstOrDefault(d => d.PinAddresses && d.Suffix == suffix) is not { } existing
                 || existing.Target == domain.Target, domain.Origins ?? [question.Name]))
         {
@@ -1425,6 +1433,19 @@ public sealed class DnsProxyServer : IAsyncDisposable
             : current is not null && previous with { Route = null, Origins = null } == current with { Route = null, Origins = null }
                 && (previous.Origins ?? []).SequenceEqual(current.Origins ?? [], StringComparer.OrdinalIgnoreCase)
                 && Context(previous.Route) == Context(current.Route);
+
+    /// <summary>Наибольший срок CNAME-связи: клиенту он нужен лишь на то, чтобы сразу спросить каноническое имя.</summary>
+    internal static readonly TimeSpan MaxCanonicalLinkLifetime = TimeSpan.FromSeconds(30);
+
+    /// <summary>Наименьший срок CNAME-связи: ответ с TTL 0 тоже даёт клиенту время на следующий запрос цепочки.</summary>
+    internal static readonly TimeSpan MinCanonicalLinkLifetime = TimeSpan.FromSeconds(5);
+
+    /// <summary>Срок CNAME-связи: TTL ответа, но в пределах 5-30 с (а не срок закрепления адресов до часа).</summary>
+    internal static TimeSpan CanonicalLinkLifetime(byte[] response)
+    {
+        var seconds = DnsMessage.GetMinTtl(response) ?? 0;
+        return TimeSpan.FromSeconds(Math.Clamp(seconds, MinCanonicalLinkLifetime.TotalSeconds, MaxCanonicalLinkLifetime.TotalSeconds));
+    }
 
     private static TimeSpan RouteTtl(byte[] response)
     {
@@ -1591,6 +1612,10 @@ public sealed class DnsProxyServer : IAsyncDisposable
     /// <summary>
     /// Правило, унаследованное именем по CNAME-связи (ответ только с CNAME пришёл раньше). Собственное правило
     /// имени и локальный суффикс важнее: связь лишь закрывает имя, которое иначе ушло бы общим путём.
+    /// Наследование не может ослабить защиту имени (порядок: блокировать > туннель > напрямую). Наследуются только
+    /// «блокировать» и туннель: у имени без своего правила адреса идут по адресным правилам, которые могут вести в
+    /// туннель, и унаследованное «напрямую» вывело бы их из VPN по выбору чужого DNS. Поэтому цель «напрямую» не
+    /// наследуется: каноническое имя разрешается своим путём, а его адреса - по адресным правилам.
     /// </summary>
     private DomainRoute? InheritedDomain(DnsProxyConfiguration configuration, string name)
     {
@@ -1602,7 +1627,7 @@ public sealed class DnsProxyServer : IAsyncDisposable
 
         var owners = _cache.GetCanonicalOwners(name);
         if (owners.Count == 0) { return null; }
-        foreach (var route in configuration.DomainRoutes.Where(d => d.PinAddresses))
+        foreach (var route in configuration.DomainRoutes.Where(d => d.PinAddresses && d.Target.Kind != TargetKind.Direct))
         {
             var origins = owners.Where(o => o.Suffix == route.Suffix).Select(o => o.Origin)
                 .Order(StringComparer.OrdinalIgnoreCase).ToArray();

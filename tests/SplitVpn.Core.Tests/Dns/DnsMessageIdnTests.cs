@@ -58,6 +58,38 @@ public class DnsMessageIdnTests
         Assert.Equal(expected, ascii);
     }
 
+    /// <summary>Итерация 12: CNAME-связь создаёт только ответ из одних CNAME (и подписей), без адресов.</summary>
+    [Fact]
+    public void IsCnameOnly_OnlyForAnswersWithoutAddresses()
+    {
+        var query = DnsMessage.BuildQuery(7, "x.evil.ru", DnsMessage.TypeA);
+        var cname = Record("x.evil.ru", DnsMessage.TypeCname, Name("mail.google.com"));
+        var address = Record("mail.google.com", DnsMessage.TypeA, [142, 250, 1, 17]);
+        var signature = Record("x.evil.ru", DnsMessage.TypeRrsig, [1, 2, 3]);
+
+        Assert.True(DnsMessage.IsCnameOnly(Response(query, cname)));
+        Assert.True(DnsMessage.IsCnameOnly(Response(query, cname, signature)));
+        Assert.False(DnsMessage.IsCnameOnly(Response(query, cname, address)));
+        Assert.False(DnsMessage.IsCnameOnly(Response(query)));
+        Assert.False(DnsMessage.IsCnameOnly(Response(query, signature)));
+        Assert.False(DnsMessage.IsCnameOnly(Response(query, cname, Record("x.evil.ru", 16, [1, (byte)'a']))));
+        Assert.False(DnsMessage.IsCnameOnly(DnsMessage.BuildAddressResponse(query, [0xC0000207], 60)));
+    }
+
+    private static byte[] Response(byte[] query, params byte[][] answers)
+    {
+        var head = DnsMessage.BuildEmptyResponse(query);
+        head[6] = (byte)(answers.Length >> 8);
+        head[7] = (byte)answers.Length;
+        return [.. head, .. answers.SelectMany(a => a)];
+    }
+
+    private static byte[] Name(string name) =>
+        [.. name.Split('.').SelectMany(l => new[] { (byte)l.Length }.Concat(System.Text.Encoding.ASCII.GetBytes(l))), 0];
+
+    private static byte[] Record(string owner, ushort type, byte[] data) =>
+        [.. Name(owner), (byte)(type >> 8), (byte)type, 0, 1, 0, 0, 0, 60, (byte)(data.Length >> 8), (byte)data.Length, .. data];
+
     [Fact]
     public void TryGetAsciiName_RejectsInvalidIdnWithoutThrowing()
     {

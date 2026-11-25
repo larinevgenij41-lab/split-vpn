@@ -322,7 +322,8 @@ public class PolicyCompilerTests
             .Union(SpecialRanges.Loopback)
             .Union(SpecialRanges.LinkScope)
             .Union(PolicyCompiler.OnLinkSet(input.OnLinePrefixes));
-        var service = infrastructure.Union(RangeSet.From(input.ServiceDnsAddresses.Select(Ipv4Range.Host)));
+        // DNS сети под правилом пользователя идёт по правилу (в том числе в блок или туннель).
+        var service = infrastructure.Union(RangeSet.From(input.ServiceDnsAddresses.Where(a => !input.Rules.Any(r => r.Cidr.Contains(a))).Select(Ipv4Range.Host)));
         Assert.Empty(policy.BlockRanges.Intersect(service));
         // DNS адаптера, которому положено «напрямую», остаётся прямым.
         Assert.Empty(policy.DirectRanges.Intersect(infrastructure));
@@ -351,7 +352,8 @@ public class PolicyCompilerTests
         {
             // DNS адаптера, которому положено «напрямую», остаётся прямым.
             var ordinary = NaiveOrdinary(input, address);
-            return ordinary.Decision == Decision.Direct ? ordinary : new Classification(Decision.Server, DecisionSource.ServiceDns, null);
+            // Правило пользователя адрес DNS сети не перекрывает: оно действует для программ, а службе её разрешение даётся отдельно.
+            return ordinary.Decision == Decision.Direct || ordinary.Source == DecisionSource.UserRule ? ordinary : new Classification(Decision.Server, DecisionSource.ServiceDns, null);
         }
 
         return NaiveOrdinary(input, address);

@@ -669,7 +669,10 @@ public sealed partial class Coordinator
 
         foreach (var (adapter, prefix) in Facts.Conflicts)
         {
-            warnings.Add(new StatusWarning("public-onlink", $"Интерфейс «{adapter}» использует публичную сеть {prefix}: доступ к ней зависит от настройки «Локальный доступ».", null));
+            warnings.Add(new StatusWarning("public-onlink", $"Интерфейс «{adapter}» использует публичную сеть {prefix}: она больше не считается локальной и идёт по правилам маршрутизации (локальным остаётся только маршрутизатор этой сети). "
+                + (adapter == Facts.Primary?.Name
+                    ? $"Если узлы этой сети нужны напрямую, добавьте правило {prefix} → «Напрямую»."
+                    : "Если это ваша сеть, отметьте адаптер в списке «Доверенные адаптеры» на странице «Защита и DNS»."), null));
         }
 
         warnings.AddRange(OnLinkRuleWarnings());

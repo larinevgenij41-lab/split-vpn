@@ -89,6 +89,9 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
     /// </summary>
     private string? _certificateWarning;
 
+    /// <summary>openconnect_disable_ipv6 завершился ошибкой: признак уходит службе в параметрах сеанса.</summary>
+    private bool _ipv6NotDisabled;
+
     /// <summary>Туннель поднят (службе отправлено Established): дальнейшие сбои с сертификатом клиента не связаны.</summary>
     private bool _established;
     private bool _signInCancelled;
@@ -194,9 +197,12 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
         }
 
         // Маршрутизация и фильтры службы — только IPv4: адрес IPv6 от шлюза на адаптере был бы вне её модели.
+        // Сбой - не отказ от сеанса: защита пропускает через туннель AnyConnect только IPv4, а служба получает признак
+        // в параметрах сеанса и показывает предупреждение.
         if (_lib.DisableIpv6() != 0)
         {
-            Log(OcCodes.PrgInfo, "Не удалось отключить IPv6 в туннеле.");
+            _ipv6NotDisabled = true;
+            Log(OcCodes.PrgErr,"Не удалось отключить IPv6 в туннеле: IPv6 через туннель будет заблокирован защитой.");
         }
 
         // Канал команд — до входа: отмена прерывает и сетевые ожидания библиотеки, а не только колбэки.
@@ -307,7 +313,7 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
     /// <summary>Параметры сеанса в пределах <see cref="HelperLimits"/>; что урезано — в журнал.</summary>
     private SessionInfo ReadSession()
     {
-        var session = _lib.ReadSession().Capped();
+        var session = _lib.ReadSession().Capped() with { Ipv6NotDisabled = _ipv6NotDisabled };
         foreach (var item in session.Truncated)
         {
             Log(OcCodes.PrgInfo, "Шлюз прислал слишком много данных сеанса, лишнее отброшено: " + item + ".");

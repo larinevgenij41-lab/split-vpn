@@ -174,8 +174,14 @@ public sealed record TunnelInput
 /// <summary>Адрес и порт TCP узла проверки отзыва сертификата сервера (ссылка http из CRL или AIA).</summary>
 public readonly record struct RevocationEndpoint(uint Address, ushort Port);
 
-/// <summary>Адаптер, трафик которого защита пропускает целиком (например, Radmin VPN).</summary>
-public sealed record TrustedAdapterInput(ulong Luid, string Name);
+/// <summary>
+/// Адаптер, трафик которого защита пропускает (например, Radmin VPN): к его собственным сетям (Prefixes - текущие или
+/// запомненные on-link-сети) и к локальным диапазонам. Публичный интернет через него не выпускается.
+/// </summary>
+public sealed record TrustedAdapterInput(ulong Luid, string Name)
+{
+    public IReadOnlyList<Ipv4Cidr> Prefixes { get; init; } = [];
+}
 
 /// <summary>Факты и настройки, от которых зависит набор фильтров.</summary>
 public sealed record ProtectionInputs
@@ -259,6 +265,14 @@ public static class FilterPlanBuilder
     /// поэтому чужая программа к тому же адресу и порту им не проходит, а попадает под обычные запреты.
     /// </summary>
     public const byte WeightConnectivityCheck = WeightDomain;
+
+    /// <summary>
+    /// Разрешение DNS службы (порт 53 к DNS сети только процессу службы от LocalSystem и только через основной адаптер)
+    /// весит больше запрета пользователя и блока «Туннель недоступен» (13): адрес DNS сохраняет решение правил
+    /// пользователя для программ (в туннель или «Блокировать»), но служба должна разрешать имена серверов VPN и при
+    /// таком правиле, и пока туннель этого правила лежит. Закрепления по домену такой адрес не получают.
+    /// </summary>
+    public const byte WeightServiceDns = WeightDomain;
 
     /// <summary>
     /// %SystemRoot%\System32\svchost.exe: в нём живут клиент DHCP и проверка интернета Windows (NCSI), их разрешения
@@ -554,11 +568,19 @@ public static class FilterPlanBuilder
                 Spec("Сеть интерфейса " + r, FilterGroup.Runtime, FilterFamily.V4, WeightLocal, FilterAction.Permit, new RemoteRangeV4(r.Start, r.End))));
         }
 
-        // Разрешение по интерфейсу, а не по адресам: не зависит от «Локального доступа» и не мигает,
-        // пока адрес адаптера меняется. DNS-страж и блокировки пользователя весят больше и действуют и здесь.
-        filters.AddRange(inputs.TrustedAdapters.Where(a => a.Luid != inputs.PrimaryLuid).Select(a => Spec(
-            "Доверенный адаптер «" + a.Name + "»", FilterGroup.Runtime, FilterFamily.Both, WeightLocal, FilterAction.Permit,
-            new LocalInterfaceCondition(a.Luid, NotEqual: false))));
+        // Разрешение по интерфейсу: не зависит от «Локального доступа» и не мигает, пока адрес адаптера меняется
+        // (сети запоминаются). Назначения - только сети самого адаптера и локальные диапазоны: при обрыве в режиме
+        // «Блокировать весь публичный» (вес 5) разрешение весом 7 без адресов выпустило бы через такой адаптер
+        // (выход Tailscale, ZeroTier) весь интернет. DNS-страж и блокировки пользователя весят больше и действуют и здесь.
+        foreach (var adapter in inputs.TrustedAdapters.Where(a => a.Luid != inputs.PrimaryLuid))
+        {
+            var name = "Доверенный адаптер «" + adapter.Name + "»";
+            var own = SpecialRanges.Local.Union(PolicyCompiler.OnLinkSet(adapter.Prefixes));
+            filters.Add(Spec(name, FilterGroup.Runtime, FilterFamily.V4, WeightLocal, FilterAction.Permit,
+                new RemoteRangesV4(own), new LocalInterfaceCondition(adapter.Luid, NotEqual: false)));
+            filters.AddRange(LocalV6.Select(n => Spec(name + ": " + n, FilterGroup.Runtime, FilterFamily.V6, WeightLocal, FilterAction.Permit,
+                new RemotePrefixV6(n), new LocalInterfaceCondition(adapter.Luid, NotEqual: false))));
+        }
 
         var foreignInterface = inputs.PrimaryLuid is { } primary
             ? Spec("Не основной адаптер", FilterGroup.Runtime, FilterFamily.Both, WeightForeignInterface, FilterAction.Block, new LocalInterfaceCondition(primary, NotEqual: true))
@@ -699,7 +721,7 @@ public static class FilterPlanBuilder
             "DNS службы " + Ipv4.Format(address),
             FilterGroup.Runtime,
             FilterFamily.V4,
-            WeightInfrastructure,
+            WeightServiceDns,
             FilterAction.Permit,
             [
                 new AppIdCondition(inputs.ServiceExecutablePath),
@@ -723,13 +745,22 @@ public static class FilterPlanBuilder
     {
         foreach (var tunnel in inputs.Tunnels.Where(t => t.Luid is not null))
         {
+            // Туннель AnyConnect - только IPv4 (помощник отключает IPv6 в сеансе, маршруты и ограничения назначений
+            // защиты - только IPv4). Если отключить IPv6 не удалось и шлюз назначил адрес IPv6 с ::/0, разрешение для
+            // обоих семейств увело бы в корпоративный туннель весь IPv6 компьютера: IPv6 через него блокируется.
             filters.Add(Spec(
                 "Туннель " + Describe(tunnel),
                 FilterGroup.Runtime,
-                FilterFamily.Both,
+                tunnel.Protocol == VpnProtocol.AnyConnect ? FilterFamily.V4 : FilterFamily.Both,
                 WeightTunnel,
                 FilterAction.Permit,
                 new LocalInterfaceCondition(tunnel.Luid!.Value, NotEqual: false)));
+            if (tunnel.Protocol == VpnProtocol.AnyConnect)
+            {
+                // И локальные IPv6 (разрешение «Локальная сеть» не привязано к интерфейсу) через этот туннель не идут.
+                filters.Add(Spec("Туннель " + Describe(tunnel) + ": без IPv6", FilterGroup.Runtime, FilterFamily.V6, WeightTunnel,
+                    FilterAction.Block, new LocalInterfaceCondition(tunnel.Luid!.Value, NotEqual: false)));
+            }
         }
 
         // Туннель не поднят: назначения неопорного блокируются, иначе они ушли бы по маршруту /1 в чужой
