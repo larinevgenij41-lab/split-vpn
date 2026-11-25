@@ -80,10 +80,47 @@ internal static class ProtoContext
             ?? throw new InvalidOperationException("Пароль прототипа не сохранён: выполните «creds set».");
     }
 
+    /// <summary>
+    /// Каталог прототипа — по правилам каталога данных службы (<see cref="SecretStore.SecureDataRoot"/>): заранее
+    /// созданный обычным пользователем каталог или ссылка на его месте переносится в сторону, а не присваивается сменой
+    /// DACL (владелец сохранил бы WRITE_DAC). Файл секрета, если его ещё нет, создаётся сразу с правами только SYSTEM и
+    /// Administrators — не наследует ничьих прав и в промежутке между созданием и сменой ACL не открыт.
+    /// </summary>
     public static void EnsureRoot()
     {
-        Directory.CreateDirectory(Root);
-        SecretStore.RestrictToSystemAndAdministrators(Root);
+        foreach (var warning in SecretStore.SecureDataRoot(Root))
+        {
+            Console.Error.WriteLine(warning);
+        }
+
+        CreateProtectedSecretFile(SecretPath);
+    }
+
+    /// <summary>Пустой файл секрета («{}») с защищённым DACL при создании; существующий не трогается.</summary>
+    internal static void CreateProtectedSecretFile(string path)
+    {
+        if (File.Exists(path))
+        {
+            return;
+        }
+
+        var security = new System.Security.AccessControl.FileSecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        foreach (var sid in new[] { System.Security.Principal.WellKnownSidType.LocalSystemSid, System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid })
+        {
+            security.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(new System.Security.Principal.SecurityIdentifier(sid, null),
+                System.Security.AccessControl.FileSystemRights.FullControl, System.Security.AccessControl.AccessControlType.Allow));
+        }
+
+        try
+        {
+            using var stream = new FileInfo(path).Create(FileMode.CreateNew, System.Security.AccessControl.FileSystemRights.Write, FileShare.None, 4096, FileOptions.None, security);
+            stream.Write("{}"u8);
+        }
+        catch (IOException) when (File.Exists(path))
+        {
+            // Файл появился одновременно: его права приведёт к норме следующая запись секрета.
+        }
     }
 
     /// <summary>Служба не установлена (ERROR_SERVICE_DOES_NOT_EXIST): её маршрутам ничто не грозит.</summary>

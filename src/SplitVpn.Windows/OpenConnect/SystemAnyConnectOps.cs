@@ -174,7 +174,7 @@ public sealed class SystemAnyConnectOps : IAnyConnectOps, IDisposable
         private readonly Process _process;
         private readonly AnonymousPipeServerStream _toHelper;
         private readonly AnonymousPipeServerStream _fromHelper;
-        private readonly Channel<byte[]> _outgoing = Channel.CreateBounded<byte[]>(
+        private readonly Channel<SerializedFrame> _outgoing = Channel.CreateBounded<SerializedFrame>(
             new BoundedChannelOptions(MaxPendingCommands) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true });
 
         private readonly Task _writer;
@@ -200,7 +200,15 @@ public sealed class SystemAnyConnectOps : IAnyConnectOps, IDisposable
                 return false;
             }
 
-            return _outgoing.Writer.TryWrite(HelperContract.Serialize(command));
+            // Кадр — в очищаемом буфере: команда Start несёт пароль, и копия в куче не должна пережить запись в трубу.
+            var frame = HelperContract.SerializeToBuffer(command);
+            if (_outgoing.Writer.TryWrite(frame))
+            {
+                return true;
+            }
+
+            frame.Dispose();
+            return false;
         }
 
         public Task Exited => _exited;
@@ -281,27 +289,44 @@ public sealed class SystemAnyConnectOps : IAnyConnectOps, IDisposable
         {
             try
             {
-                await foreach (var payload in _outgoing.Reader.ReadAllAsync())
+                await foreach (var frame in _outgoing.Reader.ReadAllAsync())
                 {
                     // Анонимная труба работает только синхронно: отменить начатую запись нельзя, поэтому
                     // предел ставится гонкой, а выталкивает застрявшую запись закрытие трубы.
-                    var write = FrameCodec.WriteAsync(_toHelper, payload, CancellationToken.None);
+                    var write = FrameCodec.WriteAsync(_toHelper, frame.Written, CancellationToken.None);
                     using var delay = new CancellationTokenSource();
                     var finished = await Task.WhenAny(write, Task.Delay(WriteTimeout, delay.Token));
                     if (!ReferenceEquals(finished, write))
                     {
+                        // Застрявшая запись ещё читает буфер: он очищается, когда она завершится.
                         Observe(write);
+                        _ = write.ContinueWith(_ => frame.Dispose(), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
                         Fail("помощник перестал читать канал");
                         return;
                     }
 
                     await delay.CancelAsync();
-                    await write;
+                    try
+                    {
+                        await write;
+                    }
+                    finally
+                    {
+                        frame.Dispose();
+                    }
                 }
             }
             catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
             {
                 Fail(ex.Message);
+            }
+            finally
+            {
+                // Команды, не дошедшие до помощника, тоже затираются.
+                while (_outgoing.Reader.TryRead(out var left))
+                {
+                    left.Dispose();
+                }
             }
         }
 

@@ -104,7 +104,7 @@ public static class SshPrivateKey
     {
         SshPrivateKeyCheck.Ok => "",
         SshPrivateKeyCheck.WrongSize => "Файл ключа SSH пуст или слишком велик (допустимо до 16 КБ).",
-        SshPrivateKeyCheck.Encrypted => "Ключ SSH защищён паролем. Сохраните копию ключа без пароля (ssh-keygen -p) и загрузите её: служба хранит ключ зашифрованным.",
+        SshPrivateKeyCheck.Encrypted => "Ключ SSH защищён паролем. Не снимайте пароль с самого ключа: «ssh-keygen -p» меняет файл на месте. Сделайте копию и снимите пароль с неё: «copy key key.nopass», затем «ssh-keygen -p -f key.nopass». Загрузите key.nopass в программу (служба хранит ключ зашифрованным) и сразу удалите эту копию.",
         _ => "Файл не похож на закрытый ключ OpenSSH: он должен начинаться со строки «-----BEGIN OPENSSH PRIVATE KEY-----».",
     };
 

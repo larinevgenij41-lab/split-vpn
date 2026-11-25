@@ -230,7 +230,7 @@ public sealed partial class Coordinator
                 if (helperEvent is LogEvent log)
                 {
                     _deps.Logger.Log(log.Level switch { "error" => LogLevel.Warning, "info" => LogLevel.Information, _ => LogLevel.Debug },
-                        "AnyConnect {Name}: {Text}", profile.Name, log.Text.TrimEnd());
+                        "AnyConnect {Name}: {Text}", profile.Name, Core.Diagnostics.LogText.SingleLine(log.Text.TrimEnd()));
                     return;
                 }
                 TryEnqueue("Helper:" + helperEvent.GetType().Name, () => OnHelperEventAsync(profileId, generation, helperEvent, CancellationToken.None));
@@ -238,6 +238,7 @@ public sealed partial class Coordinator
         }
         catch (Exception ex) when (ex is IOException or InvalidOperationException or Win32Exception or UnauthorizedAccessException)
         {
+            ClearPassword(start);
             tunnel.BlockingError = ErrorCategory.Other;
             tunnel.LastErrorCategory = ErrorCategory.Other;
             tunnel.LastErrorText = $"«{tunnel.Name}»: помощник AnyConnect не запустился: {ex.Message}";
@@ -272,6 +273,19 @@ public sealed partial class Coordinator
             tunnel.AnyConnect = null;
             ReportAnyConnectStartFailure(tunnel, $"«{tunnel.Name}»: помощник AnyConnect не получил команду входа: {ex.Message}. Повтор на следующей сверке.");
         }
+        finally
+        {
+            // Команда уже в трубе (или не ушла вовсе): пароль в памяти службы больше не нужен.
+            ClearPassword(start);
+        }
+    }
+
+    private static void ClearPassword(StartCommand start)
+    {
+        if (start.Password is { } password)
+        {
+            Array.Clear(password);
+        }
     }
 
     /// <summary>
@@ -295,21 +309,14 @@ public sealed partial class Coordinator
     /// <summary>Имя адаптера Wintun: постоянное для профиля.</summary>
     internal static string InterfaceNameFor(ConnectionProfile profile) => "SplitVpn AC " + profile.Id.ToString("N")[..8];
 
-    /// <summary>Пароль для формы шлюза: сохранённый или запомненный до перезапуска службы; без него шлюз спросит.</summary>
-    private string? LoadGatewayPassword(ConnectionProfile profile)
-    {
-        var chars = Facts.MemoryPasswords.TryGetValue(profile.Id, out var memory)
+    /// <summary>
+    /// Пароль для формы шлюза: сохранённый или запомненный до перезапуска службы; без него шлюз спросит. Массив, а не
+    /// строка: его очищают сразу после отправки команды помощнику (неизменяемая строка оставалась бы в памяти службы).
+    /// </summary>
+    private char[]? LoadGatewayPassword(ConnectionProfile profile) =>
+        Facts.MemoryPasswords.TryGetValue(profile.Id, out var memory)
             ? memory.ToArray()
             : profile.SavePassword ? _deps.Secrets.TryLoad(profile.Id) : null;
-        if (chars is null)
-        {
-            return null;
-        }
-
-        var password = new string(chars);
-        Array.Clear(chars);
-        return password;
-    }
 
     internal async Task OnHelperEventAsync(Guid profileId, int generation, HelperEvent helperEvent, CancellationToken cancellationToken)
     {
@@ -403,7 +410,7 @@ public sealed partial class Coordinator
             case LogEvent log:
                 // Сообщения библиотеки без секретов (их вырезает помощник) — в файл журнала службы: по ним разбирают сбои входа.
                 _deps.Logger.Log(log.Level switch { "error" => LogLevel.Warning, "info" => LogLevel.Information, _ => LogLevel.Debug },
-                    "AnyConnect {Name}: {Text}", tunnel.Name, log.Text.TrimEnd());
+                    "AnyConnect {Name}: {Text}", tunnel.Name, Core.Diagnostics.LogText.SingleLine(log.Text.TrimEnd()));
                 break;
             case TerminatedEvent terminated:
                 await OnAnyConnectTerminatedAsync(tunnel, link, terminated, cancellationToken);
@@ -923,7 +930,8 @@ public sealed partial class Coordinator
         else
         {
             // Текст помощника уже называет причину; общая формулировка — только если он пуст.
-            var reason = string.IsNullOrWhiteSpace(terminated.Text) ? fallback : terminated.Text.Trim().TrimEnd('.');
+            // Текст помощника идёт и в ответ о состоянии (LastErrorText): одной строкой, без управляющих символов.
+            var reason = string.IsNullOrWhiteSpace(terminated.Text) ? fallback : Core.Diagnostics.LogText.SingleLine(terminated.Text.Trim().TrimEnd('.'));
             tunnel.LastErrorCategory = category;
             tunnel.LastErrorText = $"«{tunnel.Name}»: {reason}";
             tunnel.BlockingError = blocking ? category : ErrorCategory.None;

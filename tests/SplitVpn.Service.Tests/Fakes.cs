@@ -1367,7 +1367,8 @@ internal sealed class FakeAnyConnectSession(Action<SplitVpn.Core.OpenConnect.Hel
             return false;
         }
 
-        Commands.Add(command);
+        // Как по трубе: служба очищает пароль команды Start сразу после отправки, помощник получил свою копию.
+        Commands.Add(command is SplitVpn.Core.OpenConnect.StartCommand start ? start with { Password = start.Password?.ToArray() } : command);
         return true;
     }
 

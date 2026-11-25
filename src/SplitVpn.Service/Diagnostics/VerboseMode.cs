@@ -24,10 +24,22 @@ public sealed class VerboseMode : IDisposable
     private readonly TimeProvider _time;
     private readonly Func<string?> _load;
     private readonly Action<DateTimeOffset?> _save;
+    private readonly Func<string?>? _loadRemaining;
+    private readonly Action<TimeSpan?>? _saveRemaining;
     private readonly string _logsDirectory;
     private readonly Lock _lock = new();
     private ITimer? _timer;
+    private ITimer? _checkpoint;
+
+    /// <summary>Срок по часам на момент включения: его хранит реестр (интерфейс читает его же).</summary>
     private DateTimeOffset? _until;
+
+    /// <summary>Монотонная отметка включения и остаток срока на тот момент: истечение считается по ним.</summary>
+    private long _appliedAt;
+    private TimeSpan _remainingAtApply;
+
+    /// <summary>Номер включения: таймер прежнего включения не гасит продлённый режим.</summary>
+    private long _generation;
 
     /// <summary>
     /// Режим выключен, но срок не удалён из реестра: после перезапуска службы режим включился бы снова.
@@ -35,43 +47,67 @@ public sealed class VerboseMode : IDisposable
     /// </summary>
     private bool _clearPending;
 
-    public VerboseMode(LoggingLevelSwitch level, TimeProvider time, Func<string?> load, Action<DateTimeOffset?> save, string logsDirectory)
+    /// <summary>Как часто остаток срока записывается в реестр, пока режим включён.</summary>
+    internal static readonly TimeSpan CheckpointInterval = TimeSpan.FromMinutes(5);
+
+    /// <param name="loadRemaining">Остаток срока из реестра (<see cref="VerboseRegistry.RemainingValueName"/>).</param>
+    /// <param name="saveRemaining">Запись остатка; null удаляет.</param>
+    public VerboseMode(LoggingLevelSwitch level, TimeProvider time, Func<string?> load, Action<DateTimeOffset?> save, string logsDirectory,
+        Func<string?>? loadRemaining = null, Action<TimeSpan?>? saveRemaining = null)
     {
         _level = level;
         _time = time;
         _load = load;
         _save = save;
         _logsDirectory = logsDirectory;
+        _loadRemaining = loadRemaining;
+        _saveRemaining = saveRemaining;
     }
 
     /// <summary>Событие для журнала службы: уровень («Сведения», «Предупреждение») и текст. Подключается после создания журнала.</summary>
     public Action<string, string>? Journal { get; set; }
 
+    /// <summary>
+    /// До какого момента режим включён: сейчас плюс остаток по монотонному времени. Перевод часов не продлевает и
+    /// не обрывает режим, срок лишь пересчитывается к новым часам.
+    /// </summary>
     public DateTimeOffset? UntilUtc
     {
         get
         {
             lock (_lock)
             {
-                return _until;
+                return _until is null ? null : _time.GetUtcNow() + Left();
             }
         }
     }
 
-    /// <summary>Прочитать срок из реестра и применить. Истёкшее значение удаляется.</summary>
+    /// <summary>
+    /// Прочитать срок из реестра и применить. Истёкшее значение удаляется. Срок по часам ограничен записанным остатком:
+    /// часы, переведённые назад, пока служба не работала, не продлевают режим сверх запрошенного.
+    /// </summary>
     public void Initialize()
     {
         string? stored;
+        string? storedRemaining;
         try
         {
             stored = _load();
+            storedRemaining = _loadRemaining?.Invoke();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
             stored = null;
+            storedRemaining = null;
         }
 
-        var until = VerboseRegistry.Effective(stored, _time.GetUtcNow());
+        var now = _time.GetUtcNow();
+        var until = VerboseRegistry.Effective(stored, now);
+        if (until is { } value && VerboseRegistry.ParseRemaining(storedRemaining) is { } remaining && value - now > remaining)
+        {
+            until = remaining > TimeSpan.Zero ? now + remaining : null;
+        }
+
         lock (_lock)
         {
             // Истёкшее значение удаляется, слишком дальнее — записывается обрезанным: иначе вписанный вручную
@@ -81,7 +117,12 @@ public sealed class VerboseMode : IDisposable
                 TrySave(until);
             }
 
-            Apply(until);
+            if (until is null && storedRemaining is not null)
+            {
+                TrySaveRemaining(null);
+            }
+
+            Apply(until, until is { } term ? term - now : TimeSpan.Zero);
         }
 
         DeleteOldFiles();
@@ -96,8 +137,9 @@ public sealed class VerboseMode : IDisposable
         {
             // Реестр и режим меняются вместе: иначе одновременное выключение оставило бы их разными.
             _save(until);
+            TrySaveRemaining(duration);
             _clearPending = false;
-            Apply(until);
+            Apply(until, duration);
         }
 
         DeleteOldFiles();
@@ -111,20 +153,21 @@ public sealed class VerboseMode : IDisposable
     /// </summary>
     public bool Disable(string reason) => Disable(reason, expected: null);
 
-    /// <summary>Выключить; expected — только если действует именно этот срок (истечение не гасит продлённый режим).</summary>
-    private bool Disable(string reason, DateTimeOffset? expected)
+    /// <summary>Выключить; expected — только если действует именно это включение (истечение не гасит продлённый режим).</summary>
+    private bool Disable(string reason, long? expected)
     {
         bool saved;
         lock (_lock)
         {
-            if ((_until is null && !_clearPending) || (expected is not null && _until != expected))
+            if ((_until is null && !_clearPending) || (expected is not null && (_until is null || _generation != expected)))
             {
                 return true;
             }
 
             var wasOn = _until is not null;
-            Apply(null);
+            Apply(null, TimeSpan.Zero);
             saved = TrySave(null);
+            TrySaveRemaining(null);
             _clearPending = !saved;
             if (!wasOn)
             {
@@ -140,53 +183,99 @@ public sealed class VerboseMode : IDisposable
     {
         lock (_lock)
         {
+            // Остаток — в реестр: после перезапуска режим продолжится не дольше него, как бы ни перевели часы.
+            if (_until is not null)
+            {
+                TrySaveRemaining(Left());
+            }
+
             _timer?.Dispose();
             _timer = null;
+            _checkpoint?.Dispose();
+            _checkpoint = null;
         }
     }
 
-    private void Apply(DateTimeOffset? until)
+    /// <summary>Остаток срока по монотонному времени.</summary>
+    private TimeSpan Left()
+    {
+        var left = _remainingAtApply - _time.GetElapsedTime(_appliedAt);
+        return left > TimeSpan.Zero ? left : TimeSpan.Zero;
+    }
+
+    private void Apply(DateTimeOffset? until, TimeSpan remaining)
     {
         _until = until;
+        _generation++;
+        _appliedAt = _time.GetTimestamp();
+        _remainingAtApply = remaining;
         _timer?.Dispose();
         _timer = null;
+        _checkpoint?.Dispose();
+        _checkpoint = null;
         var on = until is not null;
         _level.MinimumLevel = on ? LogEventLevel.Verbose : LogEventLevel.Information;
         Verbose.Set(on);
-        if (until is { } value)
+        if (on)
         {
-            Arm(value);
+            var generation = _generation;
+            Arm(generation, remaining);
+            if (_saveRemaining is not null)
+            {
+                _checkpoint = _time.CreateTimer(_ => Checkpoint(generation), null, CheckpointInterval, CheckpointInterval);
+            }
         }
     }
 
-    private void Arm(DateTimeOffset until)
-    {
-        var due = until - _time.GetUtcNow();
-        _timer = _time.CreateTimer(_ => Expire(until), null, due < TimeSpan.Zero ? TimeSpan.Zero : due, Timeout.InfiniteTimeSpan);
-    }
+    private void Arm(long generation, TimeSpan due) =>
+        _timer = _time.CreateTimer(_ => Expire(generation), null, due < TimeSpan.Zero ? TimeSpan.Zero : due, Timeout.InfiniteTimeSpan);
 
     /// <summary>
-    /// Таймер идёт по монотонному времени, срок — по часам: он может сработать на миллисекунды раньше
-    /// (грубая гранулярность, подстройка часов). Тогда он взводится на остаток, а не теряется.
+    /// Срок считается по монотонному времени с включения, как и таймер: перевод часов его не меняет. Таймер, сработавший
+    /// на миллисекунды раньше (грубая гранулярность), взводится на остаток, а не теряется.
     /// </summary>
-    private void Expire(DateTimeOffset expected)
+    private void Expire(long generation)
     {
         lock (_lock)
         {
-            if (_until != expected)
+            if (_until is null || _generation != generation)
             {
                 return;
             }
 
-            if (expected > _time.GetUtcNow())
+            var left = _remainingAtApply - _time.GetElapsedTime(_appliedAt);
+            if (left > TimeSpan.Zero)
             {
                 _timer?.Dispose();
-                Arm(expected);
+                Arm(generation, left);
                 return;
             }
         }
 
-        Disable("срок истёк", expected);
+        Disable("срок истёк", generation);
+    }
+
+    private void Checkpoint(long generation)
+    {
+        lock (_lock)
+        {
+            if (_until is not null && _generation == generation)
+            {
+                TrySaveRemaining(Left());
+            }
+        }
+    }
+
+    private void TrySaveRemaining(TimeSpan? remaining)
+    {
+        try
+        {
+            _saveRemaining?.Invoke(remaining);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            // Без остатка в реестре после перезапуска действует срок по часам, как прежде.
+        }
     }
 
     private bool TrySave(DateTimeOffset? until)

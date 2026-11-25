@@ -89,11 +89,48 @@ public sealed class HelperContractTests
         Assert.Null(HelperContract.TryDeserializeEvent(Encoding.UTF8.GetBytes(json)));
     }
 
+    /// <summary>
+    /// Пароль команды Start — массив символов, а на проводе та же JSON-строка, что у прежнего string: помощник прежней
+    /// версии и новая служба понимают друг друга. Буфер кадра после Dispose затёрт.
+    /// </summary>
+    [Fact]
+    public void StartPassword_IsWireCompatibleString_AndFrameBufferIsCleared()
+    {
+        var password = "пароль \"с\" \\кавычками\u0001".ToCharArray();
+        var command = new StartCommand("https://x/", "g", "ua", true, null, "if", "user", password);
+        var frame = HelperContract.SerializeToBuffer(command);
+        var bytes = frame.Written.ToArray();
+
+        Assert.Equal(HelperContract.Serialize(command), bytes);
+        using (var document = System.Text.Json.JsonDocument.Parse(bytes))
+        {
+            Assert.Equal(new string(password), document.RootElement.GetProperty("password").GetString());
+        }
+
+        var parsed = Assert.IsType<StartCommand>(HelperContract.TryDeserializeCommand(bytes));
+        Assert.Equal(password, parsed.Password);
+
+        var written = System.Runtime.InteropServices.MemoryMarshal.TryGetArray(frame.Written, out var segment) ? segment.Array! : [];
+        frame.Dispose();
+        Assert.All(written, b => Assert.Equal(0, b));
+
+        var legacy = Encoding.UTF8.GetBytes("{\"type\":\"start\",\"gatewayUrl\":\"https://x/\",\"group\":\"\",\"userAgent\":\"ua\",\"useDtls\":true,\"interfaceName\":\"if\",\"password\":null}");
+        Assert.Null(Assert.IsType<StartCommand>(HelperContract.TryDeserializeCommand(legacy)).Password);
+    }
+
+    [Fact]
+    public void LargeFrame_GrowsWithoutLosingData()
+    {
+        var command = new FormReplyCommand(Guid.NewGuid(), new Dictionary<string, string> { ["answer"] = new string('x', 10_000) }, false);
+        using var frame = HelperContract.SerializeToBuffer(command);
+        Assert.Equal(HelperContract.Serialize(command), frame.Written.ToArray());
+    }
+
     [Fact]
     public void SecretCommands_DoNotExposeSecretsInToString()
     {
         Assert.DoesNotContain(Secret, new WebviewLoadCommand(Guid.NewGuid(), "https://x/", [new SsoCookie("acSamlv2Token", Secret)]).ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain(Secret, new StartCommand("https://x/", "", "ua", true, null, "if", "user", Secret).ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Secret, new StartCommand("https://x/", "", "ua", true, null, "if", "user", Secret.ToCharArray()).ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(Secret, new FormReplyCommand(Guid.NewGuid(), new Dictionary<string, string> { ["password"] = Secret }, false).ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(Secret, new SsoNavigationRequest(Guid.NewGuid(), Guid.NewGuid(), "https://x/", [new SsoCookie("t", Secret)]).ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(Secret, new SubmitAuthFormRequest(Guid.NewGuid(), Guid.NewGuid(), new Dictionary<string, string> { ["password"] = Secret }, false).ToString(), StringComparison.Ordinal);

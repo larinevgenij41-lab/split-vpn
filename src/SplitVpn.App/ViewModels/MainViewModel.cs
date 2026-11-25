@@ -571,6 +571,34 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
         StatusUpdated?.Invoke();
         _ = ShowWizardIfNeededAsync();
+        _ = PruneSignInProfilesOnceAsync();
+    }
+
+    private bool _signInProfilesPruned;
+
+    /// <summary>
+    /// Один раз за запуск, после того как служба отдала настройки: профили встроенного браузера (cookie и вход SSO)
+    /// подключений, которых в настройках больше нет, удаляются вне потока интерфейса. Настройки не получены — ничего
+    /// не удаляется, попытка повторится при следующем опросе.
+    /// </summary>
+    private async Task PruneSignInProfilesOnceAsync()
+    {
+        if (_signInProfilesPruned)
+        {
+            return;
+        }
+
+        _signInProfilesPruned = true;
+        try
+        {
+            var settings = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
+            var ids = settings.Profiles.Select(p => p.Id).ToHashSet();
+            await Task.Run(() => SplitVpn.Core.OpenConnect.SignInBrowserProfiles.Default.PruneOrphans(ids));
+        }
+        catch (Exception ex) when (ex is ServiceUnavailableException or ServiceCommandException)
+        {
+            _signInProfilesPruned = false;
+        }
     }
 
     private void UpdateVerboseBadge() =>

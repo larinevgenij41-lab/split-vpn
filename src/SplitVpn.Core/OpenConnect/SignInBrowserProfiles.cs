@@ -26,7 +26,12 @@ public sealed class SignInBrowserProfiles(string root)
     /// организации сохраняется. Если перенос не удался (профиль занят), общий профиль никому больше не достаётся —
     /// иначе cookie одной организации попали бы в профиль другой, — а удаляется при следующем входе.
     /// </summary>
-    public string Prepare(Guid profileId)
+    /// <param name="gatewayHost">
+    /// Шлюз, для которого открывается вход. Профиль помнит шлюз, для которого создан (<see cref="HostMarkerOf"/>): у
+    /// подключения сменили адрес на шлюз другой организации — прежний профиль (её cookie и вход SSO) сбрасывается.
+    /// null — шлюз не известен, профиль не сверяется.
+    /// </param>
+    public string Prepare(Guid profileId, string? gatewayHost = null)
     {
         RetryPendingDeletes();
         var folder = FolderOf(profileId);
@@ -34,9 +39,68 @@ public sealed class SignInBrowserProfiles(string root)
         {
             throw new IOException("Профиль браузера ожидает удаления. Закройте прежнее окно входа и повторите.");
         }
+
+        MigrateLegacy(folder);
+        if (!string.IsNullOrWhiteSpace(gatewayHost))
+        {
+            BindToHost(folder, HostMarkerOf(profileId), gatewayHost.Trim());
+        }
+
+        return folder;
+    }
+
+    /// <summary>Отметка шлюза профиля — рядом с каталогом, а не в нём: каталог целиком принадлежит браузеру.</summary>
+    public string HostMarkerOf(Guid profileId) => FolderOf(profileId) + ".host";
+
+    /// <summary>
+    /// Профиль привязывается к шлюзу. Отметки нет — профиль прежней версии или перенесённый общий: он остаётся (вход
+    /// организации сохраняется) и получает отметку. Отметка другого шлюза — каталог удаляется; не удалился (занят
+    /// прежним окном входа) — исключение: чужой вход в профиле не используется.
+    /// </summary>
+    private static void BindToHost(string folder, string marker, string host)
+    {
+        string? previous = null;
+        try
+        {
+            previous = File.Exists(marker) ? File.ReadAllText(marker).Trim() : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Verbose.Write("SignIn", "отметка шлюза профиля браузера не прочитана: " + ex.Message);
+            previous = "";
+        }
+
+        if (previous is not null && !string.Equals(previous, host, StringComparison.OrdinalIgnoreCase) && Directory.Exists(folder))
+        {
+            TryDelete(folder, "профиль браузера прежнего шлюза");
+            if (Directory.Exists(folder))
+            {
+                throw new IOException("Адрес шлюза изменился, а прежний профиль браузера не удаляется. Закройте прежнее окно входа и повторите.");
+            }
+        }
+
+        if (string.Equals(previous, host, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(marker)!);
+            File.WriteAllText(marker, host);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Без отметки профиль сверится при следующем входе: отсутствующая отметка его не сбрасывает.
+            Verbose.Write("SignIn", "отметка шлюза профиля браузера не записана: " + ex.Message);
+        }
+    }
+
+    private void MigrateLegacy(string folder)
+    {
         if (!Directory.Exists(LegacyFolder))
         {
-            return folder;
+            return;
         }
 
         if (!Directory.Exists(ProfilesFolder))
@@ -49,14 +113,14 @@ public sealed class SignInBrowserProfiles(string root)
             {
                 // Перенос не начинался и решится при следующем входе.
                 Verbose.Write("SignIn", "каталог профилей браузера не создан: " + ex.Message);
-                return folder;
+                return;
             }
 
             try
             {
                 Settings.FileRetry.Run(() => Directory.Move(LegacyFolder, folder), () => !Directory.Exists(folder));
                 Verbose.Write("SignIn", "общий профиль браузера прежней версии перенесён в профиль подключения");
-                return folder;
+                return;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -65,7 +129,66 @@ public sealed class SignInBrowserProfiles(string root)
         }
 
         TryDelete(LegacyFolder, "общий профиль браузера прежней версии");
-        return folder;
+    }
+
+    /// <summary>
+    /// Удаляет профили браузера подключений, которых нет в настройках: подключение удалил другой администратор, или
+    /// настройки заменены импортом. Вызывается только с успешно прочитанным списком подключений; пустой список не
+    /// применяется вовсе — так выглядели бы и настройки, сброшенные службой после сбоя чтения, а cookie входа лишь
+    /// пережили бы подключение. Возвращает число удалённых профилей.
+    /// </summary>
+    public int PruneOrphans(IReadOnlyCollection<Guid> existingProfiles)
+    {
+        ArgumentNullException.ThrowIfNull(existingProfiles);
+        if (existingProfiles.Count == 0 || !Directory.Exists(ProfilesFolder))
+        {
+            return 0;
+        }
+
+        var removed = 0;
+        try
+        {
+            foreach (var folder in Directory.EnumerateDirectories(ProfilesFolder))
+            {
+                if (!Guid.TryParseExact(Path.GetFileName(folder), "N", out var id) || existingProfiles.Contains(id))
+                {
+                    continue;
+                }
+
+                TryDelete(folder, "профиль браузера подключения, которого нет в настройках");
+                if (!Directory.Exists(folder))
+                {
+                    removed++;
+                }
+            }
+
+            foreach (var marker in Directory.EnumerateFiles(ProfilesFolder, "*.host"))
+            {
+                if (Guid.TryParseExact(Path.GetFileNameWithoutExtension(marker), "N", out var id) && !existingProfiles.Contains(id)
+                    && !Directory.Exists(FolderOf(id)))
+                {
+                    TryDeleteFile(marker);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Verbose.Write("SignIn", "профили браузера удалённых подключений не проверены: " + ex.Message);
+        }
+
+        return removed;
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Verbose.Write("SignIn", "отметка профиля браузера не удалена: " + ex.Message);
+        }
     }
 
     /// <summary>Подключение удалено: его профиль браузера (cookie и вход организации) больше не нужен.</summary>
@@ -93,6 +216,7 @@ public sealed class SignInBrowserProfiles(string root)
         var folder = FolderOf(id);
         TryDelete(folder, "профиль браузера удаленного подключения");
         if (Directory.Exists(folder)) { return; }
+        TryDeleteFile(HostMarkerOf(id));
         try { File.Delete(marker); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

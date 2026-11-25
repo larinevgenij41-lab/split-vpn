@@ -10,7 +10,7 @@ public sealed class OcSessionTests
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(10);
 
     private static StartCommand Start(string group = "", string? user = null, string? password = null) =>
-        new("https://avpn.example.org/", group, "AnyConnect Windows 4.10.06090", true, null, "SplitVpn AC 1", user, password);
+        new("https://avpn.example.org/", group, "AnyConnect Windows 4.10.06090", true, null, "SplitVpn AC 1", user, password?.ToCharArray());
 
     [Fact]
     public async Task Dispose_WaitsForAnInFlightCancelCommand()

@@ -190,14 +190,16 @@ public static class ServiceRecovery
             }
         }
 
-        var json = JsonSerializer.Serialize(report, JsonDefaults.Options);
-        Console.WriteLine(json);
-
         // Данные удаляются, только если сеть возвращена полностью (вместе с настройкой Wi-Fi Windows) и служба
         // подтверждённо остановлена: иначе копия исходных DNS ещё нужна повторному восстановлению, а работающая служба
         // осталась бы без данных. Каталог, который не удалось защитить, не удаляется рекурсивно.
         var trusted = system.Trusted;
         var cleanable = MayPurgeData(report, trusted, staleMarkCleared);
+
+        // Записи RAS (с ключами IPsec в хранилище RAS) удаляются при удалении программы всегда: каталог данных их не
+        // содержит, а служба после отменённого удаления создаёт их заново перед дозвоном. Экстренное отключение их не трогает.
+        var rasStep = RunUninstallStep(UninstallRasStep, "Записи RAS программы", () => DeleteRasEntries(paths.Phonebook));
+
         bool cleaned;
         if (mode == RecoveryMode.UninstallNetwork)
         {
@@ -208,6 +210,18 @@ public static class ServiceRecovery
         {
             cleaned = cleanable && (TryStep("данные", () => DeleteData(paths.Root)) & TryStep("реестр", DeleteRegistryKey));
         }
+
+        // Секреты не ждут полной очистки: без неё данные остаются (dns-backup.json нужен повторному восстановлению), но
+        // пароли, ключи IPsec и SSH в них оставались бы на диске после удаления программы. С разрешением на очистку их
+        // удалит установщик вместе с каталогом после фиксации удаления, и откаченное удаление вернёт программу с паролями.
+        var secretsStep = cleaned
+            ? new EmergencyStepReport(UninstallSecretsStep, SecretsStepTitle, EmergencyStepOutcome.Skipped,
+                mode == RecoveryMode.UninstallNetwork ? "удаляются вместе с данными после фиксации удаления" : "удалены вместе с данными", 0, Required: false)
+            : RunUninstallStep(UninstallSecretsStep, SecretsStepTitle, () => DeleteSecretFiles(paths.Root, HasTrustedOwner));
+        report = report with { Steps = [.. report.Steps, rasStep, secretsStep] };
+
+        var json = JsonSerializer.Serialize(report, JsonDefaults.Options);
+        Console.WriteLine(json);
 
         if (!cleaned)
         {
@@ -238,6 +252,113 @@ public static class ServiceRecovery
     /// </summary>
     public static string UninstallLogDirectory => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "SplitVpn.Uninstall");
+
+    /// <summary>Шаги удаления программы, которых нет у экстренного отключения: в отчёте «recover ‐‐uninstall-network».</summary>
+    internal const string UninstallRasStep = "uninstall-ras-entries";
+
+    internal const string UninstallSecretsStep = "uninstall-secrets";
+
+    private const string SecretsStepTitle = "Пароли и ключи на диске";
+
+    /// <summary>Основной файл паролей: ключи IPsec и SSH — рядом с ним (secrets.bin.ipsec, secrets.bin.sshkey).</summary>
+    internal const string SecretsFileName = "secrets.bin";
+
+    /// <summary>Шаг удаления с итогом в отчёте; необязательный — сеть он не касается и код команды не меняет.</summary>
+    private static EmergencyStepReport RunUninstallStep(string id, string title, Func<string> action)
+    {
+        var watch = Stopwatch.StartNew();
+        try
+        {
+            var detail = action();
+            return new EmergencyStepReport(id, title, EmergencyStepOutcome.Done, detail, watch.ElapsedMilliseconds, Required: false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException
+            or System.ComponentModel.Win32Exception or Windows.Native.NativeCallException)
+        {
+            Console.Error.WriteLine(title + ": " + ex.Message);
+            return new EmergencyStepReport(id, title, EmergencyStepOutcome.Failed, ex.Message, watch.ElapsedMilliseconds, Required: false);
+        }
+    }
+
+    /// <summary>
+    /// Файл с секретами программы: secrets.bin, его соседи .ipsec и .sshkey и копии всех трёх (.v095, .corrupt-*,
+    /// .undecryptable-*, недописанные .tmp атомарной записи) — всё, что начинается с «secrets.bin».
+    /// </summary>
+    internal static bool IsSecretFileName(string fileName) =>
+        string.Equals(fileName, SecretsFileName, StringComparison.OrdinalIgnoreCase)
+        || fileName.StartsWith(SecretsFileName + ".", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Удаляет файлы секретов прямо в каталоге данных (без обхода подкаталогов: перенесённое в сторону «.untrusted-*»
+    /// служба не читала). Каталог-ссылка или каталог посторонней учётной записи не трогается: удаление от SYSTEM ушло
+    /// бы туда, куда он указывает. Ссылка с именем секрета удаляется сама, не её цель. Возвращает итог для отчёта;
+    /// не удалось удалить хоть один файл — исключение с перечнем.
+    /// </summary>
+    internal static string DeleteSecretFiles(string root, Func<DirectoryInfo, bool> trustedOwner)
+    {
+        ArgumentNullException.ThrowIfNull(trustedOwner);
+        var directory = new DirectoryInfo(root);
+        if (!directory.Exists)
+        {
+            return "каталога данных нет";
+        }
+
+        if (directory.Attributes.HasFlag(FileAttributes.ReparsePoint) || !trustedOwner(directory))
+        {
+            throw new IOException($"Каталог данных {root} оказался ссылкой или принадлежит посторонней учётной записи: файлы паролей не удалены.");
+        }
+
+        var deleted = 0;
+        List<string> failed = [];
+        foreach (var file in directory.EnumerateFiles(SecretsFileName + "*"))
+        {
+            if (!IsSecretFileName(file.Name))
+            {
+                continue;
+            }
+
+            try
+            {
+                file.Attributes = FileAttributes.Normal;
+                file.Delete();
+                deleted++;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                failed.Add(file.Name + " (" + ex.Message + ")");
+            }
+        }
+
+        return failed.Count > 0
+            ? throw new IOException("Не удалены файлы паролей: " + string.Join("; ", failed))
+            : deleted == 0 ? "файлов паролей нет" : string.Create(CultureInfo.InvariantCulture, $"удалено файлов: {deleted}");
+    }
+
+    /// <summary>
+    /// Удаляет записи своей телефонной книги через RasDeleteEntry: вместе с записью RAS убирает и её учётные данные, в
+    /// том числе общий ключ IPsec (RasSetCredentials). Книга-ссылка не читается.
+    /// </summary>
+    private static string DeleteRasEntries(string phonebook)
+    {
+        var file = new FileInfo(phonebook);
+        if (!file.Exists)
+        {
+            return "телефонной книги нет";
+        }
+
+        if (file.Attributes.HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new IOException($"Телефонная книга {phonebook} оказалась ссылкой: записи не удалены.");
+        }
+
+        var names = Windows.Ras.RasPhonebook.EnumerateEntryNames(phonebook);
+        foreach (var name in names)
+        {
+            Windows.Ras.RasPhonebook.Delete(phonebook, name);
+        }
+
+        return string.Create(CultureInfo.InvariantCulture, $"удалено записей: {names.Count}");
+    }
 
     private static bool TryStep(string name, Action action)
     {

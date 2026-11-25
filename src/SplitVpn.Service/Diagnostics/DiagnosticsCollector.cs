@@ -27,6 +27,9 @@ public sealed class DiagnosticsCollector(ServicePaths paths, TimeProvider time, 
     public static readonly TimeSpan ServiceLogAge = TimeSpan.FromDays(7);
     public const long MaxServiceLogBytes = 60_000_000;
 
+    /// <summary>Записи подключения Wi-Fi в архиве: несколько файлов по пределу самописца, а не все двадцать.</summary>
+    public const long MaxWifiIncidentBytes = 8_000_000;
+
     /// <summary>Пределы на файлы из профиля пользователя: размер файла, число по шаблону, объём на профиль, время открытия.</summary>
     public const long MaxUserFileBytes = 20_000_000;
     public const int MaxUserFilesPerPattern = 4;
@@ -97,10 +100,21 @@ public sealed class DiagnosticsCollector(ServicePaths paths, TimeProvider time, 
             AddFile(zip, entries, problems, "logs/" + log.Name, log.FullName);
         }
 
-        // Записи подключения Wi-Fi малы (сотни строк), их не больше двадцати.
+        // Записи подключения Wi-Fi обычно малы (сотни строк), но мигающая связь даёт файлы до предела самописца: у них
+        // свой бюджет, новые — первыми.
+        long incidentTotal = 0;
+        var incidentsTruncated = false;
         foreach (var log in Newest(paths.Logs, Coordination.WifiIncidentRecorder.FilePattern, problems, cancellationToken))
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (incidentTotal + log.Length > MaxWifiIncidentBytes)
+            {
+                if (!incidentsTruncated) { problems.Add("logs: часть записей подключения Wi-Fi пропущена из-за ограничения размера"); }
+                incidentsTruncated = true;
+                continue;
+            }
+
+            incidentTotal += log.Length;
             AddFile(zip, entries, problems, "logs/" + log.Name, log.FullName);
         }
 

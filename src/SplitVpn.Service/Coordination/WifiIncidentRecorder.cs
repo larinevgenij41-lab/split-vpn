@@ -51,10 +51,21 @@ public sealed class WifiIncidentRecorder(string? directory, TimeProvider time, I
     /// <summary>Сколько файлов хранится: старые удаляются.</summary>
     internal const int KeptFiles = 20;
 
+    /// <summary>Предел одного файла: дальше запись продолжается в новом файле, старые удаляются по <see cref="KeptFiles"/>.</summary>
+    internal const long MaxFileBytes = 2 * 1024 * 1024;
+
+    /// <summary>
+    /// Дольше одно происшествие не продлевается: мигающая связь (признак каждые несколько минут) открывает новое — с
+    /// новым файлом и своей предысторией, — а не растит один файл бесконечно.
+    /// </summary>
+    internal static readonly TimeSpan MaxIncident = TimeSpan.FromMinutes(30);
+
     private readonly Lock _gate = new();
     private readonly Queue<(DateTimeOffset Time, string Text)> _lines = new();
     private string? _file;
     private DateTimeOffset _fileUntil;
+    private DateTimeOffset _incidentStarted;
+    private long _fileBytes;
     private bool _writeFailed;
 
     /// <summary>Файл текущего или последнего происшествия.</summary>
@@ -76,7 +87,7 @@ public sealed class WifiIncidentRecorder(string? directory, TimeProvider time, I
             {
                 if (now <= _fileUntil)
                 {
-                    Append(_file, Format(now, text) + Environment.NewLine);
+                    AppendFollowing(now, Format(now, text) + Environment.NewLine);
                 }
                 else
                 {
@@ -86,16 +97,20 @@ public sealed class WifiIncidentRecorder(string? directory, TimeProvider time, I
         }
     }
 
-    /// <summary>Windows начала восстановление Wi-Fi: накопленное пишется в файл, дальнейшее дописывается в него же.</summary>
+    /// <summary>
+    /// Windows начала восстановление Wi-Fi: накопленное пишется в файл, дальнейшее дописывается в него же. Повторный
+    /// признак продлевает запись, но не дальше <see cref="MaxIncident"/> от начала происшествия; позже — новое происшествие.
+    /// </summary>
     public void Trigger(string reason)
     {
         var now = time.GetUtcNow();
         lock (_gate)
         {
-            if (_file is not null && now <= _fileUntil)
+            if (_file is not null && now <= _fileUntil && now - _incidentStarted < MaxIncident)
             {
-                _fileUntil = now + Follow;
-                Append(_file, Format(now, "ПРИЗНАК: " + reason) + Environment.NewLine);
+                var limit = _incidentStarted + MaxIncident;
+                _fileUntil = now + Follow < limit ? now + Follow : limit;
+                AppendFollowing(now, Format(now, "ПРИЗНАК: " + reason) + Environment.NewLine);
                 return;
             }
 
@@ -104,8 +119,10 @@ public sealed class WifiIncidentRecorder(string? directory, TimeProvider time, I
                 return;
             }
 
-            _file = Path.Combine(directory, "wifi-incident-" + now.ToLocalTime().ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + ".log");
+            _file = NewFileName(now);
             _fileUntil = now + Follow;
+            _incidentStarted = now;
+            _fileBytes = 0;
             LastFile = _file;
             var text = new StringBuilder();
             text.AppendLine("Запись подключения Wi-Fi: Windows начала восстановление адаптера. Время местное.");
@@ -117,9 +134,44 @@ public sealed class WifiIncidentRecorder(string? directory, TimeProvider time, I
             }
 
             text.AppendLine("--- после признака");
-            Append(_file, text.ToString());
+            AppendFollowing(now, text.ToString());
             Prune();
         }
+    }
+
+    /// <summary>Новый файл с отметкой времени; занятое имя (два файла за секунду) получает номер.</summary>
+    private string NewFileName(DateTimeOffset now)
+    {
+        var stamp = "wifi-incident-" + now.ToLocalTime().ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+        var path = Path.Combine(directory!, stamp + ".log");
+        for (var n = 2; File.Exists(path) && n < 1000; n++)
+        {
+            path = Path.Combine(directory!, stamp + "-" + n.ToString(CultureInfo.InvariantCulture) + ".log");
+        }
+
+        return path;
+    }
+
+    /// <summary>
+    /// Дописывает в файл происшествия; на пределе <see cref="MaxFileBytes"/> запись продолжается в новом файле (то же
+    /// происшествие, тот же срок), а старые файлы удаляются по <see cref="KeptFiles"/>.
+    /// </summary>
+    private void AppendFollowing(DateTimeOffset now, string text)
+    {
+        var bytes = Encoding.UTF8.GetByteCount(text);
+        if (_fileBytes > 0 && _fileBytes + bytes > MaxFileBytes)
+        {
+            _file = NewFileName(now);
+            LastFile = _file;
+            _fileBytes = 0;
+            var header = "Продолжение записи подключения Wi-Fi: прежний файл достиг " + (MaxFileBytes / 1024 / 1024).ToString(CultureInfo.InvariantCulture) + " МБ." + Environment.NewLine;
+            _fileBytes += Encoding.UTF8.GetByteCount(header);
+            Append(_file, header);
+            Prune();
+        }
+
+        _fileBytes += bytes;
+        Append(_file!, text);
     }
 
     /// <summary>Накопленные строки: для испытаний и архива разбора.</summary>

@@ -103,4 +103,72 @@ public sealed class SignInBrowserProfilesTests : IDisposable
         Assert.False(Directory.Exists(_profiles.FolderOf(_first)));
         Assert.True(Directory.Exists(_profiles.FolderOf(_second)));
     }
+
+    private void CreateCookies(Guid id) =>
+        File.WriteAllText(Path.Combine(Directory.CreateDirectory(_profiles.FolderOf(id)).FullName, "Cookies"), "idp");
+
+    /// <summary>Профиль прежней версии без отметки шлюза сохраняется и получает отметку; тот же шлюз — тоже сохраняется.</summary>
+    [Fact]
+    public void Prepare_SameOrUnknownHost_KeepsProfile()
+    {
+        CreateCookies(_first);
+
+        _profiles.Prepare(_first, "vpn.org-a.example");
+        _profiles.Prepare(_first, "VPN.org-a.example");
+
+        Assert.True(File.Exists(Path.Combine(_profiles.FolderOf(_first), "Cookies")));
+        Assert.Equal("vpn.org-a.example", File.ReadAllText(_profiles.HostMarkerOf(_first)));
+    }
+
+    /// <summary>Адрес шлюза сменили на другую организацию: её вход не наследует cookie прежней.</summary>
+    [Fact]
+    public void Prepare_OtherHost_ResetsProfile()
+    {
+        CreateCookies(_first);
+        _profiles.Prepare(_first, "vpn.org-a.example");
+
+        _profiles.Prepare(_first, "vpn.org-b.example");
+
+        Assert.False(Directory.Exists(_profiles.FolderOf(_first)));
+        Assert.Equal("vpn.org-b.example", File.ReadAllText(_profiles.HostMarkerOf(_first)));
+    }
+
+    [Fact]
+    public void Prepare_OtherHost_BusyProfileIsNotReused()
+    {
+        CreateCookies(_first);
+        _profiles.Prepare(_first, "vpn.org-a.example");
+        using (File.Open(Path.Combine(_profiles.FolderOf(_first), "Cookies"), FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            Assert.Throws<IOException>(() => _profiles.Prepare(_first, "vpn.org-b.example"));
+        }
+
+        Assert.Equal("vpn.org-a.example", File.ReadAllText(_profiles.HostMarkerOf(_first)));
+    }
+
+    [Fact]
+    public void PruneOrphans_DeletesOnlyProfilesMissingFromSettings()
+    {
+        CreateCookies(_first);
+        CreateCookies(_second);
+        _profiles.Prepare(_second, "vpn.org-b.example");
+        Directory.CreateDirectory(Path.Combine(_profiles.ProfilesFolder, "not-a-guid"));
+
+        Assert.Equal(1, _profiles.PruneOrphans([_first]));
+
+        Assert.True(Directory.Exists(_profiles.FolderOf(_first)));
+        Assert.False(Directory.Exists(_profiles.FolderOf(_second)));
+        Assert.False(File.Exists(_profiles.HostMarkerOf(_second)));
+        Assert.True(Directory.Exists(Path.Combine(_profiles.ProfilesFolder, "not-a-guid")));
+    }
+
+    /// <summary>Пустой список подключений не применяется: так выглядели бы и сброшенные после сбоя чтения настройки.</summary>
+    [Fact]
+    public void PruneOrphans_EmptySettings_DeletesNothing()
+    {
+        CreateCookies(_first);
+
+        Assert.Equal(0, _profiles.PruneOrphans([]));
+        Assert.True(Directory.Exists(_profiles.FolderOf(_first)));
+    }
 }

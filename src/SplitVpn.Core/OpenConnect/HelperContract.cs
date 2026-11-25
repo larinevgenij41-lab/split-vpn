@@ -19,6 +19,35 @@ public static class HelperContract
 
     public static byte[] Serialize(HelperCommand command) => JsonSerializer.SerializeToUtf8Bytes(command, JsonDefaults.Compact);
 
+    /// <summary>
+    /// Команда в UTF-8 в очищаемом буфере: кадр с паролем (<see cref="StartCommand"/>) не остаётся в куче копией,
+    /// которую нельзя очистить. Буфер затирает Dispose — после записи в трубу. Формат тот же, что у <see cref="Serialize(HelperCommand)"/>.
+    /// </summary>
+    public static SerializedFrame SerializeToBuffer(HelperCommand command)
+    {
+        var frame = new SerializedFrame();
+        try
+        {
+            // Те же кодировщик и отступы, что у SerializeToUtf8Bytes: байты кадра совпадают с прежними.
+            using (var writer = new Utf8JsonWriter(frame, new JsonWriterOptions
+            {
+                Encoder = JsonDefaults.Compact.Encoder,
+                Indented = JsonDefaults.Compact.WriteIndented,
+                MaxDepth = JsonDefaults.Compact.MaxDepth,
+            }))
+            {
+                JsonSerializer.Serialize(writer, command, JsonDefaults.Compact);
+            }
+
+            return frame;
+        }
+        catch
+        {
+            frame.Dispose();
+            throw;
+        }
+    }
+
     public static byte[] Serialize(HelperEvent helperEvent) => JsonSerializer.SerializeToUtf8Bytes(helperEvent, JsonDefaults.Compact);
 
     /// <summary>Разбирает команду службы; неизвестный тип и неверный JSON дают null.</summary>
@@ -38,6 +67,101 @@ public static class HelperContract
         {
             return null;
         }
+    }
+}
+
+/// <summary>
+/// Буфер кадра, который очищается: при росте прежний массив затирается, Dispose затирает текущий. Для кадров с
+/// секретами (<see cref="HelperContract.SerializeToBuffer"/>).
+/// </summary>
+public sealed class SerializedFrame : System.Buffers.IBufferWriter<byte>, IDisposable
+{
+    private byte[] _buffer = new byte[1024];
+    private int _written;
+
+    /// <summary>Записанные байты; после Dispose — пусто.</summary>
+    public ReadOnlyMemory<byte> Written => _buffer.AsMemory(0, _written);
+
+    public void Advance(int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (_written + count > _buffer.Length)
+        {
+            throw new InvalidOperationException("Запись за пределами буфера кадра.");
+        }
+
+        _written += count;
+    }
+
+    public Memory<byte> GetMemory(int sizeHint = 0)
+    {
+        Ensure(sizeHint);
+        return _buffer.AsMemory(_written);
+    }
+
+    public Span<byte> GetSpan(int sizeHint = 0)
+    {
+        Ensure(sizeHint);
+        return _buffer.AsSpan(_written);
+    }
+
+    private void Ensure(int sizeHint)
+    {
+        var needed = Math.Max(sizeHint, 1);
+        if (_buffer.Length - _written >= needed)
+        {
+            return;
+        }
+
+        var grown = new byte[Math.Max(_buffer.Length * 2, _written + needed)];
+        _buffer.AsSpan(0, _written).CopyTo(grown);
+        Array.Clear(_buffer);
+        _buffer = grown;
+    }
+
+    public void Dispose()
+    {
+        Array.Clear(_buffer);
+        _written = 0;
+    }
+}
+
+/// <summary>
+/// Секрет как массив символов в JSON-строке: на проводе — та же строка, что и у string, но в памяти — массив,
+/// который владелец очищает после использования. Промежуточный буфер чтения очищается.
+/// </summary>
+public sealed class SecretCharsJsonConverter : JsonConverter<char[]>
+{
+    public override char[]? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.Null)
+        {
+            return null;
+        }
+
+        if (reader.TokenType != JsonTokenType.String)
+        {
+            throw new JsonException("Ожидалась строка.");
+        }
+
+        // Символов UTF-16 не больше, чем байтов UTF-8 в записи (экранирование только удлиняет запись).
+        var max = checked((int)(reader.HasValueSequence ? reader.ValueSequence.Length : reader.ValueSpan.Length));
+        var scratch = new char[max];
+        try
+        {
+            var length = reader.CopyString(scratch);
+            return scratch.AsSpan(0, length).ToArray();
+        }
+        finally
+        {
+            Array.Clear(scratch);
+        }
+    }
+
+    public override void Write(Utf8JsonWriter writer, char[] value, JsonSerializerOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        writer.WriteStringValue(value);
     }
 }
 
@@ -195,7 +319,7 @@ public sealed record StartCommand(
     string? CertificateThumbprint,
     string InterfaceName,
     string? UserName,
-    string? Password) : HelperCommand
+    [property: JsonConverter(typeof(SecretCharsJsonConverter))] char[]? Password) : HelperCommand
 {
     public override string ToString() => $"StartCommand {{ GatewayUrl = {GatewayUrl}, Group = {Group}, InterfaceName = {InterfaceName}, Password = {(Password is null ? "null" : "***")} }}";
 }

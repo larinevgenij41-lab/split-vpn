@@ -183,6 +183,61 @@ public sealed partial class CoordinatorTests
         }
     }
 
+    /// <summary>Файл не растёт сверх предела: запись продолжается в новом файле, старые удаляются по числу.</summary>
+    [Fact]
+    public void Recorder_RotatesFileAtSizeLimit()
+    {
+        var folder = Directory.CreateTempSubdirectory("splitvpn-wifi-").FullName;
+        try
+        {
+            var time = new FakeTimeProvider(new DateTimeOffset(2026, 11, 21, 12, 0, 0, TimeSpan.Zero));
+            var recorder = new WifiIncidentRecorder(folder, time, NullLogger.Instance);
+            recorder.Trigger("причина");
+            var first = recorder.LastFile!;
+            var line = new string('x', 64 * 1024);
+            for (var i = 0; i < 40; i++)
+            {
+                recorder.Note(line);
+            }
+
+            var files = Directory.GetFiles(folder, WifiIncidentRecorder.FilePattern);
+            Assert.True(files.Length >= 2);
+            Assert.NotEqual(first, recorder.LastFile);
+            Assert.All(files, f => Assert.True(new FileInfo(f).Length <= WifiIncidentRecorder.MaxFileBytes + 16));
+            Assert.Contains("Продолжение записи", File.ReadAllText(recorder.LastFile!), StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(folder, recursive: true);
+        }
+    }
+
+    /// <summary>Мигающая связь продлевает запись не дольше предела происшествия: дальше — новое происшествие и новый файл.</summary>
+    [Fact]
+    public void Recorder_FlappingLink_OpensNewIncidentAfterMaximum()
+    {
+        var folder = Directory.CreateTempSubdirectory("splitvpn-wifi-").FullName;
+        try
+        {
+            var time = new FakeTimeProvider(new DateTimeOffset(2026, 11, 21, 12, 0, 0, TimeSpan.Zero));
+            var recorder = new WifiIncidentRecorder(folder, time, NullLogger.Instance);
+            recorder.Trigger("первый");
+            var first = recorder.LastFile;
+            for (var elapsed = TimeSpan.Zero; elapsed < WifiIncidentRecorder.MaxIncident; elapsed += TimeSpan.FromMinutes(3))
+            {
+                time.Advance(TimeSpan.FromMinutes(3));
+                recorder.Trigger("снова");
+            }
+
+            Assert.NotEqual(first, recorder.LastFile);
+            Assert.Contains("Признак: снова", File.ReadAllText(recorder.LastFile!), StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(folder, recursive: true);
+        }
+    }
+
     [Fact]
     public void WifiEventWatcher_ParsesInterfaceAndReason()
     {

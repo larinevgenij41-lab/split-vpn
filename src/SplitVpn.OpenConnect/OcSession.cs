@@ -699,11 +699,15 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
                     field.Set(_start.UserName);
                     break;
                 // Сохранённый пароль предлагается один раз и только без ошибки: неверный пароль не повторяется по кругу.
-                case OcFieldKind.Password when IsPrimaryPassword(form, field) && !_passwordOffered && form.Error is null && !string.IsNullOrEmpty(_start!.Password):
-                    RememberSecret(_start.Password);
-                    field.Set(_start.Password);
+                case OcFieldKind.Password when IsPrimaryPassword(form, field) && !_passwordOffered && form.Error is null && _start!.Password is { Length: > 0 }:
+                {
+                    // Библиотеке и списку скрываемых в журнале значений нужна строка: помощник живёт один сеанс.
+                    var savedPassword = new string(_start.Password);
+                    RememberSecret(savedPassword);
+                    field.Set(savedPassword);
                     _passwordOffered = true;
                     break;
+                }
                 case OcFieldKind.Text or OcFieldKind.Password or OcFieldKind.Select:
                     missing.Add(field);
                     break;

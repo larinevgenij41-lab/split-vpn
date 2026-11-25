@@ -30,7 +30,8 @@ var dataWarnings = SecretStore.SecureDataRoot(paths.Root);
 // Подробный журнал: срок читается из реестра до создания журнала, поэтому включённый режим
 // действует с первой строки после перезапуска службы или перезагрузки.
 var levelSwitch = new Serilog.Core.LoggingLevelSwitch();
-var verbose = new VerboseMode(levelSwitch, TimeProvider.System, VerboseRegistry.ReadRaw, VerboseRegistry.Write, paths.Logs);
+var verbose = new VerboseMode(levelSwitch, TimeProvider.System, VerboseRegistry.ReadRaw, VerboseRegistry.Write, paths.Logs,
+    VerboseRegistry.ReadRemainingRaw, VerboseRegistry.WriteRemaining);
 verbose.Initialize();
 Log.Logger = ServiceLogging.Create(paths.Logs, levelSwitch);
 Verbose.Sink = ServiceLogging.VerboseSink(Log.Logger);

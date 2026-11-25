@@ -48,6 +48,52 @@ public static class VerboseRegistry
     [SupportedOSPlatform("windows")]
     public static DateTimeOffset? Read(DateTimeOffset now) => Effective(ReadRaw(), now);
 
+    /// <summary>
+    /// Остаток срока в секундах по монотонному времени службы: его служба записывает при включении, периодически и при
+    /// остановке. Срок по часам (<see cref="ValueName"/>) после перевода часов назад вырос бы, остаток — нет.
+    /// </summary>
+    public const string RemainingValueName = "VerboseRemainingSeconds";
+
+    /// <summary>Остаток срока; null — не записан или неразборчив.</summary>
+    public static TimeSpan? ParseRemaining(string? stored) =>
+        long.TryParse(stored, NumberStyles.None, CultureInfo.InvariantCulture, out var seconds) && seconds <= (long)MaxDuration.TotalSeconds
+            ? TimeSpan.FromSeconds(seconds)
+            : null;
+
+    public static string FormatRemaining(TimeSpan remaining) =>
+        ((long)Math.Ceiling(Math.Max(0, remaining.TotalSeconds))).ToString(CultureInfo.InvariantCulture);
+
+    [SupportedOSPlatform("windows")]
+    public static string? ReadRemainingRaw()
+    {
+        try
+        {
+            using var root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+            using var key = root.OpenSubKey(IpcNames.RegistryKey);
+            return key?.GetValue(RemainingValueName) as string;
+        }
+        catch (Exception ex) when (ex is System.Security.SecurityException or IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Записать остаток срока; null удаляет значение. Только для службы.</summary>
+    [SupportedOSPlatform("windows")]
+    public static void WriteRemaining(TimeSpan? remaining)
+    {
+        using var root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+        using var key = root.CreateSubKey(IpcNames.RegistryKey, writable: true);
+        if (remaining is { } value)
+        {
+            key.SetValue(RemainingValueName, FormatRemaining(value), RegistryValueKind.String);
+        }
+        else
+        {
+            key.DeleteValue(RemainingValueName, throwOnMissingValue: false);
+        }
+    }
+
     /// <summary>Записать срок; null удаляет значение. Только для службы.</summary>
     [SupportedOSPlatform("windows")]
     public static void Write(DateTimeOffset? until)

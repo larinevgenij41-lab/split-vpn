@@ -75,7 +75,7 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
     {
         try
         {
-            var userDataFolder = SignInBrowserProfiles.Default.Prepare(_profileId);
+            var userDataFolder = SignInBrowserProfiles.Default.Prepare(_profileId, _prompt.GatewayHost);
             var environment = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
             Verbose.Write("SignIn", $"браузер: WebView2 {environment.BrowserVersionString}, профиль {userDataFolder}");
             await Browser.EnsureCoreWebView2Async(environment);

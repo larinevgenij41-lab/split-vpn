@@ -326,6 +326,8 @@ public sealed partial class Coordinator
 
     internal void Journal(string level, string text)
     {
+        // Тексты событий несут сообщения шлюзов, систем и помощников: одной строкой и без управляющих символов.
+        text = Core.Diagnostics.LogText.SingleLine(text);
         _deps.Journal.Add(level, text);
         _wifiRecorder?.Note(text);
         _deps.Logger.Log(level is "Ошибка" or "Предупреждение" ? LogLevel.Warning : LogLevel.Information, "{Event}", text);

@@ -221,7 +221,7 @@ public sealed partial class CoordinatorTests
 
         var session = Assert.Single(_world.AnyConnect.Sessions);
         var start = Assert.IsType<StartCommand>(session.Commands[0]);
-        Assert.Equal("secret", start.Password);
+        Assert.Equal("secret", new string(start.Password));
     }
 
     /// <summary>S-8: снимок сети при остановке падает не IOException - помощник всё равно получает Stop.</summary>

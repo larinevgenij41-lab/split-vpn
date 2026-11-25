@@ -24,10 +24,16 @@ public static class FrameCodec
     /// </summary>
     public static bool Fits(IpcRequest request) => IpcSerializer.SerializeRequest(request).Length <= MaxFrameBytes;
 
-    public static async Task WriteAsync(Stream stream, byte[] payload, CancellationToken cancellationToken)
+    public static Task WriteAsync(Stream stream, byte[] payload, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(payload);
+        return WriteAsync(stream, payload.AsMemory(), cancellationToken);
+    }
+
+    /// <summary>Кадр из чужого буфера (например, очищаемого после записи кадра с секретом).</summary>
+    public static async Task WriteAsync(Stream stream, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        ArgumentNullException.ThrowIfNull(payload);
         if (payload.Length > MaxFrameBytes)
         {
             throw new IpcProtocolException("Сообщение превышает допустимый размер.");

@@ -25,6 +25,9 @@ public static class UiVerbose
     {
         _log = new RollingTextLog(LogPath, TimeProvider.System);
         Verbose.Sink = _log.Write;
+
+        // Отдельные файлы копий, которым общий мьютекс журнала был недоступен (ui-verbose.<pid>.log), иначе копятся.
+        _ = Task.Run(() => RollingTextLog.PruneProcessFiles(LogPath, TimeSpan.FromDays(7), TimeProvider.System));
         RefreshFromRegistry(force: true);
     }
 

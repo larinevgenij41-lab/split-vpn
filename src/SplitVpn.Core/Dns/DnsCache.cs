@@ -25,10 +25,16 @@ public sealed class DnsCache
     private readonly Dictionary<string, PinnedEntry> _pinned = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>CNAME-связи: каноническое имя → суффикс правила исходного имени и срок связи.</summary>
-    private sealed record CanonicalLease(string Suffix, string Origin, DateTimeOffset ExpiresUtc, Guid? LeaseId);
+    private sealed record CanonicalLease(string Suffix, string Origin, TimeSpan ExpiresAt, Guid? LeaseId);
     private readonly Dictionary<string, List<CanonicalLease>> _links = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<Guid, string[]> _linkReservations = [];
     private readonly TimeProvider _time;
+
+    /// <summary>
+    /// Начало монотонного отсчёта: сроки закреплений и CNAME-связей — по нему, как и возраст записей кеша. Перевод
+    /// системных часов (синхронизация после сна, ручная правка) не продлевает и не обрывает их.
+    /// </summary>
+    private readonly long _origin;
     private readonly int _capacity;
     private readonly Lock _lock = new();
     private long _generation;
@@ -36,6 +42,7 @@ public sealed class DnsCache
     public DnsCache(TimeProvider time, int capacity = 10_000)
     {
         _time = time;
+        _origin = time.GetTimestamp();
         _capacity = capacity;
     }
 
@@ -61,11 +68,11 @@ public sealed class DnsCache
 
         lock (_lock)
         {
-            var now = _time.GetUtcNow();
+            var now = Now();
             RemoveExpiredPins(now);
             var key = Normalize(name);
             // Временный запрос к тому же узлу не сокращает жизнь закрепления VPN-сервера.
-            var permanent = lifetime is null || (_pinned.TryGetValue(key, out var existing) && existing.ExpiresUtc is null);
+            var permanent = lifetime is null || (_pinned.TryGetValue(key, out var existing) && existing.ExpiresAt is null);
             _pinned[key] = new PinnedEntry(addresses.ToArray(), permanent ? null : now + lifetime!.Value);
         }
     }
@@ -77,17 +84,20 @@ public sealed class DnsCache
         var keep = permanentNames.Select(Normalize).ToHashSet(StringComparer.OrdinalIgnoreCase);
         lock (_lock)
         {
-            RemoveExpiredPins(_time.GetUtcNow());
-            foreach (var name in _pinned.Where(p => p.Value.ExpiresUtc is null && !keep.Contains(p.Key)).Select(p => p.Key).ToArray())
+            RemoveExpiredPins(Now());
+            foreach (var name in _pinned.Where(p => p.Value.ExpiresAt is null && !keep.Contains(p.Key)).Select(p => p.Key).ToArray())
             {
                 _pinned.Remove(name);
             }
         }
     }
 
-    private void RemoveExpiredPins(DateTimeOffset now)
+    /// <summary>Монотонное время с создания кеша.</summary>
+    private TimeSpan Now() => _time.GetElapsedTime(_origin);
+
+    private void RemoveExpiredPins(TimeSpan now)
     {
-        foreach (var name in _pinned.Where(p => p.Value.ExpiresUtc <= now).Select(p => p.Key).ToArray())
+        foreach (var name in _pinned.Where(p => p.Value.ExpiresAt <= now).Select(p => p.Key).ToArray())
         {
             _pinned.Remove(name);
         }
@@ -110,10 +120,11 @@ public sealed class DnsCache
             var key = Normalize(name);
             if (_pinned.TryGetValue(key, out var entry))
             {
-                if (entry.ExpiresUtc is null || entry.ExpiresUtc > _time.GetUtcNow())
+                var now = Now();
+                if (entry.ExpiresAt is null || entry.ExpiresAt > now)
                 {
                     addresses = entry.Addresses;
-                    remaining = entry.ExpiresUtc - _time.GetUtcNow();
+                    remaining = entry.ExpiresAt - now;
                     return true;
                 }
 
@@ -148,7 +159,7 @@ public sealed class DnsCache
         if (uniqueOrigins.Length > 256) { return false; }
         lock (_lock)
         {
-            var now = _time.GetUtcNow();
+            var now = Now();
             foreach (var key in keys) { RemoveExpiredLink(key, now); }
             if (_links.Count + keys.Count(k => !_links.ContainsKey(k)) > _capacity) { RemoveExpiredLinks(now); }
             if (_links.Count + keys.Count(k => !_links.ContainsKey(k)) > _capacity
@@ -185,7 +196,7 @@ public sealed class DnsCache
         lock (_lock)
         {
             if (!_linkReservations.Remove(leaseId, out var keys)) { return; }
-            var now = _time.GetUtcNow();
+            var now = Now();
             foreach (var key in keys)
             {
                 if (!_links.TryGetValue(key, out var owners)) { continue; }
@@ -194,9 +205,9 @@ public sealed class DnsCache
                 foreach (var lease in accepted ? pending : [])
                 {
                     var existing = owners.Find(o => o.LeaseId is null && o.Suffix == lease.Suffix && o.Origin == lease.Origin);
-                    var expires = existing is null || existing.ExpiresUtc < lease.ExpiresUtc ? lease.ExpiresUtc : existing.ExpiresUtc;
+                    var expires = existing is null || existing.ExpiresAt < lease.ExpiresAt ? lease.ExpiresAt : existing.ExpiresAt;
                     owners.RemoveAll(o => o.LeaseId is null && o.Suffix == lease.Suffix && o.Origin == lease.Origin);
-                    owners.Add(lease with { ExpiresUtc = expires, LeaseId = null });
+                    owners.Add(lease with { ExpiresAt = expires, LeaseId = null });
                 }
                 RemoveExpiredLink(key, now);
             }
@@ -217,12 +228,12 @@ public sealed class DnsCache
         lock (_lock)
         {
             if (!_links.TryGetValue(Normalize(name), out var owners)) { return []; }
-            var now = _time.GetUtcNow();
-            return owners.Where(o => o.LeaseId is null && o.ExpiresUtc > now).Select(o => (o.Suffix, o.Origin)).ToArray();
+            var now = Now();
+            return owners.Where(o => o.LeaseId is null && o.ExpiresAt > now).Select(o => (o.Suffix, o.Origin)).ToArray();
         }
     }
 
-    private void RemoveExpiredLinks(DateTimeOffset now)
+    private void RemoveExpiredLinks(TimeSpan now)
     {
         foreach (var key in _links.Keys.ToArray())
         {
@@ -230,10 +241,10 @@ public sealed class DnsCache
         }
     }
 
-    private void RemoveExpiredLink(string key, DateTimeOffset now)
+    private void RemoveExpiredLink(string key, TimeSpan now)
     {
         if (!_links.TryGetValue(key, out var owners)) { return; }
-        owners.RemoveAll(o => o.ExpiresUtc <= now);
+        owners.RemoveAll(o => o.ExpiresAt <= now);
         if (owners.Count == 0) { _links.Remove(key); }
     }
 
@@ -383,9 +394,9 @@ public sealed class DnsCache
             _byQuestion.Clear();
             // Клиенты ещё используют выданные CNAME. Связь хранит суффикс, а путь и цель
             // выбираются по действующей конфигурации, без сохранения старого DNS-ответа.
-            RemoveExpiredLinks(_time.GetUtcNow());
+            RemoveExpiredLinks(Now());
             // Служебный ответ прежнего пути тоже не должен обходить новую доменную политику.
-            foreach (var name in _pinned.Where(p => p.Value.ExpiresUtc is not null).Select(p => p.Key).ToArray())
+            foreach (var name in _pinned.Where(p => p.Value.ExpiresAt is not null).Select(p => p.Key).ToArray())
             {
                 _pinned.Remove(name);
             }
@@ -439,5 +450,5 @@ public sealed class DnsCache
     private readonly record struct Entry(byte[] Response, long Stored, TimeSpan Lifetime,
         LinkedListNode<(string Name, ushort Type, DnsQueryFlags Flags, string Context)> Order);
 
-    private readonly record struct PinnedEntry(IReadOnlyList<uint> Addresses, DateTimeOffset? ExpiresUtc);
+    private readonly record struct PinnedEntry(IReadOnlyList<uint> Addresses, TimeSpan? ExpiresAt);
 }

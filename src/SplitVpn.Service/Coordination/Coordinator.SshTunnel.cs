@@ -183,7 +183,7 @@ public sealed partial class Coordinator
                     if (!detailed || _deps.Verbose?.UntilUtc > _deps.Time.GetUtcNow())
                     {
                         _deps.Logger.Log(detailed ? LogLevel.Debug : LogLevel.Warning,
-                            "Движок SSH {Name}: {Text}", profile.Name, Redactor.Redact(log.Line, personalValues));
+                            "Движок SSH {Name}: {Text}", profile.Name, Core.Diagnostics.LogText.SingleLine(Redactor.Redact(log.Line, personalValues)));
                     }
 
                     if (SshEngineLog.Classify(log.Line) == SshEngineFailure.None

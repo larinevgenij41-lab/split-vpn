@@ -189,22 +189,57 @@ public sealed class VerboseModeTests : IDisposable
         Assert.DoesNotContain("GetStatus", main, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void TimerFiringBeforeWallClockTermIsRearmed()
+    /// <summary>
+    /// Срок идёт по монотонному времени: часы, переведённые после включения назад (W32Time, ручная правка) или вперёд,
+    /// не продлевают и не обрывают режим — он гаснет ровно через запрошенный срок.
+    /// </summary>
+    [Theory]
+    [InlineData(-3)]
+    [InlineData(-7200)]
+    [InlineData(7200)]
+    public void ClockJumpAfterEnable_DoesNotChangeTerm(int lagSeconds)
     {
-        // После включения часы подвели назад на 3 мс (W32Time): таймер срабатывает «раньше срока».
         var lagging = new LaggingTime(_time);
         using var mode = new VerboseMode(_level, lagging, () => _stored, until => _stored = until is { } value ? VerboseRegistry.Format(value) : null, _logs);
         mode.Initialize();
         mode.Enable(TimeSpan.FromHours(1));
-        lagging.Lag = TimeSpan.FromMilliseconds(3);
+        lagging.Lag = TimeSpan.FromSeconds(lagSeconds);
 
-        _time.Advance(TimeSpan.FromHours(1));
+        _time.Advance(TimeSpan.FromHours(1) - TimeSpan.FromMilliseconds(1));
         Assert.True(Verbose.IsOn);
+        Assert.Equal(lagging.GetUtcNow() + TimeSpan.FromMilliseconds(1), mode.UntilUtc);
 
-        _time.Advance(TimeSpan.FromMilliseconds(5));
+        _time.Advance(TimeSpan.FromMilliseconds(1));
         Assert.False(Verbose.IsOn);
         Assert.Null(mode.UntilUtc);
+    }
+
+    /// <summary>
+    /// Часы перевели назад, пока служба не работала: срок по часам вырос бы, но записанный остаток его ограничивает.
+    /// </summary>
+    [Fact]
+    public void ClockMovedBackWhileStopped_TermIsCappedByStoredRemaining()
+    {
+        string? remaining = null;
+        var first = new VerboseMode(_level, _time, () => _stored, until => _stored = until is { } value ? VerboseRegistry.Format(value) : null, _logs,
+            () => remaining, value => remaining = value is { } left ? VerboseRegistry.FormatRemaining(left) : null);
+        first.Initialize();
+        first.Enable(TimeSpan.FromHours(1));
+        _time.Advance(TimeSpan.FromMinutes(40));
+        first.Dispose();
+        Assert.Equal("1200", remaining);
+
+        // Часы ушли на 2 часа назад: по ним до срока 2 ч 20 мин.
+        var lagging = new LaggingTime(_time) { Lag = TimeSpan.FromHours(2) };
+        using var second = new VerboseMode(_level, lagging, () => _stored, until => _stored = until is { } value ? VerboseRegistry.Format(value) : null, _logs,
+            () => remaining, value => remaining = value is { } left ? VerboseRegistry.FormatRemaining(left) : null);
+        second.Initialize();
+
+        Assert.Equal(lagging.GetUtcNow() + TimeSpan.FromMinutes(20), second.UntilUtc);
+        Assert.Equal(VerboseRegistry.Format(lagging.GetUtcNow() + TimeSpan.FromMinutes(20)), _stored);
+        _time.Advance(TimeSpan.FromMinutes(20));
+        Assert.False(Verbose.IsOn);
+        Assert.Null(remaining);
     }
 
     [Fact]
@@ -283,6 +318,11 @@ public sealed class VerboseModeTests : IDisposable
         public TimeSpan Lag { get; set; }
 
         public override DateTimeOffset GetUtcNow() => inner.GetUtcNow() - Lag;
+
+        // Монотонное время — исходного провайдера: перевод часов его не касается.
+        public override long GetTimestamp() => inner.GetTimestamp();
+
+        public override long TimestampFrequency => inner.TimestampFrequency;
 
         public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) =>
             inner.CreateTimer(callback, state, dueTime, period);

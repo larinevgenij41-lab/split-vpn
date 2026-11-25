@@ -61,17 +61,18 @@ public sealed class SerilogTraceListener(ILogger logger) : TraceListener
 {
     private readonly ILogger _logger = logger.ForContext(Constants.SourceContextPropertyName, "SplitVpn.Trace");
 
-    public override void Write(string? message) => _logger.Debug("{Text}", message);
+    // Сообщения Trace несут тексты системы и чужих процессов: одной строкой, без управляющих символов (LogText.SingleLine).
+    public override void Write(string? message) => _logger.Debug("{Text}", SplitVpn.Core.Diagnostics.LogText.SingleLine(message));
 
-    public override void WriteLine(string? message) => _logger.Debug("{Text}", message);
+    public override void WriteLine(string? message) => _logger.Debug("{Text}", SplitVpn.Core.Diagnostics.LogText.SingleLine(message));
 
     public override void TraceEvent(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, string? message) =>
-        _logger.Write(Level(eventType), "{Text}", message);
+        _logger.Write(Level(eventType), "{Text}", SplitVpn.Core.Diagnostics.LogText.SingleLine(message));
 
     public override void TraceEvent(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, string? format, params object?[]? args) =>
-        _logger.Write(Level(eventType), "{Text}", args is { Length: > 0 } && format is not null
+        _logger.Write(Level(eventType), "{Text}", SplitVpn.Core.Diagnostics.LogText.SingleLine(args is { Length: > 0 } && format is not null
             ? string.Format(System.Globalization.CultureInfo.InvariantCulture, format, args)
-            : format);
+            : format));
 
     private static LogEventLevel Level(TraceEventType type) => type switch
     {

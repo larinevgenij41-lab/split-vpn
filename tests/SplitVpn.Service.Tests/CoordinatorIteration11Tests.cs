@@ -115,10 +115,11 @@ public sealed partial class CoordinatorTests
             Assert.Equal(JsonValueKind.Null, document.RootElement.GetProperty("note").ValueKind);
         }
 
-        // Управляющие символы занимают по 6-7 байт после двойного экранирования: полный журнал в кадр не помещается.
+        // Кавычки занимают от 4 байт после двойного экранирования: полный журнал в кадр не помещается. (Управляющие
+        // символы журнал теперь сам записывает как «\uXXXX» и обрезает: они раздувают текст меньше.)
         for (var i = 0; i < 500; i++)
         {
-            coordinator.Journal("Сведения", new string('\u0001', EventJournal.MaxTextLength));
+            coordinator.Journal("Сведения", new string('"', EventJournal.MaxTextLength));
         }
 
         var response = await coordinator.HandleRequestAsync(new ExportReportRequest(MaskPersonalData: true), CancellationToken.None);

@@ -241,6 +241,8 @@ public sealed class EventJournal(TimeProvider time, int capacity = 500)
     public void Add(string level, string text)
     {
         ArgumentNullException.ThrowIfNull(text);
+        // Список событий программы показывает эти строки: тот же разбор, что у журнала службы (Coordinator.Journal).
+        text = Core.Diagnostics.LogText.SingleLine(text);
         if (text.Length > MaxTextLength)
         {
             text = text[..MaxTextLength] + "…";

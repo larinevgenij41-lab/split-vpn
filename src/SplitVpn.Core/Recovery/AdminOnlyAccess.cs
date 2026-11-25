@@ -11,7 +11,7 @@ namespace SplitVpn.Core.Recovery;
 /// потомков не обходит.
 /// </summary>
 [SupportedOSPlatform("windows")]
-public static class AdminOnlyAccess
+public static partial class AdminOnlyAccess
 {
     /// <summary>
     /// Право изменить сам объект: запись и дописывание (в каталоге — создание файлов и подкаталогов), атрибуты, удаление,
@@ -85,10 +85,30 @@ public static class AdminOnlyAccess
     /// путь (<see cref="ReplaceRights"/>). Иначе обычный пользователь подложил бы свой файл (или библиотеку рядом с ним), и
     /// окно UAC запустило бы его от имени администратора. Ответ — почему нельзя; null — можно.
     /// </summary>
-    public static string? ElevationTargetProblem(string path) => ElevationTargetProblem(path, ReadEntry);
+    public static string? ElevationTargetProblem(string path) => ElevationTargetProblem(path, ReadEntry, ReadReparseTag);
+
+    /// <summary>
+    /// IO_REPARSE_TAG_WOF: файл сжат WOF (compact /exe, CompactOS). Точка повторной обработки хранит сжатые данные
+    /// самого файла и никуда не перенаправляет, поэтому для конечного файла она допустима. Каталоги — строго без точек.
+    /// </summary>
+    public const uint ReparseTagWof = 0x80000017;
+
+    /// <summary>
+    /// Атрибуты конечного файла для проверки: точка повторной обработки WOF (<see cref="ReparseTagWof"/>) — не ссылка, и
+    /// флаг снимается; любая другая (symlink, junction, дедупликация, облачные файлы и т. п.) остаётся и отклоняется.
+    /// </summary>
+    public static FileAttributes FileAttributesForCheck(FileAttributes attributes, uint reparseTag) =>
+        attributes.HasFlag(FileAttributes.ReparsePoint) && !attributes.HasFlag(FileAttributes.Directory) && reparseTag == ReparseTagWof
+            ? attributes & ~FileAttributes.ReparsePoint
+            : attributes;
 
     /// <summary>Шов для тестов: <paramref name="read"/> — атрибуты и дескриптор объекта (каталога, если второй аргумент true).</summary>
-    public static string? ElevationTargetProblem(string path, Func<string, bool, (FileAttributes Attributes, FileSystemSecurity Security)?> read)
+    public static string? ElevationTargetProblem(string path, Func<string, bool, (FileAttributes Attributes, FileSystemSecurity Security)?> read) =>
+        ElevationTargetProblem(path, read, null);
+
+    /// <param name="fileReparseTag">Тег точки повторной обработки конечного файла (0 — нет или не прочитан); null — не читается.</param>
+    public static string? ElevationTargetProblem(string path, Func<string, bool, (FileAttributes Attributes, FileSystemSecurity Security)?> read,
+        Func<string, uint>? fileReparseTag)
     {
         ArgumentNullException.ThrowIfNull(read);
         if (string.IsNullOrEmpty(path) || path.Length < 4 || !char.IsAsciiLetter(path[0]) || path[1] != ':' || path[2] != '\\'
@@ -117,7 +137,10 @@ public static class AdminOnlyAccess
 
                 // Файл и его каталог: никакой записи; выше — никакой подмены пути.
                 var forbidden = level <= 1 ? WriteRights : ReplaceRights;
-                if (Problem(entry.Attributes, entry.Security, forbidden, IsAdminPrincipal) is { } problem)
+                var attributes = !directory && fileReparseTag is not null && entry.Attributes.HasFlag(FileAttributes.ReparsePoint)
+                    ? FileAttributesForCheck(entry.Attributes, fileReparseTag(current))
+                    : entry.Attributes;
+                if (Problem(attributes, entry.Security, forbidden, IsAdminPrincipal) is { } problem)
                 {
                     return current + ": " + problem;
                 }
@@ -134,6 +157,41 @@ public static class AdminOnlyAccess
             return "не проверяется: " + ex.Message;
         }
     }
+
+    /// <summary>Тег точки повторной обработки самого объекта (ссылка не открывается); 0 — точки нет или тег не прочитан.</summary>
+    internal static uint ReadReparseTag(string path)
+    {
+        using var handle = CreateFileW(path, FileReadAttributes, FileShareAll, 0, OpenExisting, FileFlagOpenReparsePoint | FileFlagBackupSemantics, 0);
+        if (handle.IsInvalid)
+        {
+            return 0;
+        }
+
+        return GetFileInformationByHandleEx(handle, FileAttributeTagInfoClass, out var info, (uint)System.Runtime.InteropServices.Marshal.SizeOf<FileAttributeTagInfo>())
+            && (info.FileAttributes & 0x400) != 0 ? info.ReparseTag : 0;
+    }
+
+    private const uint FileReadAttributes = 0x80;
+    private const uint FileShareAll = 0x7;
+    private const uint OpenExisting = 3;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const int FileAttributeTagInfoClass = 9;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct FileAttributeTagInfo
+    {
+        public uint FileAttributes;
+        public uint ReparseTag;
+    }
+
+    [System.Runtime.InteropServices.LibraryImport("kernel32.dll", SetLastError = true, StringMarshalling = System.Runtime.InteropServices.StringMarshalling.Utf16)]
+    private static partial Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string fileName, uint desiredAccess, uint shareMode, nint securityAttributes,
+        uint creationDisposition, uint flagsAndAttributes, nint templateFile);
+
+    [System.Runtime.InteropServices.LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static partial bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle file, int infoClass, out FileAttributeTagInfo info, uint bufferSize);
 
     private static (FileAttributes, FileSystemSecurity)? ReadEntry(string path, bool directory)
     {

@@ -89,6 +89,10 @@ public sealed class RollingTextLog(string path, TimeProvider time, long maxBytes
     private Mutex? _mutex;
     private bool _mutexUnavailable;
 
+    /// <summary>До этого момента (Environment.TickCount64) недоступный мьютекс не открывается снова.</summary>
+    private long _unavailableUntil;
+    private TimeSpan _unavailableBackoff = MinUnavailableRetry;
+
     /// <summary>До этого момента (Environment.TickCount64) мьютекс не ждём: его недавно держали слишком долго.</summary>
     private long _waitResumesAt;
     private TimeSpan _backoff = MinBackoff;
@@ -103,17 +107,24 @@ public sealed class RollingTextLog(string path, TimeProvider time, long maxBytes
     {
         if (_mutexUnavailable)
         {
-            return false;
+            if (Environment.TickCount64 < _unavailableUntil)
+            {
+                return false;
+            }
+
+            // Мьютекс мог исчезнуть вместе с создавшей его копией (например, запущенной от администратора): пробуем снова.
+            _mutexUnavailable = false;
         }
 
         try
         {
-            _mutex ??= new Mutex(false, MutexName(path));
+            _mutex ??= CreateMutex(MutexName(path));
             var backingOff = Environment.TickCount64 < _waitResumesAt;
             if (_mutex.WaitOne(backingOff ? TimeSpan.Zero : MutexWait))
             {
                 _backoff = MinBackoff;
                 _waitResumesAt = 0;
+                _unavailableBackoff = MinUnavailableRetry;
                 return true;
             }
 
@@ -132,10 +143,113 @@ public sealed class RollingTextLog(string path, TimeProvider time, long maxBytes
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or WaitHandleCannotBeOpenedException or ArgumentException)
         {
-            // Мьютекс создан другой учётной записью. Пишем отдельно от его владельца.
+            // Мьютекс создан другой учётной записью или прежней версией без явных прав. Пока он недоступен, пишем
+            // отдельно от его владельца, но не до конца процесса: после паузы мьютекс пробуется снова.
+            _mutex?.Dispose();
+            _mutex = null;
             _mutexUnavailable = true;
+            _unavailableUntil = Environment.TickCount64 + (long)_unavailableBackoff.TotalMilliseconds;
+            _unavailableBackoff = _unavailableBackoff * 2 > MaxBackoff ? MaxBackoff : _unavailableBackoff * 2;
             return false;
         }
+    }
+
+    /// <summary>
+    /// Мьютекс с явными правами: учётная запись пользователя (её SID), SYSTEM и Administrators. Без них мьютекс,
+    /// созданный копией программы от администратора, получал права повышенного маркера, и обычная копия того же
+    /// пользователя не могла его открыть — и писала в отдельный файл процесса до своего завершения.
+    /// </summary>
+    internal static Mutex CreateMutex(string name)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return new Mutex(false, name);
+        }
+
+        // Существующий открывается только с нужными правами: создание (MutexAcl.Create) открыло бы его с полным доступом,
+        // которого явные права не дают.
+        const System.Security.AccessControl.MutexRights needed = System.Security.AccessControl.MutexRights.Synchronize | System.Security.AccessControl.MutexRights.Modify;
+        if (System.Threading.MutexAcl.TryOpenExisting(name, needed, out var existing))
+        {
+            return existing;
+        }
+
+        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+        var security = new System.Security.AccessControl.MutexSecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        foreach (var sid in new[]
+        {
+            identity.User!,
+            new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.LocalSystemSid, null),
+            new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null),
+        })
+        {
+            security.AddAccessRule(new System.Security.AccessControl.MutexAccessRule(sid,
+                System.Security.AccessControl.MutexRights.Synchronize | System.Security.AccessControl.MutexRights.Modify,
+                System.Security.AccessControl.AccessControlType.Allow));
+        }
+
+        return System.Threading.MutexAcl.Create(false, name, out _, security);
+    }
+
+    /// <summary>
+    /// Удаляет отдельные файлы процессов («имя.&lt;pid&gt;.log» и их «.1»), не тронутые дольше <paramref name="maxAge"/>:
+    /// их оставляли копии, которым мьютекс общего файла был недоступен. Файл своего процесса не трогается. Возвращает
+    /// число удалённых.
+    /// </summary>
+    public static int PruneProcessFiles(string path, TimeSpan maxAge, TimeProvider time)
+    {
+        ArgumentNullException.ThrowIfNull(time);
+        var directory = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path));
+        var stem = System.IO.Path.GetFileNameWithoutExtension(path);
+        if (directory is null || !Directory.Exists(directory))
+        {
+            return 0;
+        }
+
+        var limit = time.GetUtcNow().UtcDateTime - maxAge;
+        var removed = 0;
+        try
+        {
+            foreach (var file in new DirectoryInfo(directory).EnumerateFiles(stem + ".*.log*"))
+            {
+                if (!IsProcessFile(file.Name, stem, out var pid) || pid == ProcessId || file.LastWriteTimeUtc >= limit)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    file.Delete();
+                    removed++;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Файл держит живой процесс: удалится при следующем запуске.
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Каталог недоступен: журнал не должен ломать программу.
+        }
+
+        return removed;
+    }
+
+    /// <summary>«stem.&lt;цифры&gt;.log» или «stem.&lt;цифры&gt;.log.1».</summary>
+    internal static bool IsProcessFile(string name, string stem, out int pid)
+    {
+        pid = 0;
+        if (!name.StartsWith(stem + ".", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var rest = name[(stem.Length + 1)..];
+        var end = rest.EndsWith(".log.1", StringComparison.OrdinalIgnoreCase) ? rest.Length - 6
+            : rest.EndsWith(".log", StringComparison.OrdinalIgnoreCase) ? rest.Length - 4 : -1;
+        return end > 0 && int.TryParse(rest.AsSpan(0, end), NumberStyles.None, CultureInfo.InvariantCulture, out pid);
     }
 
     /// <summary>Имя межпроцессного мьютекса файла журнала.</summary>
@@ -151,6 +265,9 @@ public sealed class RollingTextLog(string path, TimeProvider time, long maxBytes
     private static readonly TimeSpan MinBackoff = TimeSpan.FromSeconds(5);
 
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
+
+    /// <summary>Первая пауза перед повторной попыткой открыть недоступный мьютекс; дальше растёт до <see cref="MaxBackoff"/>.</summary>
+    private static readonly TimeSpan MinUnavailableRetry = TimeSpan.FromMinutes(1);
 
     private void Rotate(string target)
     {
