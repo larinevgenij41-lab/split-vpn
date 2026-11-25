@@ -25,7 +25,10 @@ function Get-CimInstance($ClassName, $Filter, $ErrorAction) {
 }
 $problemList = [Collections.Generic.List[string]]::new()
 if (Stop-RecoveryServices ([Collections.Generic.List[object]]::new()) $problemList) { throw 'Неизвестное состояние службы принято за остановку' }
-if ($checkedServices.Count -ne 2 -or $problemList.Count -ne 1) { throw 'Запрос второй службы пропущен' }
+# Сбой запроса SplitVpn даёт две записи: остановка не подтверждена и повторный запрос для принудительного завершения
+# тоже не удался. Вторая служба при этом всё равно должна быть опрошена.
+if (-not ($checkedServices | Where-Object { $_ -match "='SplitVpnDev'" })) { throw 'Запрос второй службы пропущен' }
+if ($checkedServices.Count -ne 3 -or $problemList.Count -ne 2) { throw 'Сбой запроса службы учтён неверно' }
 
 $changes = [Collections.Generic.List[string]]::new()
 function Set-DnsClientServerAddress {
@@ -33,6 +36,17 @@ function Set-DnsClientServerAddress {
     param([Parameter(ValueFromPipeline)]$Family, [string[]]$ServerAddresses, [switch]$ResetServerAddresses)
     process { $changes.Add("$($Family.AddressFamily)|$ResetServerAddresses|$($ServerAddresses -join ',')") }
 }
+# Сброс семейства на «автоматически» идёт через netsh по полному пути, состояние DHCP - через Get-NetIPInterface:
+# оба подменены, настоящий адаптер не трогается.
+$dhcp = 'Enabled'
+function Get-NetIPInterface($InterfaceIndex, $AddressFamily, $ErrorAction) { [pscustomobject]@{ Dhcp = $dhcp } }
+New-Item -Path "function:$env:SystemRoot\System32\netsh.exe" -Value {
+    $changes.Add("netsh|$($args -join ' ')")
+    $global:LASTEXITCODE = 0
+} | Out-Null
+$adapter = [pscustomobject]@{ ifIndex = 7; Name = 'Тестовый' }
+$resolvers = @{ V4 = $false; V6 = $false }
+$dnsProblems = [Collections.Generic.List[string]]::new()
 $saved = @{ NameServerV4 = '192.0.2.2,192.0.2.3'; NameServerV6 = '' }
 $families = @(
     [pscustomobject]@{ AddressFamily = 2; ServerAddresses = @('127.0.0.1') }
@@ -42,8 +56,15 @@ $families = @(
     [pscustomobject]@{ AddressFamily = 2; ServerAddresses = @('192.168.1.100', '127.0.0.1') }
     [pscustomobject]@{ AddressFamily = 2; ServerAddresses = @('127.0.0.1', '192.168.1.100') }
 )
-Restore-SavedDns $families ([pscustomobject]$saved)
-if (($changes -join ';') -ne '2|False|192.0.2.2,192.0.2.3;23|True|;2|False|192.0.2.2,192.0.2.3') { throw "Неверное восстановление DNS: $changes" }
+Restore-SavedDns $adapter $families ([pscustomobject]$saved) $resolvers $dnsProblems
+if (($changes -join ';') -ne '2|False|192.0.2.2,192.0.2.3;netsh|interface ipv6 set dnsservers name=7 source=dhcp;2|False|192.0.2.2,192.0.2.3') { throw "Неверное восстановление DNS: $changes" }
+if ($dnsProblems.Count) { throw "Лишние проблемы при восстановлении DNS: $dnsProblems" }
+
+# Без копии у адаптера со статическим IPv4 DNS не сбрасывается: «автоматически» оставило бы его без DNS.
+$changes.Clear()
+$dhcp = 'Disabled'
+Restore-SavedDns $adapter @([pscustomobject]@{ AddressFamily = 2; ServerAddresses = @('127.0.0.1') }) $null $resolvers $dnsProblems
+if ($changes.Count -or $dnsProblems.Count -ne 1) { throw "Статический адаптер сброшен: $changes" }
 
 $temp = [IO.Directory]::CreateDirectory((Join-Path ([IO.Path]::GetTempPath()) ('splitvpn-backup-test-' + [guid]::NewGuid())))
 try {
