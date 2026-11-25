@@ -29,11 +29,17 @@ public sealed partial class CoordinatorTests
         Assert.NotEmpty(coordinator.Facts.Conflicts);
 
         // Итерация 12: публичная сеть недоверенного адаптера не локальна - она идёт по правилам (здесь в туннель), а
-        // локальным остаётся только его маршрутизатор. Предупреждение говорит, как доверять адаптеру.
+        // локальным остаётся только его маршрутизатор (итерация 13: ниже правил, разрешение - только через его адаптер).
         Assert.False(coordinator.Facts.Policy!.LocalRanges.Contains(RadminPeer));
         Assert.Equal(Decision.Local, coordinator.Facts.Policy.Classify(Ipv4.Parse("26.0.0.1")).Decision);
+        var gateway = Assert.Single(coordinator.Facts.AppliedFilters[FilterGroup.Runtime].Specs, f => f.Name == "Маршрутизатор 26.0.0.1");
+        Assert.Contains(gateway.Conditions, c => c is LocalInterfaceCondition { Luid: FakeWorld.RadminLuid, NotEqual: false });
+
+        // Итерация 13: адаптер не распознан как виртуальная сеть и не основной - совета доверять ему (доверие навсегда по
+        // GUID, такой адаптер не станет основным) и совета «Напрямую» (правило шло бы через основной адаптер) нет.
         var warning = Assert.Single(coordinator.BuildStatus().Warnings, w => w.Code == "public-onlink");
-        Assert.Contains("Доверенные адаптеры", warning.Text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Доверенные адаптеры", warning.Text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Напрямую", warning.Text, StringComparison.Ordinal);
         Assert.Contains("26.0.0.0/8", warning.Text, StringComparison.Ordinal);
     }
 

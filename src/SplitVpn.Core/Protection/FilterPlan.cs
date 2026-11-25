@@ -175,12 +175,16 @@ public sealed record TunnelInput
 public readonly record struct RevocationEndpoint(uint Address, ushort Port);
 
 /// <summary>
-/// Адаптер, трафик которого защита пропускает (например, Radmin VPN): к его собственным сетям (Prefixes - текущие или
-/// запомненные on-link-сети) и к локальным диапазонам. Публичный интернет через него не выпускается.
+/// Адаптер, трафик которого защита пропускает (например, Radmin VPN): к его собственным сетям и к локальным диапазонам.
+/// Prefixes - текущие или запомненные сети, которые локальны по уровню доверия (on-link-сети и собственные маршруты
+/// адаптера не короче /8, см. <see cref="PolicyCompiler.TrustedNetworks"/>); PrefixesV6 - сети IPv6 адаптера из списка
+/// «Доверенные адаптеры». Публичный интернет через него не выпускается.
 /// </summary>
 public sealed record TrustedAdapterInput(ulong Luid, string Name)
 {
     public IReadOnlyList<Ipv4Cidr> Prefixes { get; init; } = [];
+
+    public IReadOnlyList<IPNetwork> PrefixesV6 { get; init; } = [];
 }
 
 /// <summary>Факты и настройки, от которых зависит набор фильтров.</summary>
@@ -212,6 +216,12 @@ public sealed record ProtectionInputs
     public IReadOnlyList<Ipv4Cidr> OnLinkPrefixes { get; init; } = [];
 
     public IReadOnlyList<TrustedAdapterInput> TrustedAdapters { get; init; } = [];
+
+    /// <summary>
+    /// Публичные маршрутизаторы недоверенных адаптеров (<see cref="PolicyCompiler.SelectOnLinkPrefixes"/>): пока политика
+    /// считает адрес локальным (правило или закрепление его не забрало), защита пропускает его только через свой адаптер.
+    /// </summary>
+    public IReadOnlyList<AdapterGateway> AdapterGateways { get; init; } = [];
 
     /// <summary>
     /// Узлы проверки отзыва, пока она нужна туннелю, который не поднят: открываются только TCP на порт ссылки
@@ -566,19 +576,30 @@ public static class FilterPlanBuilder
         {
             filters.AddRange(PolicyCompiler.OnLinkSet(inputs.OnLinkPrefixes).Select(r =>
                 Spec("Сеть интерфейса " + r, FilterGroup.Runtime, FilterFamily.V4, WeightLocal, FilterAction.Permit, new RemoteRangeV4(r.Start, r.End))));
+
+            // Публичный маршрутизатор недоверенного адаптера - только через этот адаптер и только пока политика считает его
+            // локальным: правило или закрепление в туннель важнее (точка доступа, назвавшая маршрутизатором адрес
+            // Telegram, не выведет его из VPN). Транспорт VPN, DHCP и DNS службы доступа к самому маршрутизатору не требуют.
+            foreach (var gateway in inputs.AdapterGateways.Distinct()
+                .Where(g => inputs.Policy.Classify(g.Address) is { Decision: Decision.Local, Source: DecisionSource.LocalNetwork }))
+            {
+                filters.Add(Spec("Маршрутизатор " + Ipv4.Format(gateway.Address), FilterGroup.Runtime, FilterFamily.V4, WeightLocal, FilterAction.Permit,
+                    new RemoteRangeV4(gateway.Address, gateway.Address), new LocalInterfaceCondition(gateway.Luid, NotEqual: false)));
+            }
         }
 
         // Разрешение по интерфейсу: не зависит от «Локального доступа» и не мигает, пока адрес адаптера меняется
-        // (сети запоминаются). Назначения - только сети самого адаптера и локальные диапазоны: при обрыве в режиме
-        // «Блокировать весь публичный» (вес 5) разрешение весом 7 без адресов выпустило бы через такой адаптер
-        // (выход Tailscale, ZeroTier) весь интернет. DNS-страж и блокировки пользователя весят больше и действуют и здесь.
+        // (сети запоминаются). Назначения - только сети самого адаптера (on-link и его маршруты не короче /8) и локальные
+        // диапазоны: при обрыве в режиме «Блокировать весь публичный» (вес 5) разрешение весом 7 без адресов выпустило бы
+        // через такой адаптер (выход Tailscale, ZeroTier) весь интернет. DNS-страж и блокировки пользователя весят больше.
         foreach (var adapter in inputs.TrustedAdapters.Where(a => a.Luid != inputs.PrimaryLuid))
         {
             var name = "Доверенный адаптер «" + adapter.Name + "»";
             var own = SpecialRanges.Local.Union(PolicyCompiler.OnLinkSet(adapter.Prefixes));
             filters.Add(Spec(name, FilterGroup.Runtime, FilterFamily.V4, WeightLocal, FilterAction.Permit,
                 new RemoteRangesV4(own), new LocalInterfaceCondition(adapter.Luid, NotEqual: false)));
-            filters.AddRange(LocalV6.Select(n => Spec(name + ": " + n, FilterGroup.Runtime, FilterFamily.V6, WeightLocal, FilterAction.Permit,
+            filters.AddRange(LocalV6.Concat(adapter.PrefixesV6.Where(n => n.PrefixLength is >= 8 and <= 128)).Distinct().Select(n => Spec(
+                name + ": " + n, FilterGroup.Runtime, FilterFamily.V6, WeightLocal, FilterAction.Permit,
                 new RemotePrefixV6(n), new LocalInterfaceCondition(adapter.Luid, NotEqual: false))));
         }
 

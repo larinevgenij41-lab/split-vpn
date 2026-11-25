@@ -14,10 +14,9 @@ public partial class FilterPlanTests
     private static readonly Guid AnyConnectTunnel = new("eeeeeeee-0000-0000-0000-000000000005");
 
     [Theory]
-    [InlineData("10.1.2.3", "локальной сети")]
     [InlineData("169.254.10.1", null)]
     [InlineData("203.0.113.77", "зарезервированного")]
-    [InlineData("198.18.0.5", "зарезервированного")]
+    [InlineData("192.0.0.9", "зарезервированного")]
     [InlineData("45.10.0.1", "запрещён правилом")]
     public void Pin_DoesNotOverrideStrongerAddressDecision(string address, string? reason)
     {
@@ -73,21 +72,22 @@ public partial class FilterPlanTests
     [Fact]
     public void OnLinkSelection_PublicPrefixIsLocalOnlyForTrustedAdapter()
     {
-        var hotspot = Adapter("Wi-Fi", "149.154.160.0/20", gateway: "149.154.160.1");
+        var hotspot = Adapter("Wi-Fi", "149.154.160.0/20", gateway: "149.154.160.1", luid: WiFi);
         var lan = Adapter("Ethernet", "192.168.1.0/24", gateway: "192.168.1.1");
         var cgnat = Adapter("Tailscale", "100.100.0.0/16");
         var radmin = Adapter("Radmin VPN", "26.0.0.0/8");
 
-        var (local, untrusted) = PolicyCompiler.SelectOnLinkPrefixes([hotspot, lan, cgnat, radmin], a => a == radmin);
+        var selection = PolicyCompiler.SelectOnLinkPrefixes([hotspot, lan, cgnat, radmin], a => a == radmin ? AdapterTrust.Explicit : AdapterTrust.None);
 
-        Assert.Equal(
-            [Ipv4Cidr.Parse("149.154.160.1/32"), Ipv4Cidr.Parse("192.168.1.0/24"), Ipv4Cidr.Parse("100.100.0.0/16"), Ipv4Cidr.Parse("26.0.0.0/8")],
-            local);
-        Assert.Equal([Ipv4Cidr.Parse("149.154.160.0/20")], untrusted);
+        // Публичный маршрутизатор точки доступа - не в локальных сетях (они выше правил), а отдельно: ниже правил и закреплений.
+        Assert.Equal([Ipv4Cidr.Parse("192.168.1.0/24"), Ipv4Cidr.Parse("100.100.0.0/16"), Ipv4Cidr.Parse("26.0.0.0/8")], selection.Local);
+        Assert.Equal([Ipv4Cidr.Parse("149.154.160.0/20")], selection.Untrusted.Select(u => u.Prefix));
+        Assert.Equal([new AdapterGateway(Ipv4.Parse("149.154.160.1"), WiFi)], selection.Gateways);
 
-        var (trusted, none) = PolicyCompiler.SelectOnLinkPrefixes([hotspot], _ => true);
-        Assert.Equal([Ipv4Cidr.Parse("149.154.160.0/20")], trusted);
-        Assert.Empty(none);
+        var trusted = PolicyCompiler.SelectOnLinkPrefixes([hotspot], _ => AdapterTrust.Explicit);
+        Assert.Equal([Ipv4Cidr.Parse("149.154.160.0/20")], trusted.Local);
+        Assert.Empty(trusted.Untrusted);
+        Assert.Empty(trusted.Gateways);
     }
 
     /// <summary>
@@ -100,17 +100,19 @@ public partial class FilterPlanTests
     public void PublicOnLinkOfUntrustedAdapter_IsGuardedButGatewayVpnDnsAndDhcpWork(bool connected)
     {
         // Обычная схема провайдера: единственный адаптер с публичным адресом в публичной /24, DNS провайдера в той же сети.
-        var isp = Adapter("Ethernet", "95.31.18.0/24", gateway: "95.31.18.1");
+        var isp = Adapter("Ethernet", "95.31.18.0/24", gateway: "95.31.18.1", luid: WiFi);
         var ispDns = Ipv4.Parse("95.31.18.2");
         var server = Ipv4.Parse("5.129.236.106");
         var neighbour = Ipv4.Parse("95.31.18.50");
-        var (onLink, _) = PolicyCompiler.SelectOnLinkPrefixes([isp], _ => false);
+        var selection = PolicyCompiler.SelectOnLinkPrefixes([isp], _ => AdapterTrust.None);
+        var onLink = selection.Local;
         var policy = PolicyCompiler.Compile(new PolicyInput
         {
             DefaultTarget = RouteTarget.Tunnel(TunnelA),
             ServerAddresses = [server],
             ServiceDnsAddresses = [ispDns],
             OnLinePrefixes = onLink,
+            AdapterGateways = [.. selection.Gateways.Select(g => g.Address)],
         });
         var filters = All(new ProtectionInputs
         {
@@ -120,10 +122,13 @@ public partial class FilterPlanTests
             ServiceDnsAddresses = [ispDns],
             ServiceExecutablePath = ServiceExe,
             OnLinkPrefixes = onLink,
+            AdapterGateways = selection.Gateways,
         });
 
         Assert.Equal(Decision.Local, policy.Classify(Ipv4.Parse("95.31.18.1")).Decision);
         Assert.Equal(FilterAction.Permit, Evaluate(filters, Tcp(Ipv4.Parse("95.31.18.1"), 80, WiFi)));
+        // Разрешение маршрутизатора привязано к его адаптеру.
+        Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(Ipv4.Parse("95.31.18.1"), 80, Radmin)));
         Assert.Equal(FilterAction.Permit, Evaluate(filters, Tcp(server, 443, WiFi)));
         Assert.Equal(FilterAction.Permit, Evaluate(filters, Udp(ispDns, 53, WiFi, ServiceExe, system: true)));
         Assert.Equal(FilterAction.Permit, Evaluate(filters, Packet.Dhcp(WiFi) with { RemoteV4 = Ipv4.Parse("95.31.18.3") }));
@@ -175,23 +180,28 @@ public partial class FilterPlanTests
         Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(dns, 443, Tunnel)));
     }
 
-    /// <summary>DNS шлюза при «Ручные правила важнее сетей шлюза» не перекрывает ручное правило.</summary>
+    /// <summary>
+    /// DNS шлюза при «Ручные правила важнее сетей шлюза» уступает только правилу ровно на свой адрес (/32): широкое
+    /// правило (8.8.4.0/24 → «Напрямую») его не забирает, иначе split DNS шлюза пропал бы.
+    /// </summary>
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void TunnelDns_KeepsUserRuleWhenUserRulesWin(bool userRulesWin)
+    [InlineData(true, "8.8.4.4/32", true)]
+    [InlineData(false, "8.8.4.4/32", false)]
+    [InlineData(true, "8.8.4.0/24", false)]
+    [InlineData(false, "8.8.4.0/24", false)]
+    public void TunnelDns_KeepsOnlyExactUserRuleWhenUserRulesWin(bool userRulesWin, string rule, bool ruleWins)
     {
         var dns = Ipv4.Parse("8.8.4.4");
         var policy = PolicyCompiler.Compile(new PolicyInput
         {
             DefaultTarget = RouteTarget.Tunnel(TunnelA),
-            Rules = [new UserRule(Ipv4Cidr.Parse("8.8.4.0/24"), RouteTarget.Direct)],
+            Rules = [new UserRule(Ipv4Cidr.Parse(rule), RouteTarget.Direct)],
             TunnelHosts = [new TunnelHost(AnyConnectTunnel, dns, userRulesWin)],
         });
 
         var label = policy.Classify(dns);
-        Assert.Equal(userRulesWin ? Decision.Direct : Decision.Vpn, label.Decision);
-        Assert.Equal(userRulesWin ? DecisionSource.UserRule : DecisionSource.TunnelInfrastructure, label.Source);
+        Assert.Equal(ruleWins ? Decision.Direct : Decision.Vpn, label.Decision);
+        Assert.Equal(ruleWins ? DecisionSource.UserRule : DecisionSource.TunnelInfrastructure, label.Source);
     }
 
     /// <summary>Туннель AnyConnect пропускает только IPv4: IPv6 от шлюза (если отключить его не удалось) блокируется.</summary>
@@ -210,10 +220,12 @@ public partial class FilterPlanTests
         Assert.Contains(FilterPlanBuilder.BuildRuntime(baseline), f => f.Name == "Туннель «Основной»" && f.Family == FilterFamily.Both);
     }
 
-    private static AdapterCandidate Adapter(string name, string prefix, string? gateway = null) => new()
+    private static AdapterCandidate Adapter(string name, string prefix, string? gateway = null, ulong luid = 0, string description = "") => new()
     {
         InterfaceGuid = Guid.NewGuid(),
+        Luid = luid,
         Name = name,
+        Description = description,
         IsUp = true,
         OnLinkPrefixes = [Ipv4Cidr.Parse(prefix)],
         DefaultGateway = gateway is null ? null : Ipv4.Parse(gateway),

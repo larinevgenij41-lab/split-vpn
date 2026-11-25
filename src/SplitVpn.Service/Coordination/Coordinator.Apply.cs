@@ -659,8 +659,12 @@ public sealed partial class Coordinator
         NotePrimaryForWifiSettle(result.Adapter);
         Facts.Primary = result.Adapter;
         Facts.NetworkFingerprint = Fingerprint(snapshot);
-        Facts.Conflicts = PrimaryAdapterSelector.PublicOnLinkConflicts(snapshot.Adapters.Where(a => !tunnelLuids.Contains(a.Luid) && !IsTrusted(a)))
-            .Select(c => (c.Adapter.Name, c.Prefix)).ToList();
+        // Публичные сети, которые не считаются локальными: у недоверенного адаптера любая, у распознанной виртуальной сети -
+        // вне диапазонов поставщика. Зарезервированные диапазоны предупреждения не дают.
+        Facts.Conflicts = PolicyCompiler.SelectOnLinkPrefixes(snapshot.Adapters.Where(a => a.IsUp && !tunnelLuids.Contains(a.Luid)), TrustOf,
+                a => RoutesOf(snapshot, a))
+            .Untrusted.Where(c => PolicyCompiler.IsPublicOnLink(c.Prefix))
+            .Select(c => (c.Adapter.Name, c.Prefix, c.Adapter.IsOverlay)).ToList();
         RememberTrustedPrefixes(snapshot, tunnelLuids);
         _snapshot = snapshot;
     }
@@ -831,8 +835,20 @@ public sealed partial class Coordinator
     /// </summary>
     private readonly Dictionary<ulong, IReadOnlyList<Ipv4Cidr>> _trustedPrefixes = [];
 
-    private bool IsTrusted(AdapterCandidate adapter) =>
-        (_settings.TrustOverlayAdapters && adapter.IsOverlay) || _settings.TrustedAdapters.Contains(adapter.InterfaceGuid);
+    private bool IsTrusted(AdapterCandidate adapter) => TrustOf(adapter) != AdapterTrust.None;
+
+    /// <summary>
+    /// Уровень доверия адаптеру: список «Доверенные адаптеры» - ко всем его сетям и маршрутам, распознанная виртуальная сеть
+    /// при включённом «Виртуальные сети» - только к частным сетям и диапазонам поставщика.
+    /// </summary>
+    private AdapterTrust TrustOf(AdapterCandidate adapter) =>
+        _settings.TrustedAdapters.Contains(adapter.InterfaceGuid) ? AdapterTrust.Explicit
+        : _settings.TrustOverlayAdapters && adapter.IsOverlay ? AdapterTrust.Overlay
+        : AdapterTrust.None;
+
+    /// <summary>Собственные маршруты адаптера из снимка таблицы маршрутов (назначения через его интерфейс).</summary>
+    private static IEnumerable<Ipv4Cidr> RoutesOf(NetSnapshot? snapshot, AdapterCandidate adapter) =>
+        (snapshot?.RoutesV4 ?? []).Where(r => r.InterfaceLuid == adapter.Luid).Select(r => r.Destination);
 
     private List<AdapterCandidate> TrustedAdapters()
     {
@@ -850,7 +866,9 @@ public sealed partial class Coordinator
 
         foreach (var adapter in trusted.Where(a => a.IsUp && a.OnLinkPrefixes.Count > 0))
         {
-            _trustedPrefixes[adapter.Luid] = adapter.OnLinkPrefixes;
+            // Запоминаются только сети, локальные по уровню доверия: публичная сеть виртуальной сети вне диапазонов
+            // поставщика локальной не становится и через память.
+            _trustedPrefixes[adapter.Luid] = PolicyCompiler.TrustedNetworks(adapter, TrustOf(adapter), RoutesOf(snapshot, adapter));
         }
     }
 
@@ -877,28 +895,9 @@ public sealed partial class Coordinator
             throw;
         }
 
-        ReportRejectedPins(Facts.Policy);
-    }
-
-    /// <summary>О каких отказах в закреплении (суффикс правила, причина) уже сказано в журнале.</summary>
-    private readonly HashSet<(string Suffix, string Reason)> _reportedRejectedPins = [];
-
-    /// <summary>
-    /// Закрепление по домену, не принятое политикой (адресное решение сильнее), - одна запись в журнал на пару
-    /// «правило, причина». Адреса и запрошенные имена не пишутся: только суффикс правила из настроек.
-    /// </summary>
-    private void ReportRejectedPins(CompiledPolicy policy)
-    {
-        foreach (var rejected in policy.RejectedPins)
-        {
-            var suffix = Facts.Pinned.TryGetValue(rejected.Address, out var pin) ? pin.Suffix : "";
-            if (_reportedRejectedPins.Count >= 10_000 || !_reportedRejectedPins.Add((suffix, rejected.Reason)))
-            {
-                continue;
-            }
-
-            Journal("Сведения", $"Правило для домена «{suffix}»: адрес не закреплён ({rejected.Reason}) и идёт по адресным правилам.");
-        }
+        // Отклонённые закрепления уходят из реестра, ожидающие их ответы DNS получают отказ; о причине - предупреждение и
+        // одна запись в журнал на пару «правило, причина» (без адресов и запрошенных имён).
+        DropRejectedPins(Facts.Policy);
     }
 
     private PolicyInput BuildPolicyInput(IReadOnlyList<UserRule> rules) => new()
@@ -911,11 +910,12 @@ public sealed partial class Coordinator
         Rules = rules,
         Groups = ResolveGroups(),
         OnLinePrefixes = OnLinkPrefixes(),
+        AdapterGateways = SelectOnLink().Gateways.Select(g => g.Address).Distinct().ToList(),
         ServerAddresses = AllServerAddresses(),
         ServiceDnsAddresses = ServiceDnsAddresses(),
         ServerNetworks = GatewayNetworks(),
         TunnelHosts = TunnelHosts(),
-        PinnedHosts = Facts.Pinned.Select(p => new PinnedHost(p.Key, p.Value.Target)).ToList(),
+        PinnedHosts = PinnedHostsForPolicy(),
     };
 
     private List<uint> AllServerAddresses() =>
@@ -944,16 +944,19 @@ public sealed partial class Coordinator
     /// Сети адаптеров, которые считаются локальными: частные - у любого адаптера, публичные - только у доверенного
     /// (<see cref="PolicyCompiler.SelectOnLinkPrefixes"/>); от недоверенного с публичной сетью - лишь его маршрутизатор.
     /// </summary>
-    private List<Ipv4Cidr> OnLinkPrefixes()
-    {
-        var tunnelLuids = TunnelLuids();
-        var (local, _) = PolicyCompiler.SelectOnLinkPrefixes(
-            (_snapshot?.Adapters ?? []).Where(a => a.IsUp && !tunnelLuids.Contains(a.Luid)), IsTrusted);
-        return local
+    private List<Ipv4Cidr> OnLinkPrefixes() =>
+        SelectOnLink().Local
             .Concat(_trustedPrefixes.Values.SelectMany(p => p))
             .Where(p => p.PrefixLength >= PolicyCompiler.MinOnLinkPrefix)
             .Distinct()
             .ToList();
+
+    private OnLinkSelection SelectOnLink()
+    {
+        var tunnelLuids = TunnelLuids();
+        var snapshot = _snapshot;
+        return PolicyCompiler.SelectOnLinkPrefixes(
+            (snapshot?.Adapters ?? []).Where(a => a.IsUp && !tunnelLuids.Contains(a.Luid)), TrustOf, a => RoutesOf(snapshot, a));
     }
 
     /// <summary>
@@ -1021,10 +1024,14 @@ public sealed partial class Coordinator
         ServiceExecutablePath = _deps.ServiceExecutablePath,
         SshEngineExecutablePath = Facts.Tunnels.Values.Any(t => t.Protocol == VpnProtocol.SshVpn) ? _deps.SshTunnel.EnginePath ?? "" : "",
         OnLinkPrefixes = OnLinkPrefixes(),
+        AdapterGateways = SelectOnLink().Gateways,
         TrustedAdapters = TrustedAdapters().Select(a => new TrustedAdapterInput(a.Luid, a.Name)
         {
             // Запомненные сети: адаптер, на время потерявший адрес, сохраняет разрешение к своей сети.
-            Prefixes = _trustedPrefixes.GetValueOrDefault(a.Luid) ?? a.OnLinkPrefixes,
+            Prefixes = _trustedPrefixes.GetValueOrDefault(a.Luid) ?? PolicyCompiler.TrustedNetworks(a, TrustOf(a), RoutesOf(_snapshot, a)),
+            // Сети IPv6 - только у адаптера из списка «Доверенные адаптеры»: доверие к виртуальной сети по описанию на
+            // её публичный IPv6 не распространяется.
+            PrefixesV6 = TrustOf(a) == AdapterTrust.Explicit ? a.OnLinkPrefixesV6 : [],
         }).ToList(),
         RevocationEndpoints = RevocationEndpoints(),
         ConnectivityCheckEndpoints = ConnectivityCheckEndpoints(),
@@ -2114,7 +2121,12 @@ public sealed partial class Coordinator
             : configuration with { Mode = DnsProxyMode.Offline };
     }
 
-    private DnsRoute? TunnelDnsRoute(TunnelFacts tunnel)
+    /// <param name="publicFallback">
+    /// Без своих DNS туннель разрешает через публичные резолверы (1.1.1.1, 8.8.8.8). Для AnyConnect так только общий путь
+    /// имён опорного туннеля: имена правил для доменов и split DNS шлюза тогда не разрешаются (false - маршрута нет),
+    /// иначе внутренние имена компании ушли бы к публичным резолверам.
+    /// </param>
+    private DnsRoute? TunnelDnsRoute(TunnelFacts tunnel, bool publicFallback = true)
     {
         if (tunnel.Adapter is not { } adapter)
         {
@@ -2133,6 +2145,11 @@ public sealed partial class Coordinator
 
         // У AnyConnect свои DNS шлюза: общий «DNS через VPN» из настроек к ним не относится.
         var upstream = tunnel.Protocol == VpnProtocol.AnyConnect ? [] : UpstreamDnsAddresses();
+        if (upstream.Count == 0 && tunnel.VpnDns.Count == 0 && !publicFallback && tunnel.Protocol == VpnProtocol.AnyConnect)
+        {
+            return null;
+        }
+
         var servers = upstream.Count > 0 ? upstream : tunnel.VpnDns.Count > 0 ? [.. tunnel.VpnDns] : FallbackUpstreams.ToList();
 
         return new DnsRoute(servers.Select(Endpoint).ToList(), adapter.InterfaceIndex);
@@ -2209,7 +2226,7 @@ public sealed partial class Coordinator
         }
 
         var carrier = Carriers(target).Select(id => Facts.Tunnels.GetValueOrDefault(id)).FirstOrDefault(t => t?.Luid is not null);
-        return carrier is null ? null : TunnelDnsRoute(carrier);
+        return carrier is null ? null : TunnelDnsRoute(carrier, publicFallback: false);
     }
 
     private void SetProxyConfiguration(DnsProxyConfiguration configuration, bool suffixChanged = false)

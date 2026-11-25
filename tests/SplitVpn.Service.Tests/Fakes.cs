@@ -390,7 +390,7 @@ internal sealed class FakeInventory : INetInventory
                 InterfaceGuid = RadminGuid ?? Guid.NewGuid(), Luid = FakeWorld.RadminLuid, InterfaceIndex = 19, Name = "Radmin VPN", IfType = 6,
                 Description = RadminDescription, IsUp = true, DefaultGateway = RadminHasAddress ? Ipv4.Parse("26.0.0.1") : null, DefaultRouteMetric = RadminDefaultRouteMetric,
                 OnLinkPrefixes = RadminHasAddress ? [Ipv4Cidr.Parse("26.0.0.0/8")] : [], Addresses = RadminHasAddress ? [Ipv4.Parse("26.185.67.105")] : [],
-                DnsServers = RadminDnsServers,
+                DnsServers = RadminDnsServers, OnLinkPrefixesV6 = RadminPrefixesV6,
             },
         };
         List<int> hidden;
@@ -415,11 +415,17 @@ internal sealed class FakeInventory : INetInventory
         }
 
         adapters.AddRange(Extra);
-        return new NetSnapshot(adapters, []);
+        return new NetSnapshot(adapters, [.. ExtraRoutes]);
     }
 
     /// <summary>Дополнительные адаптеры снимка (например, выключенный Ethernet с оставшимся DNS).</summary>
     public List<AdapterCandidate> Extra { get; } = [];
+
+    /// <summary>Маршруты IPv4 снимка (например, маршруты подсетей через адаптер Radmin или Tailscale).</summary>
+    public List<RouteEntry> ExtraRoutes { get; } = [];
+
+    /// <summary>On-link-сети IPv6 адаптера Radmin.</summary>
+    public IReadOnlyList<System.Net.IPNetwork> RadminPrefixesV6 { get; set; } = [];
 
     public IReadOnlyList<uint> DhcpDnsServers(Guid interfaceGuid) => interfaceGuid == FakeWorld.WiFiGuid ? [FakeWorld.Gateway] : [];
 }

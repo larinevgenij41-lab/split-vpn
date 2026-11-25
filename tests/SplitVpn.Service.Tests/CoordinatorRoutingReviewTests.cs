@@ -40,16 +40,17 @@ public sealed partial class CoordinatorTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task DirectPin_DoesNotOverrideUserRuleIntoTunnel(bool pause)
+    public async Task DirectPin_DoesNotOverrideHigherPriorityUserRuleIntoTunnel(bool pause)
     {
-        // Итерация 12: закрепление «напрямую» не выводит из VPN адрес, который ручное правило направило в туннель
-        // (адрес в ответе DNS выбирает сервер имён). Ответ отдаётся, адрес идёт по правилу, отказ - в журнале.
+        // Итерации 12-13: закрепление «напрямую» не выводит из VPN адрес, который ручное правило с более высоким
+        // приоритетом направило в туннель (адрес в ответе DNS выбирает сервер имён). Ответ не отдаётся (SERVFAIL): адрес
+        // пошёл бы мимо правила для домена; на главной - предупреждение с правилом и причиной.
         var second = SecondProfile();
         var host = Ipv4.Parse("13.107.1.1");
         SaveSettings(Settings() with
         {
             Profiles = [_profile, second],
-            Rules = [new UserRuleSetting { Cidr = "13.107.1.1/32", Target = RouteTarget.Tunnel(second.Id) }],
+            Rules = [new UserRuleSetting { Cidr = "13.107.1.1/32", Target = RouteTarget.Tunnel(second.Id), Priority = RoutePriority.High }],
             DomainRules = [new DomainRuleSetting { Suffix = "direct.example", Target = RouteTarget.Direct }],
         });
         var c = await StartAsync();
@@ -62,11 +63,14 @@ public sealed partial class CoordinatorTests
         var pending = c.ObservePinnedAsync(new PinnedRouteNotice("direct.example", "direct.example", RouteTarget.Direct,
             [host], TimeSpan.FromMinutes(5)), CancellationToken.None);
         await c.DrainAsync();
-        Assert.True(await pending);
+        Assert.False(await pending);
         Assert.DoesNotContain(_world.Routes.Current, r => r.Destination == new Ipv4Cidr(host, 32) && r.InterfaceLuid == FakeWorld.WiFiLuid);
         Assert.Equal(FilterAction.Block, RoutingAction(host, FakeWorld.WiFiLuid));
-        Assert.Contains(c.Facts.Policy!.RejectedPins, p => p.Address == host);
-        Assert.Equal(Decision.Vpn, c.Facts.Policy.Classify(host).Decision);
+        Assert.DoesNotContain(c.Facts.Pinned.Keys, a => a == host);
+        Assert.Equal(Decision.Vpn, c.Facts.Policy!.Classify(host).Decision);
+        var warning = Assert.Single(c.BuildStatus().Warnings, w => w.Code == "domain-pin-rejected");
+        Assert.Contains("direct.example", warning.Text, StringComparison.Ordinal);
+        Assert.Contains("13.107.1.1/32", warning.Text, StringComparison.Ordinal);
 
         if (!pause)
         {

@@ -25,6 +25,7 @@ public sealed class PolicyCompilationCache
             Rules = input.Rules.ToArray(),
             Groups = input.Groups.Select(g => g with { Members = g.Members.ToArray() }).ToArray(),
             OnLinePrefixes = input.OnLinePrefixes.ToArray(),
+            AdapterGateways = input.AdapterGateways.ToArray(),
             ServerAddresses = input.ServerAddresses.ToArray(),
             ServiceDnsAddresses = input.ServiceDnsAddresses.ToArray(),
             ServerNetworks = input.ServerNetworks.Select(n => n with { Cidrs = n.Cidrs.ToArray() }).ToArray(),
@@ -40,6 +41,7 @@ public sealed class PolicyCompilationCache
         && ReferenceEquals(a.Geo, b.Geo) && ReferenceEquals(a.Bypass, b.Bypass)
         && a.Rules.SequenceEqual(b.Rules)
         && a.OnLinePrefixes.SequenceEqual(b.OnLinePrefixes)
+        && a.AdapterGateways.SequenceEqual(b.AdapterGateways)
         && a.ServerAddresses.SequenceEqual(b.ServerAddresses)
         && a.ServiceDnsAddresses.SequenceEqual(b.ServiceDnsAddresses)
         && a.TunnelHosts.SequenceEqual(b.TunnelHosts)

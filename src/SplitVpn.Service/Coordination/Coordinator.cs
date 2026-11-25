@@ -667,15 +667,13 @@ public sealed partial class Coordinator
             warnings.Add(new StatusWarning("geo-pending", "Новая RU-база ждёт подтверждения: " + geoState.PendingReason, "geo-review"));
         }
 
-        foreach (var (adapter, prefix) in Facts.Conflicts)
+        foreach (var (adapter, prefix, overlay) in Facts.Conflicts)
         {
-            warnings.Add(new StatusWarning("public-onlink", $"Интерфейс «{adapter}» использует публичную сеть {prefix}: она больше не считается локальной и идёт по правилам маршрутизации (локальным остаётся только маршрутизатор этой сети). "
-                + (adapter == Facts.Primary?.Name
-                    ? $"Если узлы этой сети нужны напрямую, добавьте правило {prefix} → «Напрямую»."
-                    : "Если это ваша сеть, отметьте адаптер в списке «Доверенные адаптеры» на странице «Защита и DNS»."), null));
+            warnings.Add(new StatusWarning("public-onlink", PublicOnLinkText(adapter, prefix, overlay, adapter == Facts.Primary?.Name), null));
         }
 
         warnings.AddRange(OnLinkRuleWarnings());
+        warnings.AddRange(RejectedPinWarnings());
         warnings.AddRange(SkippedSettingsWarnings());
 
         if (_state is { Intent: Intent.Connected, ProtectionSuspended: false })
@@ -694,6 +692,27 @@ public sealed partial class Coordinator
             warnings.Add(new StatusWarning("ipv6-restricted", "IPv6 ограничен: публичный IPv6 блокируется, пока включена защита.", null));
         }
         return BoundWarnings(warnings);
+    }
+
+    /// <summary>
+    /// Текст предупреждения о публичной сети адаптера. Совет «доверять адаптеру» - только виртуальной сети: доверие
+    /// хранится по GUID навсегда, доверенный адаптер не может стать основным, а любая будущая чужая сеть на той же карте
+    /// стала бы локальной. Правило «Напрямую» - только для сети основного адаптера и только с оговоркой про общественные
+    /// сети (в них это правило вывело бы сеть точки доступа из VPN); показывается сама сеть адаптера, не шире.
+    /// </summary>
+    internal static string PublicOnLinkText(string adapter, Ipv4Cidr prefix, bool overlay, bool primary)
+    {
+        var text = $"Интерфейс «{adapter}» в сети с публичными адресами {prefix}: локальной она не считается, устройства в ней "
+            + "доступны только по правилу маршрутизации (локальным остаётся лишь маршрутизатор сети).";
+        if (overlay)
+        {
+            return text + " Если это ваша виртуальная сеть, отметьте адаптер в списке «Доверенные адаптеры» на странице «Защита и DNS».";
+        }
+
+        return primary
+            ? text + $" Если это сеть вашего провайдера, офиса или учебного заведения и её узлы нужны напрямую, добавьте правило {prefix} → «Напрямую»; "
+                + "в общественной сети (кафе, гостиница, аэропорт) не добавляйте его."
+            : text;
     }
 
     /// <summary>Сколько предупреждений одного вида попадает в состояние; о прочих — одна строка.</summary>
@@ -1267,7 +1286,8 @@ internal sealed class CoordinatorFacts
 
     public string NetworkFingerprint { get; set; } = "";
 
-    public IReadOnlyList<(string Adapter, Ipv4Cidr Prefix)> Conflicts { get; set; } = [];
+    /// <summary>Публичные сети адаптеров, которые не считаются локальными; IsOverlay - адаптер виртуальной сети.</summary>
+    public IReadOnlyList<(string Adapter, Ipv4Cidr Prefix, bool IsOverlay)> Conflicts { get; set; } = [];
 
     /// <summary>Туннели по идентификатору профиля.</summary>
     public Dictionary<Guid, TunnelFacts> Tunnels { get; } = [];

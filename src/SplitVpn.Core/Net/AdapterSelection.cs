@@ -34,6 +34,12 @@ public sealed record AdapterCandidate
 
     public IReadOnlyList<Ipv4Cidr> OnLinkPrefixes { get; init; } = [];
 
+    /// <summary>
+    /// On-link-сети IPv6 адаптера (кроме link-local): защита пропускает их только через адаптер из списка «Доверенные
+    /// адаптеры».
+    /// </summary>
+    public IReadOnlyList<System.Net.IPNetwork> OnLinkPrefixesV6 { get; init; } = [];
+
     public IReadOnlyList<uint> Addresses { get; init; } = [];
 
     public IReadOnlyList<uint> DnsServers { get; init; } = [];
@@ -62,6 +68,29 @@ public static class OverlayAdapters
     public static bool IsKnown(string? description) =>
         !string.IsNullOrEmpty(description)
         && KnownDescriptions.Any(known => description.Contains(known, StringComparison.OrdinalIgnoreCase));
+
+    private static readonly RangeSet Radmin = RangeSet.From([Ipv4Cidr.Parse("26.0.0.0/8")]);
+    private static readonly RangeSet Hamachi = RangeSet.From([Ipv4Cidr.Parse("25.0.0.0/8")]);
+
+    /// <summary>
+    /// Публичные диапазоны, которые поставщик виртуальной сети раздаёт своим адаптерам: Radmin VPN - 26.0.0.0/8, Hamachi -
+    /// 25.0.0.0/8. Tailscale (100.64.0.0/10) и ZeroTier (частные сети) публичных диапазонов не используют. Только эти
+    /// публичные сети и маршруты распознанной виртуальной сети считаются локальными без отметки в «Доверенных адаптерах».
+    /// </summary>
+    public static RangeSet VendorRanges(string? description)
+    {
+        if (string.IsNullOrEmpty(description))
+        {
+            return RangeSet.Empty;
+        }
+
+        if (description.Contains("Radmin VPN", StringComparison.OrdinalIgnoreCase))
+        {
+            return Radmin;
+        }
+
+        return description.Contains("Hamachi", StringComparison.OrdinalIgnoreCase) ? Hamachi : RangeSet.Empty;
+    }
 }
 
 /// <summary>Действующая метрика маршрута: метрика маршрута плюс метрика интерфейса.</summary>
@@ -145,8 +174,10 @@ public static class PrimaryAdapterSelector
     }
 
     /// <summary>
-    /// Не частные on-link-сети интерфейсов (например, Radmin VPN 26.0.0.0/8 или публичная /24 провайдера). У
+    /// Публичные on-link-сети интерфейсов (например, Radmin VPN 26.0.0.0/8 или публичная /24 провайдера). У
     /// недоверенного адаптера такая сеть локальной не считается (<see cref="Policy.PolicyCompiler.SelectOnLinkPrefixes"/>).
+    /// Частные в сети адаптера (192.0.0.0/29 DS-Lite, 198.18.0.0/15 fake-IP) и прочие зарезервированные диапазоны сюда не
+    /// попадают (<see cref="Policy.PolicyCompiler.IsPublicOnLink"/>).
     /// </summary>
     public static IEnumerable<(AdapterCandidate Adapter, Ipv4Cidr Prefix)> PublicOnLinkConflicts(IEnumerable<AdapterCandidate> adapters)
     {
@@ -154,6 +185,6 @@ public static class PrimaryAdapterSelector
         return adapters
             .Where(a => a.IsUp)
             .SelectMany(a => a.OnLinkPrefixes.Select(p => (Adapter: a, Prefix: p)))
-            .Where(x => x.Prefix.PrefixLength >= Policy.PolicyCompiler.MinOnLinkPrefix && !Policy.PolicyCompiler.IsPrivateOnLink(x.Prefix));
+            .Where(x => Policy.PolicyCompiler.IsPublicOnLink(x.Prefix));
     }
 }

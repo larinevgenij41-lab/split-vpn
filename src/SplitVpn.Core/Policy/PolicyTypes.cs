@@ -101,9 +101,10 @@ public enum DecisionSource
 public sealed record ServerNetworks(RouteTarget Target, IReadOnlyList<Ipv4Cidr> Cidrs, bool UserRulesWin = true);
 
 /// <summary>
-/// Служебный адрес туннеля, который должен идти через этот туннель. UserRulesWin - у подключения включено «Ручные
-/// правила важнее сетей шлюза»: тогда адрес под любым ручным правилом остаётся по правилу (служба такой адрес и сама
-/// убирает из DNS туннеля с предупреждением).
+/// Служебный адрес туннеля, который должен идти через этот туннель. Запрет пользователя он не перекрывает никогда.
+/// UserRulesWin - у подключения включено «Ручные правила важнее сетей шлюза»: тогда адрес остаётся и под ручным
+/// правилом ровно на этот адрес (/32); широкое правило его не забирает (служба адрес под таким /32-правилом или запретом
+/// сама убирает из DNS туннеля с предупреждением).
 /// </summary>
 public readonly record struct TunnelHost(Guid Tunnel, uint Address, bool UserRulesWin = false);
 
@@ -112,15 +113,44 @@ public sealed record UserRule(Ipv4Cidr Cidr, RouteTarget Target, string? Comment
 /// <summary>
 /// Адрес, полученный по правилу для домена, и цель, за которой он закреплён. В скомпилированной политике
 /// цель уже раскрыта: группа заменена своим участником, если хоть один годен.
+/// Priority - действующий приоритет правила для домена: при равном или более высоком приоритете цель «напрямую»
+/// важнее ручного CIDR-правила в туннель для публичного адреса (<see cref="PolicyCompiler.PinRejection"/>).
 /// </summary>
-public sealed record PinnedHost(uint Address, RouteTarget Target);
+public sealed record PinnedHost(uint Address, RouteTarget Target, RoutePriority Priority = RoutePriority.Normal);
 
 /// <summary>
 /// Закрепление по домену, которое политика не приняла: адрес держит адресное решение сильнее правила для домена
-/// (запрет пользователя, локальная сеть, сеть шлюза, зарезервированный диапазон, ручное правило в туннель для цели
-/// «напрямую»). Адрес идёт по адресным правилам; причина - для журнала службы.
+/// (запрет пользователя, сеть шлюза, зарезервированный диапазон, ручное правило в туннель для цели «напрямую»). Служба
+/// не отдаёт такой адрес программе (SERVFAIL) и показывает предупреждение с правилом и причиной.
 /// </summary>
 public sealed record RejectedPin(uint Address, RouteTarget Target, string Reason);
+
+/// <summary>Итог разбора закреплений: принятые, отклонённые с причиной и молча не закреплённые адреса.</summary>
+public sealed record PinResolution(IReadOnlyList<PinnedHost> Accepted, IReadOnlyList<RejectedPin> Rejected, IReadOnlyList<uint> Ignored);
+
+/// <summary>Насколько пользователь доверяет адаптеру: его публичные сети и маршруты локальны только у доверенного.</summary>
+public enum AdapterTrust
+{
+    None,
+
+    /// <summary>Распознанная виртуальная сеть при включённом «Виртуальные сети»: доверие только к диапазонам поставщика.</summary>
+    Overlay,
+
+    /// <summary>Адаптер из списка «Доверенные адаптеры»: доверие ко всем его сетям и маршрутам.</summary>
+    Explicit,
+}
+
+/// <summary>Публичный маршрутизатор недоверенного адаптера: локален ниже правил, защита пропускает его только через Luid.</summary>
+public readonly record struct AdapterGateway(uint Address, ulong Luid);
+
+/// <summary>
+/// Итог <see cref="PolicyCompiler.SelectOnLinkPrefixes"/>: локальные сети, отброшенные публичные сети адаптеров (для
+/// предупреждения) и публичные маршрутизаторы недоверенных адаптеров.
+/// </summary>
+public sealed record OnLinkSelection(
+    IReadOnlyList<Ipv4Cidr> Local,
+    IReadOnlyList<(AdapterCandidate Adapter, Ipv4Cidr Prefix)> Untrusted,
+    IReadOnlyList<AdapterGateway> Gateways);
 
 /// <summary>
 /// Группа туннелей с уже отобранными участниками: служба передаёт только те, что сейчас годны
@@ -158,6 +188,13 @@ public sealed record PolicyInput
 
     /// <summary>On-link-префиксы интерфейсов (кроме туннелей), считаются локальными сетями.</summary>
     public IReadOnlyList<Ipv4Cidr> OnLinePrefixes { get; init; } = [];
+
+    /// <summary>
+    /// Публичные адреса маршрутизаторов недоверенных адаптеров с публичной сетью (<see cref="PolicyCompiler.SelectOnLinkPrefixes"/>).
+    /// Они локальны, но слоем ниже правил пользователя и закреплений: чужая точка доступа, назвавшая маршрутизатором ценный
+    /// публичный адрес, не выведет его из VPN, если правило или закрепление ведёт его в туннель.
+    /// </summary>
+    public IReadOnlyList<uint> AdapterGateways { get; init; } = [];
 
     /// <summary>IPv4-адреса серверов всех активных туннелей: транспорт идёт через основной адаптер.</summary>
     public IReadOnlyList<uint> ServerAddresses { get; init; } = [];

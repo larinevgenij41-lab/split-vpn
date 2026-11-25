@@ -176,7 +176,8 @@ public sealed partial class CoordinatorTests
         ];
         uint[] dns = [Ipv4.Parse("9.9.9.9")];
 
-        string? Problem(string address) => Coordinator.GatewayNodeAddressProblem(Ipv4.Parse(address), primary, dns, rules);
+        string? Problem(string address) => Coordinator.GatewayNodeAddressProblem(Ipv4.Parse(address), primary,
+            RangeSet.From([Ipv4Cidr.Parse("192.168.1.0/24")]), dns, rules);
 
         Assert.Equal("служебный диапазон", Problem("255.255.255.255"));
         Assert.Equal("маршрутизатор локальной сети", Problem("192.168.1.1"));
@@ -212,8 +213,8 @@ public sealed partial class CoordinatorTests
     }
 
     /// <summary>
-    /// Итерация 12: при «Ручные правила важнее сетей шлюза» DNS шлюза под ручным правилом с другой целью остаётся по
-    /// правилу и уходит из DNS туннеля с предупреждением. Без галочки DNS шлюза по-прежнему важнее правила.
+    /// Итерации 12-13: при «Ручные правила важнее сетей шлюза» DNS шлюза под ручным правилом ровно на свой адрес (/32) с
+    /// другой целью остаётся по правилу и уходит из DNS туннеля с предупреждением. Без галочки DNS шлюза важнее правила.
     /// </summary>
     [Theory]
     [InlineData(true)]
@@ -225,7 +226,7 @@ public sealed partial class CoordinatorTests
         var coordinator = await StartWithAnyConnectAsync(Settings() with
         {
             Profiles = [_profile, profile],
-            Rules = [new UserRuleSetting { Cidr = "10.0.16.0/24", Target = RouteTarget.Direct }],
+            Rules = [new UserRuleSetting { Cidr = "10.0.16.21/32", Target = RouteTarget.Direct }],
         });
         await EstablishSessionAsync(coordinator, GatewaySession() with { Dns = ["10.0.16.21", "10.0.17.5"] });
 

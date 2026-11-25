@@ -23,7 +23,7 @@ public sealed partial class CoordinatorTests
         await coordinator.OnConnectivityCheckResolvedAsync(coordinator.ConnectivityPinContext, warm);
 
         var unrelated = coordinator.ObservePinnedAsync(new PinnedRouteNotice("busy.example", "busy.example", RouteTarget.Direct,
-            [Ipv4.Parse("198.51.100.10")], TimeSpan.FromMinutes(5)), CancellationToken.None).AsTask();
+            [Ipv4.Parse("151.101.40.10")], TimeSpan.FromMinutes(5)), CancellationToken.None).AsTask();
         Assert.False(unrelated.IsCompleted);
 
         var pin = ObserveConnectivityCheckWithoutDrain(coordinator, [warm[0]]).AsTask();
@@ -39,20 +39,20 @@ public sealed partial class CoordinatorTests
     {
         SaveSettings(Settings() with { DomainRules = [new DomainRuleSetting { Suffix = "ready.example", Target = RouteTarget.Direct }] });
         var coordinator = await StartProtectedForConnectivityCheckAsync();
-        var notice = new PinnedRouteNotice("ready.example", "ready.example", RouteTarget.Direct, [Ipv4.Parse("198.51.100.20")], TimeSpan.FromMinutes(5));
+        var notice = new PinnedRouteNotice("ready.example", "ready.example", RouteTarget.Direct, [Ipv4.Parse("151.101.40.20")], TimeSpan.FromMinutes(5));
         var first = coordinator.ObservePinnedAsync(notice, CancellationToken.None);
         await coordinator.DrainAsync();
         Assert.True(await first);
 
         var unrelated = coordinator.ObservePinnedAsync(new PinnedRouteNotice("busy.example", "busy.example", RouteTarget.Direct,
-            [Ipv4.Parse("198.51.100.10")], TimeSpan.FromMinutes(5)), CancellationToken.None).AsTask();
+            [Ipv4.Parse("151.101.40.10")], TimeSpan.FromMinutes(5)), CancellationToken.None).AsTask();
         Assert.False(unrelated.IsCompleted);
 
         var repeated = coordinator.ObservePinnedAsync(notice, CancellationToken.None).AsTask();
         Assert.True(await repeated.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
 
         // Новый адрес по-прежнему ждёт применения.
-        var fresh = coordinator.ObservePinnedAsync(notice with { Addresses = [Ipv4.Parse("198.51.100.21")] }, CancellationToken.None).AsTask();
+        var fresh = coordinator.ObservePinnedAsync(notice with { Addresses = [Ipv4.Parse("151.101.40.21")] }, CancellationToken.None).AsTask();
         Assert.False(fresh.IsCompleted);
         await coordinator.DrainAsync();
         Assert.True(await fresh.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));

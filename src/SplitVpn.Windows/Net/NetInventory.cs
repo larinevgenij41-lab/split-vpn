@@ -23,6 +23,7 @@ public static unsafe class NetInventory
     {
         var routes = ReadRoutesV4();
         var addresses = ReadUnicastV4();
+        var addressesV6 = ReadOnLinkV6();
         var interfaces = ReadInterfaces();
         var metrics = ReadInterfaceMetrics(interfaces);
         var pppoe = ReadPppoeAddresses();
@@ -32,7 +33,10 @@ public static unsafe class NetInventory
             .GroupBy(r => r.InterfaceLuid)
             .ToDictionary(g => g.Key, g => g.OrderBy(r => r.RouteMetric).First());
         var adapters = interfaces
-            .Select(row => BuildCandidate(row, defaults, addresses, metrics, pppoe))
+            .Select(row => BuildCandidate(row, defaults, addresses, metrics, pppoe) with
+            {
+                OnLinkPrefixesV6 = addressesV6.GetValueOrDefault(row.InterfaceLuid.Value) ?? [],
+            })
             .ToList();
         return new NetSnapshot(adapters, routes);
     }
@@ -154,6 +158,66 @@ public static unsafe class NetInventory
         finally
         {
             PInvoke.FreeMibTable(table);
+        }
+    }
+
+    /// <summary>
+    /// On-link-сети IPv6 по интерфейсам (без link-local и петли): защита пропускает их через адаптер из списка
+    /// «Доверенные адаптеры». Сбой чтения - пустой набор: без IPv6-сетей доверенный адаптер работает по IPv4, как прежде.
+    /// </summary>
+    private static Dictionary<ulong, List<IPNetwork>> ReadOnLinkV6()
+    {
+        var result = new Dictionary<ulong, List<IPNetwork>>();
+        if (PInvoke.GetUnicastIpAddressTable(ADDRESS_FAMILY.AF_INET6, out var table) != 0)
+        {
+            return result;
+        }
+
+        try
+        {
+            foreach (ref readonly var row in table->Table.AsSpan((int)table->NumEntries))
+            {
+                if (row.DadState is not (NL_DAD_STATE.IpDadStatePreferred or NL_DAD_STATE.IpDadStateDeprecated)
+                    || row.OnLinkPrefixLength is 0 or >= 128)
+                {
+                    continue;
+                }
+
+                var raw = row.Address.Ipv6.sin6_addr.u.Byte;
+                var address = new IPAddress(raw.AsSpan());
+                if (address.IsIPv6LinkLocal || IPAddress.IsLoopback(address))
+                {
+                    continue;
+                }
+
+                if (!result.TryGetValue(row.InterfaceLuid.Value, out var list))
+                {
+                    result[row.InterfaceLuid.Value] = list = [];
+                }
+
+                var network = new IPNetwork(Mask(address, row.OnLinkPrefixLength), row.OnLinkPrefixLength);
+                if (!list.Contains(network))
+                {
+                    list.Add(network);
+                }
+            }
+
+            return result;
+        }
+        finally
+        {
+            PInvoke.FreeMibTable(table);
+        }
+
+        static IPAddress Mask(IPAddress address, int prefixLength)
+        {
+            var bytes = address.GetAddressBytes();
+            for (var bit = prefixLength; bit < bytes.Length * 8; bit++)
+            {
+                bytes[bit / 8] &= (byte)~(0x80 >> (bit % 8));
+            }
+
+            return new IPAddress(bytes);
         }
     }
 

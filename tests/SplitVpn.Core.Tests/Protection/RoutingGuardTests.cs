@@ -56,23 +56,51 @@ public partial class FilterPlanTests
     }
 
     /// <summary>
-    /// Итерация 12: закрепление «напрямую» не выводит из VPN адрес, который ручное правило направило в туннель:
-    /// закрепление не принимается, адрес идёт по правилу.
+    /// Итерация 13: закрепление «напрямую» поверх ручного CIDR-правила в туннель (13.107.0.0/16 → второй туннель, приоритет
+    /// «обычный») для публичного адреса решает приоритет: правило для домена с более низким приоритетом не принимается
+    /// (адрес идёт по правилу), с равным или более высоким - принимается, как в 0.18.0.
     /// </summary>
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void DirectDomain_DoesNotOverrideUserRuleIntoTunnel(bool secondUp)
+    [InlineData(false, RoutePriority.Low, false)]
+    [InlineData(true, RoutePriority.Low, false)]
+    [InlineData(false, RoutePriority.Normal, true)]
+    [InlineData(true, RoutePriority.Normal, true)]
+    [InlineData(true, RoutePriority.High, true)]
+    public void DirectDomain_OverUserRuleIntoTunnel_FollowsPriority(bool secondUp, RoutePriority domainPriority, bool accepted)
     {
-        var inputs = Inputs(Tunnel, secondUp ? SecondTunnel : null, [new PinnedHost(SecondNetwork, RouteTarget.Direct)]);
+        var inputs = Inputs(Tunnel, secondUp ? SecondTunnel : null, [new PinnedHost(SecondNetwork, RouteTarget.Direct, domainPriority)]);
         var filters = All(inputs);
+
+        if (accepted)
+        {
+            Assert.Single(inputs.Policy.Pins);
+            Assert.Empty(inputs.Policy.RejectedPins);
+            Assert.Equal(FilterAction.Permit, Evaluate(filters, Tcp(SecondNetwork, 443, WiFi)));
+            Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(SecondNetwork, 443, SecondTunnel)));
+            return;
+        }
 
         Assert.Empty(inputs.Policy.Pins);
         var rejected = Assert.Single(inputs.Policy.RejectedPins);
         Assert.Equal(SecondNetwork, rejected.Address);
+        Assert.Contains("13.107.0.0/16", rejected.Reason, StringComparison.Ordinal);
         Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(SecondNetwork, 443, WiFi)));
         Assert.Equal(FilterAction.Block, Evaluate(filters, Tcp(SecondNetwork, 443, Tunnel)));
         Assert.Equal(secondUp ? FilterAction.Permit : FilterAction.Block, Evaluate(filters, Tcp(SecondNetwork, 443, SecondTunnel)));
+    }
+
+    /// <summary>Итерация 13: CIDR-правило с более высоким приоритетом важнее правила «напрямую» для домена.</summary>
+    [Theory]
+    [InlineData(RoutePriority.Normal, false)]
+    [InlineData(RoutePriority.High, true)]
+    public void DirectDomain_UnderHighPriorityUserRule(RoutePriority domainPriority, bool accepted)
+    {
+        var inputs = Inputs(Tunnel, SecondTunnel, [new PinnedHost(Ipv4.Parse("104.16.1.1"), RouteTarget.Direct, domainPriority)],
+            extraRules: [new UserRule(Ipv4Cidr.Parse("104.16.0.0/12"), RouteTarget.Tunnel(TunnelB), Priority: RoutePriority.High)]);
+
+        Assert.Equal(accepted, inputs.Policy.Pins.Count == 1);
+        Assert.Equal(accepted, inputs.Policy.RejectedPins.Count == 0);
+        Assert.Equal(accepted ? Decision.Direct : Decision.Vpn, inputs.Policy.Classify(Ipv4.Parse("104.16.1.1")).Decision);
     }
 
     /// <summary>

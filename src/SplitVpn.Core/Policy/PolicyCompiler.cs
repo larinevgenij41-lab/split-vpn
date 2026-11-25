@@ -13,13 +13,16 @@ public sealed class CompiledPolicy
     internal CompiledPolicy(
         PolicyInput input,
         IntervalPainter painter,
-        (IReadOnlyList<PinnedHost> Accepted, IReadOnlyList<RejectedPin> Rejected) pins,
+        PinResolution pins,
         IReadOnlyList<uint> directServerAddresses,
+        IReadOnlyDictionary<Guid, IReadOnlyList<Guid>> groups,
         IReadOnlyList<string>? warnings = null)
     {
         Warnings = warnings ?? [];
         _painter = painter;
+        _groups = groups;
         RejectedPins = pins.Rejected;
+        IgnoredPins = pins.Ignored;
         Pins = pins.Accepted;
         _pins = Pins.ToDictionary(p => p.Address, p => p.Target);
         DefaultTarget = input.DefaultTarget;
@@ -35,9 +38,10 @@ public sealed class CompiledPolicy
         Tunnels = _tunnelRanges.Keys.Order().ToArray();
     }
 
-    private CompiledPolicy(CompiledPolicy source, (IReadOnlyList<PinnedHost> Accepted, IReadOnlyList<RejectedPin> Rejected) pins)
+    private CompiledPolicy(CompiledPolicy source, PinResolution pins)
     {
         _painter = source._painter;
+        _groups = source._groups;
         Warnings = source.Warnings;
         _tunnelRanges = source._tunnelRanges;
         _tunnelCidrs = source._tunnelCidrs;
@@ -53,13 +57,27 @@ public sealed class CompiledPolicy
         Tunnels = source.Tunnels;
         Pins = pins.Accepted;
         RejectedPins = pins.Rejected;
+        IgnoredPins = pins.Ignored;
         _pins = Pins.ToDictionary(p => p.Address, p => p.Target);
     }
+
+    private readonly IReadOnlyDictionary<Guid, IReadOnlyList<Guid>> _groups;
 
     internal bool SharesAddressPolicy(CompiledPolicy other) => ReferenceEquals(_painter, other._painter);
 
     internal CompiledPolicy WithPins(PolicyInput input) => new(this,
         PolicyCompiler.ResolvePins(input, _painter, PolicyCompiler.GroupMembers(input.Groups)));
+
+    /// <summary>
+    /// Принял бы адресный слой этой политики закрепление (без учёта DNS службы): служба перепроверяет им отказы,
+    /// запомненные при прежней сборке, - правило могло измениться. Reason - причина отказа, null - отказа нет или он
+    /// молчаливый (<see cref="IgnoredPins"/>).
+    /// </summary>
+    public (bool Allowed, string? Reason) EvaluatePin(PinnedHost pin)
+    {
+        ArgumentNullException.ThrowIfNull(pin);
+        return PolicyCompiler.PinRejection(pin, PolicyCompiler.ResolvePinTarget(pin.Address, pin.Target, _groups), _painter.Classify(pin.Address));
+    }
 
     public RouteTarget DefaultTarget { get; }
 
@@ -97,10 +115,17 @@ public sealed class CompiledPolicy
 
     /// <summary>
     /// Закрепления, которые не приняты, потому что адресное решение сильнее правила для домена (см.
-    /// <see cref="PolicyCompiler.PinRejection"/>). Служебные адреса (сервер VPN, DNS, loopback, 0.0.0.0/8) сюда не попадают:
-    /// их отказ ожидаем и в журнал не пишется.
+    /// <see cref="PolicyCompiler.PinRejection"/>): служба отвечает на такой запрос SERVFAIL и показывает предупреждение.
+    /// Молчаливые отказы (<see cref="IgnoredPins"/>) сюда не попадают.
     /// </summary>
     public IReadOnlyList<RejectedPin> RejectedPins { get; }
+
+    /// <summary>
+    /// Адреса, которые не закреплены молча: служебные (сервер VPN, DNS, loopback, сеть адаптера, 0.0.0.0/8) и цель
+    /// «напрямую» на адресе локальной сети. Адрес идёт по своему адресному решению, которое из VPN его не выводит, ответ
+    /// DNS отдаётся как обычно, а конфликтов с другими доменами на том же адресе такое закрепление не создаёт.
+    /// </summary>
+    public IReadOnlyList<uint> IgnoredPins { get; }
 
     public int SegmentCount => _painter.Segments.Count;
 
@@ -161,11 +186,24 @@ public static class PolicyCompiler
 
     /// <summary>
     /// Адреса, которые не закрепляются по домену: «этот хост» 0.0.0.0/8 (так отвечает блокирующий DNS),
-    /// 240.0.0.0/4 с широковещанием и link-scope. Отказ по ним молчаливый; остальные зарезервированные диапазоны
-    /// (документационные, 198.18.0.0/15) тоже не закрепляются, но с записью в журнал (<see cref="PinRejection"/>).
+    /// 240.0.0.0/4 с широковещанием и link-scope. Отказ по ним молчаливый; документационные диапазоны и 192.0.0.0/24 тоже
+    /// не закрепляются, но с отказом (<see cref="PinRejection"/>). 198.18.0.0/15 закрепляется (<see cref="FakeIpPool"/>).
     /// </summary>
     private static readonly RangeSet Unpinnable = RangeSet.From([Ipv4Cidr.Parse("0.0.0.0/8"), Ipv4Cidr.Parse("240.0.0.0/4")])
         .Union(SpecialRanges.LinkScope);
+
+    /// <summary>
+    /// 198.18.0.0/15: пул подменных адресов (fake-IP) резолверов Clash, sing-box и подобных. Закреплению по домену он
+    /// доступен с любой целью, как до итерации 12: маршрут на такой адрес безвреден, а иначе правило для домена при таком
+    /// резолвере не работало бы вовсе.
+    /// </summary>
+    public static RangeSet FakeIpPool { get; } = RangeSet.From([Ipv4Cidr.Parse("198.18.0.0/15")]);
+
+    /// <summary>
+    /// Зарезервированные диапазоны, которые в сети адаптера считаются частными: 192.0.0.0/29 (адрес B4 у DS-Lite) и
+    /// 198.18.0.0/15 (адаптеры TUN с пулом fake-IP). Сеть из них локальна у любого адаптера и предупреждения не даёт.
+    /// </summary>
+    private static readonly RangeSet PrivateOnLinkReserved = RangeSet.From([Ipv4Cidr.Parse("192.0.0.0/29"), Ipv4Cidr.Parse("198.18.0.0/15")]);
 
     public static CompiledPolicy Compile(PolicyInput input)
     {
@@ -192,6 +230,8 @@ public static class PolicyCompiler
         // удалённую частную сеть в свой туннель. Сеть адаптера защищает слой on-link выше.
         var local = new Classification(Decision.Local, DecisionSource.LocalNetwork, null);
         painter.Paint(SpecialRanges.Private, local);
+        // Публичный маршрутизатор недоверенного адаптера локален, но ниже правил и закреплений (SelectOnLinkPrefixes).
+        painter.Paint(HostSet(input.AdapterGateways), local);
         Verify(painter, "частные сети", input);
         foreach (var rule in input.Rules.OrderBy(r => r.Priority).ThenBy(r => r.Cidr.PrefixLength))
         {
@@ -217,9 +257,11 @@ public static class PolicyCompiler
             // не открывается ради DNS. Loopback и сеть своего адаптера в туннель не уводятся никогда: шлюз,
             // назвавший своим DNS адрес из домашней сети (X-CSTP-DNS: 192.168.1.10), иначе забрал бы в туннель
             // узел локальной сети. Такой адрес служба и сама убирает из DNS туннеля с предупреждением.
-            // С «Ручные правила важнее сетей шлюза» адрес DNS шлюза не перекрывает и остальные ручные правила.
+            // С «Ручные правила важнее сетей шлюза» адрес DNS шлюза не перекрывает и правило ровно на этот адрес (/32). Широкое
+            // правило (10.0.0.0/8 → «Напрямую») его не забирает: иначе split DNS шлюза пропал бы, а имена ушли бы к чужому DNS.
             painter.PaintKeeping(Ipv4Range.Host(host.Address), new Classification(Decision.Vpn, DecisionSource.TunnelInfrastructure, null, host.Tunnel),
-                label => (host.UserRulesWin ? IsUserRule(label) : IsUserBlock(label)) || label.Source is DecisionSource.Loopback or DecisionSource.OnLink);
+                label => IsUserBlock(label) || (host.UserRulesWin && IsUserHostRule(label))
+                    || label.Source is DecisionSource.Loopback or DecisionSource.OnLink);
         }
 
         // Решение правила для адреса сервера запоминается до слоя серверов, который его перекроет.
@@ -243,47 +285,97 @@ public static class PolicyCompiler
         var groups = GroupMembers(input.Groups);
         painter.ExpandGroups(groups);
         Verify(painter, "раскрытие групп", input);
-        return new CompiledPolicy(input, painter, ResolvePins(input, painter, groups), directServers, warnings);
+        return new CompiledPolicy(input, painter, ResolvePins(input, painter, groups), directServers, groups, warnings);
     }
 
-    /// <summary>Сеть адаптера целиком из частных, CGNAT 100.64.0.0/10 и link-local диапазонов.</summary>
-    public static bool IsPrivateOnLink(Ipv4Cidr prefix) => SpecialRanges.Local.Covers(prefix.ToRange());
+    /// <summary>
+    /// Сеть адаптера целиком из частных, CGNAT 100.64.0.0/10 и link-local диапазонов, из 192.0.0.0/29 (DS-Lite) или
+    /// 198.18.0.0/15 (адаптеры TUN с fake-IP).
+    /// </summary>
+    public static bool IsPrivateOnLink(Ipv4Cidr prefix) =>
+        SpecialRanges.Local.Covers(prefix.ToRange()) || PrivateOnLinkReserved.Covers(prefix.ToRange());
 
     /// <summary>
-    /// Какие сети адаптеров считаются локальными (идут напрямую поверх правил). Публичная сеть - только от адаптера,
-    /// которому пользователь доверяет: иначе чужая точка доступа, выдавшая адрес из 149.154.160.0/20, открыла бы
-    /// этот кусок интернета мимо VPN. Частные (RFC 1918), CGNAT и link-local сети локальны у любого адаптера. От
-    /// недоверенного адаптера с публичной сетью локальным остаётся только его маршрутизатор (адрес шлюза, если он в
-    /// этой сети): остальная сеть идёт по общим правилам, а в туннель ей Windows её не отдаст - маршрут on-link
-    /// точнее - и защита её блокирует (как любой адрес туннеля вне туннеля). Untrusted - отброшенные публичные сети.
+    /// Публичная сеть адаптера, о которой стоит предупредить: не частная (<see cref="IsPrivateOnLink"/>) и не из
+    /// зарезервированных диапазонов (документационные сети в интернете не встречаются, о них предупреждать незачем).
     /// </summary>
-    public static (List<Ipv4Cidr> Local, List<Ipv4Cidr> Untrusted) SelectOnLinkPrefixes(IEnumerable<AdapterCandidate> adapters, Func<AdapterCandidate, bool> trusted)
+    public static bool IsPublicOnLink(Ipv4Cidr prefix) =>
+        prefix.PrefixLength >= MinOnLinkPrefix && !IsPrivateOnLink(prefix) && !SpecialRanges.Reserved.Covers(prefix.ToRange());
+
+    /// <summary>
+    /// Какие сети адаптеров считаются локальными (идут напрямую поверх правил).
+    /// <list type="bullet">
+    /// <item>Частные (RFC 1918), CGNAT, link-local сети, 192.0.0.0/29 и 198.18.0.0/15 - у любого адаптера.</item>
+    /// <item>Адаптер из списка «Доверенные адаптеры» (<see cref="AdapterTrust.Explicit"/>): любая его сеть и его
+    /// собственные маршруты не короче /8 (подсети за Tailscale, управляемые маршруты ZeroTier).</item>
+    /// <item>Распознанная виртуальная сеть (<see cref="AdapterTrust.Overlay"/>): публичная сеть и маршруты - только из
+    /// известных диапазонов поставщика (<see cref="OverlayAdapters.VendorRanges"/>). Контроллер ZeroTier, назначивший
+    /// 149.154.160.0/20, иначе открыл бы этот кусок интернета мимо VPN.</item>
+    /// <item>Остальные публичные сети - не локальны (Untrusted): чужая точка доступа с такой сетью иначе вывела бы её из
+    /// VPN. Маршрутизатор такой сети с частным адресом локален как прежде, с публичным - уходит в Gateways: он локален
+    /// слоем ниже правил пользователя и закреплений, а защита пропускает его только через свой адаптер.</item>
+    /// </list>
+    /// </summary>
+    public static OnLinkSelection SelectOnLinkPrefixes(
+        IEnumerable<AdapterCandidate> adapters,
+        Func<AdapterCandidate, AdapterTrust> trust,
+        Func<AdapterCandidate, IEnumerable<Ipv4Cidr>>? routes = null)
     {
         ArgumentNullException.ThrowIfNull(adapters);
-        ArgumentNullException.ThrowIfNull(trusted);
+        ArgumentNullException.ThrowIfNull(trust);
         var local = new List<Ipv4Cidr>();
-        var untrusted = new List<Ipv4Cidr>();
+        var untrusted = new List<(AdapterCandidate, Ipv4Cidr)>();
+        var gateways = new List<AdapterGateway>();
         foreach (var adapter in adapters)
         {
-            var isTrusted = trusted(adapter);
-            foreach (var prefix in adapter.OnLinkPrefixes.Where(p => p.PrefixLength >= MinOnLinkPrefix))
+            var level = trust(adapter);
+            // Маршруты нужны только доверенному адаптеру: таблица маршрутов велика, а таких адаптеров единицы.
+            local.AddRange(TrustedNetworks(adapter, level, level == AdapterTrust.None ? [] : routes?.Invoke(adapter) ?? []));
+            foreach (var prefix in adapter.OnLinkPrefixes.Where(p => p.PrefixLength >= MinOnLinkPrefix && !IsLocalFor(p, adapter, level)))
             {
-                if (isTrusted || IsPrivateOnLink(prefix))
+                untrusted.Add((adapter, prefix));
+                if (adapter.DefaultGateway is not { } gateway || !prefix.Contains(gateway))
                 {
-                    local.Add(prefix);
                     continue;
                 }
 
-                untrusted.Add(prefix);
-                if (adapter.DefaultGateway is { } gateway && prefix.Contains(gateway))
+                if (SpecialRanges.Local.Contains(gateway))
                 {
                     local.Add(new Ipv4Cidr(gateway, 32));
+                }
+                else
+                {
+                    gateways.Add(new AdapterGateway(gateway, adapter.Luid));
                 }
             }
         }
 
-        return ([.. local.Distinct()], [.. untrusted.Distinct()]);
+        return new OnLinkSelection([.. local.Distinct()], [.. untrusted.Distinct()], [.. gateways.Distinct()]);
     }
+
+    /// <summary>
+    /// Сети адаптера, которые локальны по его уровню доверия: on-link-сети и (для доверенного) его маршруты. Служба
+    /// запоминает их, пока адаптер на время теряет адрес, и строит по ним разрешение защиты для адаптера.
+    /// </summary>
+    public static List<Ipv4Cidr> TrustedNetworks(AdapterCandidate adapter, AdapterTrust level, IEnumerable<Ipv4Cidr> routes)
+    {
+        ArgumentNullException.ThrowIfNull(adapter);
+        ArgumentNullException.ThrowIfNull(routes);
+        var result = adapter.OnLinkPrefixes.Where(p => p.PrefixLength >= MinOnLinkPrefix && IsLocalFor(p, adapter, level)).ToList();
+        if (level != AdapterTrust.None)
+        {
+            // Маршрут по умолчанию и пара /1 (выход Tailscale, полный туннель ZeroTier) сюда не попадают: не короче /8.
+            result.AddRange(routes.Where(r => r.PrefixLength >= MinOnLinkPrefix
+                && (level == AdapterTrust.Explicit || SpecialRanges.Local.Covers(r.ToRange()) || OverlayAdapters.VendorRanges(adapter.Description).Covers(r.ToRange()))));
+        }
+
+        return [.. result.Distinct()];
+    }
+
+    private static bool IsLocalFor(Ipv4Cidr prefix, AdapterCandidate adapter, AdapterTrust level) =>
+        IsPrivateOnLink(prefix)
+        || level == AdapterTrust.Explicit
+        || (level == AdapterTrust.Overlay && OverlayAdapters.VendorRanges(adapter.Description).Covers(prefix.ToRange()));
 
     /// <summary>
     /// Слой сетей шлюзов. Слой шлюза, вышедший за <see cref="GatewayNetworkLimits"/>, отбрасывается целиком
@@ -324,83 +416,108 @@ public static class PolicyCompiler
     /// Адреса, которые адресные слои держат за собой (см. <see cref="PinRejection"/>), закреплению не подлежат:
     /// суффикс правила накрыл бы и их, а ответ чужого DNS мог бы назвать любой адрес.
     /// </summary>
-    internal static (IReadOnlyList<PinnedHost> Accepted, IReadOnlyList<RejectedPin> Rejected) ResolvePins(
+    internal static PinResolution ResolvePins(
         PolicyInput input,
         IntervalPainter painter,
         IReadOnlyDictionary<Guid, IReadOnlyList<Guid>> groups)
     {
         if (input.PinnedHosts.Count == 0)
         {
-            return ([], []);
+            return new([], [], []);
         }
 
         var result = new List<PinnedHost>(input.PinnedHosts.Count);
         var rejected = new List<RejectedPin>();
+        var ignored = new List<uint>();
         var seen = new HashSet<uint>(input.PinnedHosts.Count);
         // DNS службы может сохранить адресное решение пользователя (а не метку ServiceDns), но закреплению он
         // не подлежит: блок «чужой интерфейс» закрепления весит не меньше разрешения DNS службы.
         var serviceDns = input.ServiceDnsAddresses.ToHashSet();
         foreach (var pin in input.PinnedHosts)
         {
-            if (!seen.Add(pin.Address) || serviceDns.Contains(pin.Address))
+            if (!seen.Add(pin.Address))
             {
                 continue;
             }
 
-            var (allowed, reason) = PinRejection(pin.Address, pin.Target, painter.Classify(pin.Address));
-            if (!allowed)
+            if (serviceDns.Contains(pin.Address))
             {
-                if (reason is not null)
-                {
-                    rejected.Add(new RejectedPin(pin.Address, pin.Target, reason));
-                }
-
+                ignored.Add(pin.Address);
                 continue;
             }
 
-            result.Add(pin with { Target = ResolvePinTarget(pin.Address, pin.Target, groups) });
+            var resolved = ResolvePinTarget(pin.Address, pin.Target, groups);
+            var (allowed, reason) = PinRejection(pin, resolved, painter.Classify(pin.Address));
+            if (allowed)
+            {
+                result.Add(pin with { Target = resolved });
+            }
+            else if (reason is null)
+            {
+                ignored.Add(pin.Address);
+            }
+            else
+            {
+                rejected.Add(new RejectedPin(pin.Address, pin.Target, reason));
+            }
         }
 
-        return (result, rejected);
+        return new(result, rejected, ignored);
     }
 
     /// <summary>
     /// Можно ли закрепить адрес по правилу для домена поверх его адресного решения. Закрепление - ответ DNS, а его
-    /// содержимое выбирает сервер имён (возможно, чужой), поэтому оно не перекрывает решений, которые сильнее:
+    /// содержимое выбирает сервер имён (возможно, чужой). Принцип: закрепление может увести трафик В туннель, но не
+    /// вывести его из туннеля и не открыть то, что пользователь закрыл.
     /// <list type="bullet">
-    /// <item>служебные адреса: сервер VPN, DNS службы, служебный адрес туннеля, loopback, сеть адаптера, а также
-    /// <see cref="Unpinnable"/> (блокирующий DNS отвечает 0.0.0.0) - отказ без причины, он ожидаем;</item>
-    /// <item>запрет пользователя («Блокировать» по адресу);</item>
-    /// <item>локальные диапазоны (частные сети без ручного правила, link-local, multicast), сети шлюза AnyConnect и
-    /// зарезервированные диапазоны;</item>
-    /// <item>цель «напрямую» поверх ручного правила, которое направляет адрес в туннель. Закрепление в туннель поверх
-    /// правила «напрямую» или в другой туннель допустимо: трафик остаётся в VPN.</item>
+    /// <item>Молчаливый отказ (Reason = null, адрес идёт по своему решению, ответ DNS отдаётся): служебные адреса
+    /// (сервер VPN, DNS службы, служебный адрес туннеля, loopback, сеть адаптера), <see cref="Unpinnable"/> (блокирующий
+    /// DNS отвечает 0.0.0.0) и цель «напрямую» на адресе локальной сети без ручного правила - он и так не уходит в VPN, а
+    /// прямой маршрут через маршрутизатор открыл бы его в обход «Локального доступа» по выбору чужого DNS.</item>
+    /// <item>Закрепление, которое ничего не меняет (та же цель, что у адресного решения), принимается.</item>
+    /// <item>Локальная сеть без ручного правила (10.x, публичный маршрутизатор недоверенного адаптера): туннель и группа
+    /// принимаются - трафик уходит только в VPN, а при лежащем туннеле адрес блокируется.</item>
+    /// <item>198.18.0.0/15 (<see cref="FakeIpPool"/>) принимается с любой целью; остальные зарезервированные диапазоны
+    /// (документационные, 192.0.0.0/24) - отказ.</item>
+    /// <item>Запрет пользователя по адресу и сеть шлюза AnyConnect с другой целью - отказ.</item>
+    /// <item>Цель «напрямую» поверх ручного правила в туннель: для публичного адреса решает приоритет - правило для
+    /// домена с приоритетом не ниже CIDR-правила (равный - домен важнее, как в 0.18.0) принимается, иначе отказ; для
+    /// частного и зарезервированного адреса - всегда отказ (чужой DNS мог бы вывести адрес сети за VPN наружу).</item>
     /// </list>
-    /// Непринятый адрес идёт по адресным правилам.
+    /// Отказ с причиной служба не отдаёт программе (SERVFAIL) и показывает предупреждение с правилом и причиной.
     /// </summary>
-    internal static (bool Allowed, string? Reason) PinRejection(uint address, RouteTarget target, Classification label)
+    internal static (bool Allowed, string? Reason) PinRejection(PinnedHost pin, RouteTarget resolvedTarget, Classification label)
     {
-        if (Unpinnable.Contains(address)
+        if (Unpinnable.Contains(pin.Address)
             || label.Source is DecisionSource.Server or DecisionSource.ServiceDns or DecisionSource.Loopback
                 or DecisionSource.OnLink or DecisionSource.TunnelInfrastructure)
         {
             return (false, null);
         }
 
-        var reason = label switch
+        var pinned = Label(resolvedTarget, DecisionSource.DomainRule);
+        if (pinned.Decision == label.Decision && pinned.Tunnel == label.Tunnel)
         {
-            { Source: DecisionSource.UserRule, Decision: Decision.Block } => "адрес запрещён правилом пользователя",
-            { Source: DecisionSource.UserRule, Decision: Decision.Vpn } when target.Kind == TargetKind.Direct =>
-                "правило пользователя направляет адрес в VPN, а правило для домена - напрямую",
-            { Source: DecisionSource.LocalNetwork } => "адрес из локальной сети",
-            { Source: DecisionSource.ServerNetwork } => "адрес из сети шлюза AnyConnect",
-            { Source: DecisionSource.Reserved } => "адрес из зарезервированного диапазона",
-            _ => null,
+            return (true, null);
+        }
+
+        var direct = pin.Target.Kind == TargetKind.Direct;
+        return label switch
+        {
+            { Source: DecisionSource.LocalNetwork } => direct ? (false, null) : (true, null),
+            { Source: DecisionSource.Reserved } when FakeIpPool.Contains(pin.Address) => (true, null),
+            { Source: DecisionSource.Reserved } => (false, "адрес из зарезервированного диапазона"),
+            { Source: DecisionSource.ServerNetwork } => (false, "адрес из сети шлюза AnyConnect"),
+            { Source: DecisionSource.UserRule, Decision: Decision.Block } => (false, "адрес запрещён правилом пользователя"),
+            { Source: DecisionSource.UserRule, Decision: Decision.Vpn } when direct && SpecialRanges.AllNonPublic.Contains(pin.Address) =>
+                (false, $"правило {label.Rule?.Cidr} направляет частный адрес в VPN, а правило для домена - напрямую"),
+            { Source: DecisionSource.UserRule, Decision: Decision.Vpn } when direct && pin.Priority < (label.Rule?.Priority ?? RoutePriority.Normal) =>
+                (false, $"правило {label.Rule?.Cidr} с более высоким приоритетом направляет адрес в VPN"),
+            _ => (true, null),
         };
-        return (reason is null, reason);
     }
 
-    private static RouteTarget ResolvePinTarget(uint address, RouteTarget target, IReadOnlyDictionary<Guid, IReadOnlyList<Guid>> groups)
+    internal static RouteTarget ResolvePinTarget(uint address, RouteTarget target, IReadOnlyDictionary<Guid, IReadOnlyList<Guid>> groups)
     {
         if (!target.IsGroup(out var group))
         {
@@ -443,6 +560,10 @@ public static class PolicyCompiler
 
     /// <summary>Решение принято любым правилом пользователя.</summary>
     private static bool IsUserRule(Classification label) => label.Source == DecisionSource.UserRule;
+
+    /// <summary>Решение принято правилом пользователя ровно на один адрес (/32).</summary>
+    private static bool IsUserHostRule(Classification label) =>
+        label is { Source: DecisionSource.UserRule, Rule.Cidr.PrefixLength: 32 };
 
     /// <summary>Решение принято правилом пользователя «Блокировать»: его не перекрывает никакой следующий слой.</summary>
     private static bool IsUserBlock(Classification label) =>

@@ -753,8 +753,9 @@ public sealed partial class Coordinator
 
         var all = session.DnsAddresses();
         var conflicts = all.Where(onLink.Contains).ToList();
-        // «Ручные правила важнее сетей шлюза»: адрес DNS, который правило пользователя направило в другую цель (напрямую,
-        // в другой туннель, «Блокировать»), не уводится в этот туннель ради DNS - он убирается из DNS туннеля.
+        // «Ручные правила важнее сетей шлюза»: адрес DNS, который пользователь запретил или направил в другую цель правилом
+        // на этот самый адрес (/32), не уводится в этот туннель ради DNS - он убирается из DNS туннеля. Широкое правило
+        // (10.0.0.0/8 → «Напрямую») адрес DNS шлюза не отбирает: иначе split DNS пропал бы целиком.
         var ruled = _settings.Profile(tunnel.ProfileId) is { AnyConnect.UserRulesOverrideServerNetworks: true }
             ? all.Except(conflicts).Where(a => DnsRuleConflict(a, tunnel.ProfileId)).ToList()
             : [];
@@ -782,14 +783,16 @@ public sealed partial class Coordinator
 
     /// <summary>
     /// Действующее ручное правило для адреса (то, что ложится в политике последним: по приоритету, затем самое узкое)
-    /// направляет его не в этот туннель.
+    /// направляет его не в этот туннель и при этом сильнее адреса DNS шлюза: «Блокировать» или правило ровно на этот
+    /// адрес (/32). Так же решает политика (<see cref="TunnelHost.UserRulesWin"/>).
     /// </summary>
     private bool DnsRuleConflict(uint address, Guid tunnel)
     {
         var (rules, _) = ParsedRules();
         var rule = rules.Where(r => r.Cidr.Contains(address))
             .OrderBy(r => r.Priority).ThenBy(r => r.Cidr.PrefixLength).LastOrDefault();
-        return rule is not null && rule.Target != RouteTarget.Tunnel(tunnel);
+        return rule is not null && rule.Target != RouteTarget.Tunnel(tunnel)
+            && (rule.Target.Kind == TargetKind.Block || rule.Cidr.PrefixLength == 32);
     }
 
     private static string DnsLanConflictText(IReadOnlyList<uint> conflicts) =>
@@ -797,8 +800,9 @@ public sealed partial class Coordinator
         + "запросы имён к нему не отправляются, этот адрес остаётся в локальной сети.";
 
     private static string DnsRuleConflictText(IReadOnlyList<uint> conflicts) =>
-        $"адрес DNS-сервера шлюза {string.Join(", ", conflicts.Select(Ipv4.Format))} попадает под ручное правило с другой целью — "
-        + "запросы имён к нему не отправляются, адрес идёт по правилу. Чтобы DNS шлюза работал, измените правило "
+        $"адрес DNS-сервера шлюза {string.Join(", ", conflicts.Select(Ipv4.Format))} запрещён или направлен в другую цель ручным правилом на этот адрес — "
+        + "запросы имён к нему не отправляются, адрес идёт по правилу. Если других DNS у шлюза нет, имена шлюза и правил "
+        + "для доменов в это подключение не разрешаются. Чтобы DNS шлюза работал, измените правило "
         + "или снимите галочку «Ручные правила важнее сетей шлюза».";
 
     /// <summary>
@@ -885,11 +889,12 @@ public sealed partial class Coordinator
     {
         var serviceDns = ServiceDnsAddresses();
         var (rules, _) = ParsedRules();
+        var local = RangeSet.From(OnLinkPrefixes());
         var kept = new List<uint>();
         var dropped = new List<string>();
         foreach (var address in candidates.Distinct())
         {
-            if (GatewayNodeAddressProblem(address, Facts.Primary, serviceDns, rules) is { } reason)
+            if (GatewayNodeAddressProblem(address, Facts.Primary, local, serviceDns, rules) is { } reason)
             {
                 dropped.Add($"{Ipv4.Format(address)} ({reason})");
             }
@@ -907,9 +912,15 @@ public sealed partial class Coordinator
         return kept;
     }
 
-    /// <summary>Почему адрес узла шлюза нельзя открыть напрямую; null — можно.</summary>
-    internal static string? GatewayNodeAddressProblem(uint address, AdapterCandidate? primary, IReadOnlyCollection<uint> serviceDns, IReadOnlyList<UserRule> rules)
+    /// <summary>
+    /// Почему адрес узла шлюза нельзя открыть напрямую; null — можно. Локальная сеть - выбранный набор локальных сетей
+    /// (<paramref name="local"/>, <see cref="PolicyCompiler.SelectOnLinkPrefixes"/>), а не сырая сеть адаптера: публичная
+    /// сеть недоверенного адаптера (публичная /16 университета) локальной не считается, и узел шлюза в ней принимается, как
+    /// любой публичный адрес. Маршрут к нему EnsureRoutes всё равно строит по сырой сети адаптера (on-link, без шлюза).
+    /// </summary>
+    internal static string? GatewayNodeAddressProblem(uint address, AdapterCandidate? primary, RangeSet local, IReadOnlyCollection<uint> serviceDns, IReadOnlyList<UserRule> rules)
     {
+        ArgumentNullException.ThrowIfNull(local);
         if (SpecialRanges.GatewayUnusable.Contains(address))
         {
             return "служебный диапазон";
@@ -922,11 +933,15 @@ public sealed partial class Coordinator
                 return "маршрутизатор локальной сети";
             }
 
-            if (primary.Addresses.Contains(address)
-                || primary.OnLinkPrefixes.Any(p => p.PrefixLength >= PolicyCompiler.MinOnLinkPrefix && p.Contains(address)))
+            if (primary.Addresses.Contains(address))
             {
                 return "локальная сеть";
             }
+        }
+
+        if (local.Contains(address))
+        {
+            return "локальная сеть";
         }
 
         if (serviceDns.Contains(address))
@@ -1109,12 +1124,18 @@ public sealed partial class Coordinator
     /// </summary>
     private void AddGatewayDomainRoutes(List<DomainRoute> routes)
     {
-        foreach (var tunnel in Facts.Tunnels.Values.Where(t => t is { IsUp: true, Session: not null, Protocol: VpnProtocol.AnyConnect, VpnDns.Count: > 0 }))
+        // Шлюз прислал DNS, но все его адреса убраны (локальная сеть, ручное правило): имена split DNS не разрешаются вовсе
+        // (SERVFAIL, правило «недоступно»), а не уходят к общему DNS - внутренние имена компании не должны утекать к
+        // публичным резолверам. О причине говорят предупреждения «gateway-dns-lan» и «gateway-dns-rule».
+        foreach (var tunnel in Facts.Tunnels.Values.Where(t => t is { IsUp: true, Session: not null, Protocol: VpnProtocol.AnyConnect }
+            && (t.VpnDns.Count > 0 || t.Session.DnsAddresses().Count > 0)))
         {
-            if (_settings.Profile(tunnel.ProfileId) is not { } profile || TunnelDnsRoute(tunnel) is not { } dns)
+            if (_settings.Profile(tunnel.ProfileId) is not { } profile)
             {
                 continue;
             }
+
+            var dns = TunnelDnsRoute(tunnel, publicFallback: false);
 
             var target = AppSettings.ServerNetworksTarget(profile);
             foreach (var suffix in GatewayDnsNames(tunnel.Session!, profile.AnyConnect.ApplyServerProxy).Where(s => routes.TrueForAll(r =>
@@ -1122,7 +1143,7 @@ public sealed partial class Coordinator
                 && (!r.PinAddresses || r.ExactName || !s.EndsWith("." + r.Suffix, StringComparison.OrdinalIgnoreCase)))))
             {
                 var exact = !tunnel.Session!.DnsSuffixes().Select(SettingsSerializer.NormalizeSuffix).Contains(suffix, StringComparer.OrdinalIgnoreCase);
-                routes.Add(new DomainRoute(suffix, target, dns, PinAddresses: false, ExactName: exact));
+                routes.Add(new DomainRoute(suffix, target, dns, PinAddresses: false, Unavailable: dns is null, ExactName: exact));
             }
         }
     }
