@@ -15,7 +15,7 @@ public readonly record struct OrphanDnsReset(bool V4, bool V6, bool KeptStatic =
 
     /// <summary>Пояснение для отчёта и журнала об адаптере, оставленном из-за статического адреса.</summary>
     public static string StaticNote(string adapterName, string nameServers) =>
-        $"адаптер «{adapterName}» со статическим адресом: DNS «{nameServers}» программы не сброшен (без DHCP адаптер остался бы без DNS) — DNS укажите вручную";
+        $"адаптер «{adapterName}» {Core.Recovery.EmergencyNotes.StaticAddress}: DNS «{nameServers}» программы не сброшен (без DHCP адаптер остался бы без DNS) — DNS укажите вручную";
 }
 
 /// <summary>Кто слушает UDP-порт 53 так, что ему доходят запросы к loopback.</summary>

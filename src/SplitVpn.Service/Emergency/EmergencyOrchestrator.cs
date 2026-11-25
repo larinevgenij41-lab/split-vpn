@@ -4,44 +4,45 @@ using SplitVpn.Core.Recovery;
 
 namespace SplitVpn.Service.Emergency;
 
-/// <summary>Сроки команд. Значения по умолчанию — для настоящей системы; тесты задают малые.</summary>
+/// <summary>
+/// Сроки команд. Значения по умолчанию — из договора (<see cref="EmergencyTimeouts"/>): по тем же числам приложение
+/// считает, сколько ждать команду. Тесты задают малые.
+/// </summary>
 internal sealed record EmergencyOptions
 {
     /// <summary>Сколько ждать занятую блокировку команд.</summary>
-    public TimeSpan LockWait { get; init; } = TimeSpan.FromSeconds(15);
+    public TimeSpan LockWait { get; init; } = EmergencyTimeouts.LockWait;
+
+    /// <summary>Срок проверки, не выполняется ли другая команда этой программы.</summary>
+    public TimeSpan OtherCommandCheck { get; init; } = EmergencyTimeouts.OtherCommandCheck;
 
     /// <summary>Сколько ждать штатной остановки службы до принудительного завершения (общий срок с прежним recover).</summary>
-    public TimeSpan StopWaitBeforeKill { get; init; } = ServiceRecovery.StopWaitBeforeKill;
+    public TimeSpan StopWaitBeforeKill { get; init; } = EmergencyTimeouts.StopWaitBeforeKill;
 
     /// <summary>Сколько ждать выхода завершаемого процесса.</summary>
-    public TimeSpan KillWait { get; init; } = TimeSpan.FromSeconds(10);
+    public TimeSpan KillWait { get; init; } = EmergencyTimeouts.KillWait;
 
     /// <summary>Сколько ждать запуска службы.</summary>
-    public TimeSpan StartWait { get; init; } = TimeSpan.FromSeconds(45);
+    public TimeSpan StartWait { get; init; } = EmergencyTimeouts.StartWait;
 
     /// <summary>Срок одного вызова диспетчера служб внутри шага остановки: не ответил — завершение процессов по пути.</summary>
-    public TimeSpan ScmCallTimeout { get; init; } = TimeSpan.FromSeconds(15);
+    public TimeSpan ScmCallTimeout { get; init; } = EmergencyTimeouts.ScmCallTimeout;
+
+    /// <summary>Сколько перед выходом ждать шаги, не уложившиеся в срок и ещё работающие в фоне.</summary>
+    public TimeSpan AbandonedStepGrace { get; init; } = EmergencyTimeouts.AbandonedStepGrace;
+
+    /// <summary>Общий срок emergency-off (и сетевого шага удаления): худший случай из договора.</summary>
+    public TimeSpan OffDeadline { get; init; } = EmergencyTimeouts.OffWorstCase;
+
+    /// <summary>Общий срок emergency-on.</summary>
+    public TimeSpan OnDeadline { get; init; } = EmergencyTimeouts.OnWorstCase;
 
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromMilliseconds(500);
 
-    /// <summary>Срок шага; null — по умолчанию (<see cref="DefaultTimeout"/>).</summary>
+    /// <summary>Срок шага; null — из договора (<see cref="EmergencyTimeouts.Step"/>).</summary>
     public Func<string, TimeSpan>? StepTimeout { get; init; }
 
-    public TimeSpan TimeoutFor(string step) => StepTimeout?.Invoke(step) ?? DefaultTimeout(step);
-
-    private TimeSpan DefaultTimeout(string step) => step switch
-    {
-        EmergencySteps.Service => StopWaitBeforeKill + (3 * (KillWait + ScmCallTimeout)) + TimeSpan.FromSeconds(30),
-        EmergencySteps.StartService => StartWait + ScmCallTimeout + TimeSpan.FromSeconds(10),
-        EmergencySteps.Wfp => TimeSpan.FromMinutes(2),
-        EmergencySteps.Dns => TimeSpan.FromSeconds(90),
-        EmergencySteps.Routes => TimeSpan.FromSeconds(60),
-        EmergencySteps.Ras => TimeSpan.FromSeconds(45),
-        EmergencySteps.Flag or EmergencySteps.ClearFlag or EmergencySteps.Wcm => TimeSpan.FromSeconds(15),
-        EmergencySteps.FlushDns => TimeSpan.FromSeconds(20),
-        EmergencySteps.ServiceRecheck => (2 * (KillWait + ScmCallTimeout)) + TimeSpan.FromMinutes(2),
-        _ => TimeSpan.FromSeconds(30),
-    };
+    public TimeSpan TimeoutFor(string step) => StepTimeout?.Invoke(step) ?? EmergencyTimeouts.Step(step);
 }
 
 /// <summary>
@@ -61,6 +62,9 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
         EmergencySteps.ServiceRecheck,
     ];
 
+    /// <summary>Повторные снятия: выполняются, только когда нужны, но если выполнялись — их сбой тоже «сеть не возвращена».</summary>
+    private static readonly string[] AgainSteps = [EmergencySteps.WfpAgain, EmergencySteps.RoutesAgain, EmergencySteps.DnsAgain];
+
     /// <summary>Подробности шага, не запущенного из-за общего срока команды.</summary>
     internal const string DeadlineSkipDetail = "не запущен: истёк общий срок команды";
 
@@ -76,23 +80,43 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
         EmergencySteps.FailureActions, EmergencySteps.RestoreFailureActions, EmergencySteps.SuspendState, EmergencySteps.FlushDns,
     };
 
-    public Task<EmergencyReport> OffAsync(CancellationToken overall) =>
-        RunAsync(EmergencyCommands.Off, includeServiceGuard: true, OffStepsAsync, overall);
+    /// <summary>Подробности повторной проверки: какие повторные снятия нужны (заполняет шаг, читает команда после него).</summary>
+    private volatile RecheckFinding? _recheck;
+
+    /// <summary>Шаг DNS выполнялся по правилам работающей службы (остановка не была подтверждена).</summary>
+    private bool _dnsUsedRunningRules;
+
+    public Task<EmergencyReport> OffAsync(CancellationToken overall, Guid? reportId = null) =>
+        RunAsync(EmergencyCommands.Off, includeServiceGuard: true, OffStepsAsync, options.OffDeadline, reportId, overall);
 
     /// <summary>Шаг удаления программы: остановка службы и сеть, без флага и без смены типа запуска.</summary>
     public Task<EmergencyReport> UninstallNetworkAsync(CancellationToken overall) =>
-        RunAsync("uninstall-network", includeServiceGuard: false, OffStepsAsync, overall);
+        RunAsync("uninstall-network", includeServiceGuard: false, OffStepsAsync, options.OffDeadline, null, overall);
 
-    public Task<EmergencyReport> OnAsync(CancellationToken overall) =>
-        RunAsync(EmergencyCommands.On, includeServiceGuard: true, OnStepsAsync, overall);
+    public Task<EmergencyReport> OnAsync(CancellationToken overall, Guid? reportId = null) =>
+        RunAsync(EmergencyCommands.On, includeServiceGuard: true, OnStepsAsync, options.OnDeadline, reportId, overall);
 
     private async Task<EmergencyReport> RunAsync(string command, bool includeServiceGuard,
-        Func<StepRunner, bool, CancellationToken, Task> steps, CancellationToken overall)
+        Func<StepRunner, bool, CancellationToken, Task> steps, TimeSpan deadline, Guid? reportId, CancellationToken overall)
     {
         var started = DateTimeOffset.UtcNow;
         if (!SafeIsElevated())
         {
-            return Finish(command, started, [], EmergencyExitCodes.NotElevated);
+            return Finish(command, started, [], EmergencyExitCodes.NotElevated, reportId);
+        }
+
+        // Общий срок команды — худший случай из договора: приложение ждёт его с запасом, и команда не должна пережить это
+        // ожидание. Отсчёт — с начала, вместе с ожиданием блокировки.
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(overall);
+        limit.CancelAfter(deadline);
+        overall = limit.Token;
+
+        // Включение рядом с другой командой этой программы (по живым процессам, а не по мьютексу, который может занять и
+        // обычный пользователь) не выполняется: оно перезапускало бы службу, которую та команда как раз останавливает, и
+        // вернуло бы автоперезапуск посреди её остановки. Отключение идемпотентно и выполняется всё равно.
+        if (command == EmergencyCommands.On && OtherCommandRunning())
+        {
+            return Finish(command, started, [], EmergencyExitCodes.Busy, reportId);
         }
 
         // Блокировка — только от двух одновременных команд. Занять её заранее может и обычный пользователь (мьютекс в
@@ -120,9 +144,34 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
         {
             var runner = new StepRunner(options);
             await steps(runner, includeServiceGuard, overall);
+
+            // Шаги, не уложившиеся в срок, ещё работают в фоне: перед выходом процесса им дано немного времени, чтобы начатая
+            // запись (копия DNS, состояние) не оборвалась на середине. Дольше не ждём: команда должна ответить.
+            await runner.DrainAbandonedAsync(options.AbandonedStepGrace);
             var code = command == EmergencyCommands.On ? OnExitCode(runner.Steps) : OffExitCode(runner.Steps);
-            return Finish(command, started, runner.Steps, code, lockNote);
+            return Finish(command, started, runner.Steps, code, reportId, lockNote);
         }
+    }
+
+    /// <summary>Выполняется ли другая команда восстановления этой программы; сбой или зависание проверки — «нет».</summary>
+    private bool OtherCommandRunning()
+    {
+        var check = Task.Factory.StartNew(system.OtherRecoveryCommandRunning, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        try
+        {
+            if (check.Wait(options.OtherCommandCheck))
+            {
+                return check.Result;
+            }
+        }
+        catch (AggregateException ex)
+        {
+            Trace.TraceWarning("Проверка другой команды не удалась: {0}", ex.GetBaseException().Message);
+            return false;
+        }
+
+        _ = check.ContinueWith(t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return false;
     }
 
     private bool SafeIsElevated()
@@ -163,9 +212,30 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
         await run.StepAsync(EmergencySteps.Wfp, _ => system.RemoveFilters(), overall);
         await run.StepAsync(EmergencySteps.Ras, system.HangUpConnectionsAsync, overall);
         await run.StepAsync(EmergencySteps.Routes, _ => system.RemoveRoutes(), overall);
+        _dnsUsedRunningRules = !serviceStopped;
         await run.StepAsync(EmergencySteps.Dns, _ => system.RestoreDns(serviceStopped), overall);
         await run.StepAsync(EmergencySteps.Wcm, _ => system.RestoreWcm(), overall);
-        await run.StepAsync(EmergencySteps.ServiceRecheck, RecheckService, overall);
+
+        // Повторная проверка — только подсчёт и завершение процессов службы; повторные снятия — отдельными шагами со своими
+        // сроками и только когда нужны.
+        _recheck = null;
+        var recheck = await run.StepAsync(EmergencySteps.ServiceRecheck, RecheckService, overall);
+        var finding = _recheck;
+        if (finding is null || finding.Alive > 0 || !recheck.Succeeded)
+        {
+            // Процессы службы были живы (или проверка не дошла до конца): живая служба могла вернуть своё. DNS — по правилам
+            // остановленной службы, только если процессов подтверждённо не осталось.
+            var stopped = finding is { Left: 0 };
+            await run.StepAsync(EmergencySteps.WfpAgain, _ => system.RemoveFilters(), overall);
+            await run.StepAsync(EmergencySteps.RoutesAgain, _ => system.RemoveRoutes(), overall);
+            await run.StepAsync(EmergencySteps.DnsAgain, _ => system.RestoreDns(stopped), overall);
+        }
+        else if (_dnsUsedRunningRules)
+        {
+            // Остановка не была подтверждена, и DNS шёл по правилам работающей службы (наш loopback мог остаться), а процессов
+            // службы нет: без посредника такой DNS не отвечает — DNS ещё раз, по правилам остановленной службы.
+            await run.StepAsync(EmergencySteps.DnsAgain, _ => system.RestoreDns(true), overall);
+        }
 
         // Флаг приостановки — после сетевых шагов: он не нужен для возврата сети, а работающая служба записала бы своё
         // состояние поверх него. Каталог данных при этом не исправляется (никакого рекурсивного обхода прав): недоверенный
@@ -182,10 +252,14 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
         }
     }
 
+    /// <summary>Итог повторной проверки: сколько процессов службы было и сколько осталось.</summary>
+    private sealed record RecheckFinding(int Alive, int Left);
+
     /// <summary>
     /// Повторная проверка после сетевых шагов: остались процессы службы (остановка не удалась, процесс не отдал дескриптор
-    /// или служба запустилась снова) — они завершаются, и фильтры, маршруты и DNS снимаются ещё раз: живая служба
-    /// успела бы вернуть своё. Процессы остались и после этого — шаг не выполнен (код 3), итог говорит, что служба работает.
+    /// или служба запустилась снова) — они завершаются; фильтры, маршруты и DNS после этого снимаются ещё раз отдельными
+    /// шагами (живая служба успела бы вернуть своё). Процессы остались и после этого — шаг не выполнен (код 3), итог
+    /// говорит, что служба работает.
     /// </summary>
     private StepResult RecheckService(CancellationToken cancellationToken)
     {
@@ -201,6 +275,7 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
 
         if (alive == 0)
         {
+            _recheck = new RecheckFinding(0, 0);
             return StepResult.Already("процессов службы нет");
         }
 
@@ -225,41 +300,14 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
             left = alive;
         }
 
-        var failed = false;
-        foreach (var (name, action) in new (string, Func<StepResult>)[]
-        {
-            ("фильтры WFP", system.RemoveFilters),
-            ("маршруты", system.RemoveRoutes),
-            ("DNS", () => system.RestoreDns(left == 0)),
-        })
-        {
-            if (cancellationToken.IsCancellationRequested)
-            {
-                notes.Add(name + ": не снято повторно — истёк срок шага");
-                failed = true;
-                continue;
-            }
-
-            try
-            {
-                var result = action();
-                var ok = result.Outcome is EmergencyStepOutcome.Done or EmergencyStepOutcome.Already or EmergencyStepOutcome.Skipped;
-                failed |= !ok;
-                notes.Add(name + (ok ? " сняты повторно" : ": " + (result.Detail ?? "не снято")));
-            }
-            catch (Exception ex) when (ex is not OutOfMemoryException)
-            {
-                failed = true;
-                notes.Add(name + ": " + ex.Message);
-            }
-        }
-
+        _recheck = new RecheckFinding(alive, left);
         if (left > 0)
         {
             return StepResult.Failed($"{StillRunningDetail}: процессов {left}; " + string.Join("; ", notes));
         }
 
-        return failed ? StepResult.Failed(string.Join("; ", notes)) : StepResult.Done(string.Join("; ", notes));
+        notes.Add("фильтры, маршруты и DNS снимаются ещё раз");
+        return StepResult.Done(string.Join("; ", notes));
     }
 
     private async Task OnStepsAsync(StepRunner run, bool full, CancellationToken overall)
@@ -479,7 +527,7 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
     /// <summary>Код завершения отключения: сеть важнее службы.</summary>
     internal static int OffExitCode(IReadOnlyList<EmergencyStepReport> steps)
     {
-        if (steps.Any(s => s.Required && NetworkSteps.Contains(s.Step) && !s.Succeeded))
+        if (steps.Any(s => s.Required && (NetworkSteps.Contains(s.Step) || AgainSteps.Contains(s.Step)) && !s.Succeeded))
         {
             return EmergencyExitCodes.Incomplete;
         }
@@ -502,28 +550,45 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
             : EmergencyExitCodes.Success;
     }
 
-    /// <summary>Сеть возвращена: каждый сетевой шаг есть в отчёте и выполнен (не запущенный из-за общего срока — не выполнен).</summary>
+    /// <summary>
+    /// Сеть возвращена: каждый сетевой шаг есть в отчёте и выполнен (не запущенный из-за общего срока — не выполнен), как и
+    /// каждое повторное снятие, если оно было.
+    /// </summary>
     internal static bool IsNetworkClean(IReadOnlyList<EmergencyStepReport> steps) =>
-        NetworkSteps.All(id => steps.Any(s => s.Step == id && s.Succeeded));
+        NetworkSteps.All(id => steps.Any(s => s.Step == id && s.Succeeded))
+        && steps.Where(s => AgainSteps.Contains(s.Step)).All(s => s.Succeeded);
 
-    private static EmergencyReport Finish(string command, DateTimeOffset started, IReadOnlyList<EmergencyStepReport> steps, int code, string? lockNote = null)
+    /// <summary>
+    /// Итог одним абзацем: что получилось (по коду), что из обязательного не выполнено («Не выполнено»), служба ли ещё
+    /// работает, отдельно — необязательные шаги, которые не удались («Замечания»: на код не влияют), и о блокировке.
+    /// </summary>
+    internal static string Summary(string command, int code, IReadOnlyList<EmergencyStepReport> steps, string? lockNote)
     {
         var on = command == EmergencyCommands.On;
-        var failed = steps.Where(s => !s.Succeeded).Select(s => s.Title).ToList();
-        var serviceConfirmed = steps.FirstOrDefault(s => s.Step == (on ? EmergencySteps.StartService : EmergencySteps.Service)) is { Succeeded: true };
+        var failed = steps.Where(s => !s.Succeeded && s.Required).Select(s => s.Title).ToList();
+        var remarks = steps.Where(s => !s.Succeeded && !s.Required).Select(s => s.Title).ToList();
         var stillRunning = steps.Any(s => s.Step == EmergencySteps.ServiceRecheck && !s.Succeeded
             && s.Detail?.StartsWith(StillRunningDetail, StringComparison.Ordinal) == true);
-        var summary = EmergencyExitCodes.Describe(code, on)
+        return EmergencyExitCodes.Describe(code, on)
             + (failed.Count > 0 ? " Не выполнено: " + string.Join(", ", failed) + "." : "")
             + (stillRunning ? " Служба всё ещё работает и может снова применить фильтры, маршруты и DNS." : "")
+            + (remarks.Count > 0 ? " Замечания (на итог не влияют): не удалось — " + string.Join(", ", remarks) + "." : "")
             + (lockNote is null ? "" : " " + lockNote);
+    }
+
+    private static EmergencyReport Finish(string command, DateTimeOffset started, IReadOnlyList<EmergencyStepReport> steps, int code,
+        Guid? reportId, string? lockNote = null)
+    {
+        var on = command == EmergencyCommands.On;
+        var serviceConfirmed = steps.FirstOrDefault(s => s.Step == (on ? EmergencySteps.StartService : EmergencySteps.Service)) is { Succeeded: true };
         return new EmergencyReport
         {
             Command = command,
+            ReportId = reportId,
             StartedUtc = started,
             FinishedUtc = DateTimeOffset.UtcNow,
             ExitCode = code,
-            Summary = summary,
+            Summary = Summary(command, code, steps, lockNote),
             NetworkClean = !on && IsNetworkClean(steps),
             ServiceConfirmed = serviceConfirmed,
             Steps = steps,
@@ -534,8 +599,31 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
     internal sealed class StepRunner(EmergencyOptions options)
     {
         private readonly List<EmergencyStepReport> _steps = [];
+        private readonly List<Task> _abandoned = [];
 
         public IReadOnlyList<EmergencyStepReport> Steps => _steps;
+
+        /// <summary>
+        /// Даёт шагам, не уложившимся в срок, ещё не больше <paramref name="grace"/> на завершение: начатая запись не
+        /// обрывается выходом процесса. Не успели — процесс всё равно завершается (команда не висит бесконечно).
+        /// </summary>
+        public async Task DrainAbandonedAsync(TimeSpan grace)
+        {
+            var running = _abandoned.Where(t => !t.IsCompleted).ToArray();
+            if (running.Length == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                await Task.WhenAll(running).WaitAsync(grace);
+            }
+            catch (TimeoutException)
+            {
+                Trace.TraceWarning("Шаги, не уложившиеся в срок, ещё работают: {0}", running.Count(t => !t.IsCompleted));
+            }
+        }
 
         public Task<EmergencyStepReport> StepAsync(string step, Func<CancellationToken, StepResult> body, CancellationToken overall, bool required = true) =>
             StepAsync(step, token => Task.FromResult(body(token)), overall, required);
@@ -600,12 +688,13 @@ internal sealed class EmergencyOrchestrator(IEmergencySystem system, EmergencyOp
                         Trace.TraceWarning("Отмена шага {0}: {1}", step, ex.GetBaseException().Message);
                     }
 
-                    // Зависший шаг не должен уронить процесс необработанным исключением, когда всё же завершится.
-                    _ = task.ContinueWith(t =>
+                    // Зависший шаг не должен уронить процесс необработанным исключением, когда всё же завершится. Продолжение
+                    // само не падает: перед выходом процесса команда ждёт его недолго (DrainAbandonedAsync).
+                    _abandoned.Add(task.ContinueWith(t =>
                     {
                         _ = t.Exception;
                         limit.Dispose();
-                    }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                    }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default));
                 }
             }
 

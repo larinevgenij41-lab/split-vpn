@@ -349,7 +349,11 @@ public sealed partial class CoordinatorTests
         Assert.Equal("2606:4700::1111", _world.Dns.NameServersV6[FakeWorld.WiFiGuid]);
     }
 
-    /// <summary>Запись посредника не удалась, и на адаптере остался исходный DNS: это не правка пользователя, копия прежняя.</summary>
+    /// <summary>
+    /// Запись посредника не удаётся раз за разом, и на адаптере остаётся исходный DNS: это не правка извне — копия прежняя,
+    /// в журнале нет «изменён извне», и после трёх и более сверок адаптер не объявляется «спорным» (после устранения сбоя
+    /// настоящая правка пользователя снова запоминается).
+    /// </summary>
     [Fact]
     public async Task FailedLoopbackWrite_DoesNotRewriteBackup()
     {
@@ -357,13 +361,50 @@ public sealed partial class CoordinatorTests
         var coordinator = await StartAsync();
         _world.Dns.FailLoopback.Add(FakeWorld.WiFiGuid);
         await ConnectAsync(coordinator);
-        var before = new DnsBackupStore(_world.Paths.DnsBackup).Load()[FakeWorld.WiFiGuid];
+        var store = new DnsBackupStore(_world.Paths.DnsBackup);
+        var before = store.Load()[FakeWorld.WiFiGuid];
 
+        for (var tick = 0; tick < 4; tick++)
+        {
+            _world.Time.Advance(Coordinator.FullReconcileInterval);
+            await TickAsync(coordinator);
+            Assert.Equal(before, store.Load()[FakeWorld.WiFiGuid]);
+        }
+
+        Assert.DoesNotContain(_world.Journal.Since(0), e => e.Text.Contains("извне", StringComparison.Ordinal));
+
+        // Сбой записи устранён, и человек сменил DNS: это правка, и она запоминается — адаптер не стал «спорным».
+        _world.Dns.FailLoopback.Remove(FakeWorld.WiFiGuid);
+        _world.Dns.NameServers[FakeWorld.WiFiGuid] = "1.1.1.1";
         _world.Time.Advance(Coordinator.FullReconcileInterval);
         await TickAsync(coordinator);
+        Assert.Equal("1.1.1.1", store.Load()[FakeWorld.WiFiGuid].NameServerV4);
+        Assert.Contains(_world.Journal.Since(0), e => e.Text.Contains("запомнено как исходное", StringComparison.Ordinal));
+        Assert.DoesNotContain(_world.Journal.Since(0), e => e.Text.Contains("переписывается извне раз за разом", StringComparison.Ordinal));
+    }
 
-        Assert.Equal(before, new DnsBackupStore(_world.Paths.DnsBackup).Load()[FakeWorld.WiFiGuid]);
-        Assert.DoesNotContain(_world.Journal.Since(0), e => e.Text.Contains("запомнено как исходное", StringComparison.Ordinal));
+    /// <summary>
+    /// Окно «правки извне» — по монотонному времени: часы перевели назад на час, но три правки, разнесённые на 6 минут
+    /// каждая, всё равно не укладываются в 10 минут — это выбор человека, а не борьба с другой программой (по настенным
+    /// часам все три правки оказались бы «в окне»).
+    /// </summary>
+    [Fact]
+    public async Task ExternalDnsWindow_IgnoresWallClockJumps()
+    {
+        var clock = new ShiftedTimeProvider(_world.Time);
+        var coordinator = await StartWithClockAsync(clock);
+        await ConnectAsync(coordinator);
+
+        foreach (var chosen in new[] { "1.1.1.1", "9.9.9.9", "8.8.8.8" })
+        {
+            _world.Dns.NameServers[FakeWorld.WiFiGuid] = chosen;
+            _world.Time.Advance(TimeSpan.FromMinutes(6));
+            await TickAsync(coordinator);
+            clock.Offset -= TimeSpan.FromHours(1);
+        }
+
+        Assert.Equal("8.8.8.8", new DnsBackupStore(_world.Paths.DnsBackup).Load()[FakeWorld.WiFiGuid].NameServerV4);
+        Assert.DoesNotContain(_world.Journal.Since(0), e => e.Text.Contains("переписывается извне раз за разом", StringComparison.Ordinal));
     }
 
     private static AdapterCandidate Adapter(Guid guid, string name) => new()

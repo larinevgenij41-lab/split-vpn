@@ -50,6 +50,18 @@ public sealed partial class EmergencyViewModel(MainViewModel main) : ObservableO
     [ObservableProperty]
     private EmergencyRunResult? _result;
 
+    /// <summary>
+    /// Список шагов итога раскрыт. Задаётся заново при каждом новом итоге (раскрыт, если есть неудавшиеся шаги и окно не
+    /// низкое), а дальше его меняет только человек — привязка двусторонняя.
+    /// </summary>
+    [ObservableProperty]
+    private bool _stepsExpanded;
+
+    /// <summary>Окно низкое: шаги нового итога свёрнуты, чтобы кнопки итога и баннера были видны без прокрутки. Ставит окно.</summary>
+    internal bool CompactLayout { get; set; }
+
+    partial void OnResultChanged(EmergencyRunResult? value) => StepsExpanded = value is { HasProblems: true } && !CompactLayout;
+
     public string BannerText => UiText.EmergencyBannerText(Since);
 
     /// <summary>Пункт меню трея: выключить или, если уже выключена, включить.</summary>
@@ -141,7 +153,9 @@ public sealed partial class EmergencyViewModel(MainViewModel main) : ObservableO
 
     /// <summary>
     /// Запуск команды. Пока она идёт, повторный запуск (кнопка, трей, баннер) ничего не делает. Перед выключением
-    /// снимается свой прокси шлюза. После команды флаг перечитывается из реестра, затем опрашивается служба.
+    /// снимается свой прокси шлюза. Команда не уложилась в отведённое время — она не прерывается: показывается «ещё
+    /// выполняется», кнопки выключения и включения остаются недоступными до её настоящего окончания, затем — итог. После
+    /// команды флаг перечитывается из реестра, затем опрашивается служба.
     /// </summary>
     internal async Task RunAsync(bool on)
     {
@@ -170,6 +184,13 @@ public sealed partial class EmergencyViewModel(MainViewModel main) : ObservableO
             }
 
             var result = await Launcher.RunAsync(on);
+            if (result is { Kind: EmergencyRunKind.Overdue, Completion: { } completion })
+            {
+                Result = result;
+                RunningText = UiText.EmergencyStillRunningText(on);
+                result = await completion;
+            }
+
             if (result.Kind == EmergencyRunKind.Cancelled)
             {
                 main.CurrentPage.ShowInfo(result.Summary);

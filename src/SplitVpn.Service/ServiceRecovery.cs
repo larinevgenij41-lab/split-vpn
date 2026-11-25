@@ -90,11 +90,15 @@ public static class ServiceRecovery
     private static readonly Lock FinishGate = new();
     private static bool _abandoned;
 
-    public static async Task<int> RunAsync(ServicePaths paths, RecoveryMode mode)
+    /// <param name="reportId">
+    /// Метка запуска (<see cref="EmergencyCommands.ReportIdOption"/>) для emergency-off/-on: повторяется в отчёте, чтобы
+    /// запустивший отличил свой отчёт от прежнего или подложенного.
+    /// </param>
+    public static async Task<int> RunAsync(ServicePaths paths, RecoveryMode mode, Guid? reportId = null)
     {
         if (mode is RecoveryMode.Recover or RecoveryMode.EmergencyOff or RecoveryMode.EmergencyOn)
         {
-            return await RunEmergencyAsync(paths, mode == RecoveryMode.EmergencyOn);
+            return await RunEmergencyAsync(paths, mode == RecoveryMode.EmergencyOn, reportId);
         }
 
         using var deadline = new CancellationTokenSource(Watchdog);
@@ -125,15 +129,16 @@ public static class ServiceRecovery
 
     /// <summary>
     /// Экстренное отключение или включение: отчёт — в stdout и в защищённый каталог (<see cref="EmergencyReportFiles"/>),
-    /// код завершения — <see cref="EmergencyExitCodes"/>. У каждого шага свой срок, поэтому общего сторожа нет.
+    /// код завершения — <see cref="EmergencyExitCodes"/>. У каждого шага свой срок, а у команды — общий, из договора
+    /// (<see cref="EmergencyTimeouts.OffWorstCase"/>, <see cref="EmergencyTimeouts.OnWorstCase"/>).
     /// </summary>
-    private static async Task<int> RunEmergencyAsync(ServicePaths paths, bool on)
+    private static async Task<int> RunEmergencyAsync(ServicePaths paths, bool on, Guid? reportId)
     {
         try
         {
             var system = new Emergency.SystemEmergency(paths, AppContext.BaseDirectory);
             var orchestrator = new Emergency.EmergencyOrchestrator(system, new Emergency.EmergencyOptions());
-            var report = on ? await orchestrator.OnAsync(CancellationToken.None) : await orchestrator.OffAsync(CancellationToken.None);
+            var report = on ? await orchestrator.OnAsync(CancellationToken.None, reportId) : await orchestrator.OffAsync(CancellationToken.None, reportId);
             var json = JsonSerializer.Serialize(report, JsonDefaults.Options);
             if (report.ExitCode != EmergencyExitCodes.NotElevated)
             {

@@ -390,6 +390,23 @@ public sealed unsafe partial class SecretStore(string path)
     private static bool IsTrustedOwner(IdentityReference? owner) => owner is not null && (owner.Equals(SystemSid) || owner.Equals(AdministratorsSid));
 
     /// <summary>
+    /// Свой владелец данных: SYSTEM, Administrators или прямой член локальной группы Administrators (файл или каталог,
+    /// созданный повышенным администратором при политике «владелец — создатель»: администратор и так может всё). Одно
+    /// правило для потомков каталога данных здесь и для проверки каталога данных командами экстренного отключения
+    /// (DataRootTrust). Ошибка запроса членства — исключение (Win32Exception) у вызывающего.
+    /// </summary>
+    public static bool IsAcceptedOwner(IdentityReference? owner, Func<SecurityIdentifier, bool> isLocalAdministrator)
+    {
+        ArgumentNullException.ThrowIfNull(isLocalAdministrator);
+        if (IsTrustedOwner(owner))
+        {
+            return true;
+        }
+
+        return owner is SecurityIdentifier account && isLocalAdministrator(account);
+    }
+
+    /// <summary>
     /// Почему корню данных нельзя доверять; null — можно. Каталог, созданный повышенным администратором при
     /// политике «владелец — создатель», принадлежит его учётной записи, а не группе Administrators: такой
     /// владелец и так может всё, поэтому каталог не переносится, а получает владельца SYSTEM (служба от SYSTEM
@@ -448,7 +465,7 @@ public sealed unsafe partial class SecretStore(string path)
     /// Прямой член локальной группы Administrators. Вложенные группы (например, администраторы домена) не
     /// раскрываются: такой каталог переносится в сторону — это безопасный исход. Ошибка запроса — «нет».
     /// </summary>
-    internal static bool IsLocalAdministrator(SecurityIdentifier account)
+    public static bool IsLocalAdministrator(SecurityIdentifier account)
     {
         string group;
         try
@@ -596,7 +613,7 @@ public sealed unsafe partial class SecretStore(string path)
     private static string? UntrustedOwner(FileSystemSecurity security, Func<SecurityIdentifier, bool> isLocalAdministrator)
     {
         var owner = security.GetOwner(typeof(SecurityIdentifier));
-        if (IsTrustedOwner(owner) || (owner is SecurityIdentifier account && isLocalAdministrator(account)))
+        if (IsAcceptedOwner(owner, isLocalAdministrator))
         {
             return null;
         }

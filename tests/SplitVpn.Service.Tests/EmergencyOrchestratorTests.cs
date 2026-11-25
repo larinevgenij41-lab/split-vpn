@@ -31,6 +31,7 @@ public sealed class EmergencyOrchestratorTests : IDisposable
         StartWait = TimeSpan.FromMilliseconds(200),
         ScmCallTimeout = TimeSpan.FromMilliseconds(300),
         PollInterval = TimeSpan.FromMilliseconds(5),
+        AbandonedStepGrace = TimeSpan.FromMilliseconds(100),
         StepTimeout = timeout ?? (_ => TimeSpan.FromSeconds(10)),
     };
 
@@ -648,6 +649,243 @@ public sealed class EmergencyOrchestratorTests : IDisposable
         Assert.Null(EmergencyRegistry.Parse(1, "мусор")!.SinceUtc);
     }
 
+    // ---------- Итерация 11: сроки, повторные снятия, итог, метка запуска, другая команда ----------
+
+    /// <summary>
+    /// Худший случай в договоре — это ожидание блокировки, проверка другой команды, запас для зависших шагов и сумма сроков
+    /// всех шагов, которые команда может выполнить; общий срок команды по умолчанию равен ему, а сроки шагов по умолчанию
+    /// берутся из того же договора.
+    /// </summary>
+    [Fact]
+    public void WorstCase_IsSumOfStepBudgets_AndIsTheDefaultDeadline()
+    {
+        static TimeSpan Sum(IEnumerable<string> steps) => steps.Aggregate(
+            EmergencyTimeouts.LockWait + EmergencyTimeouts.OtherCommandCheck + EmergencyTimeouts.AbandonedStepGrace, (t, s) => t + EmergencyTimeouts.Step(s));
+
+        Assert.Equal(Sum(EmergencyTimeouts.OffSteps), EmergencyTimeouts.OffWorstCase);
+        Assert.Equal(Sum(EmergencyTimeouts.OnSteps), EmergencyTimeouts.OnWorstCase);
+        Assert.Equal(TimeSpan.FromMinutes(17), EmergencyTimeouts.OffWorstCase);
+        Assert.Distinct(EmergencyTimeouts.OffSteps);
+
+        var defaults = new EmergencyOptions();
+        Assert.Equal(EmergencyTimeouts.OffWorstCase, defaults.OffDeadline);
+        Assert.Equal(EmergencyTimeouts.OnWorstCase, defaults.OnDeadline);
+        Assert.Equal(EmergencyTimeouts.LockWait, defaults.LockWait);
+        Assert.All(EmergencyTimeouts.OffSteps.Concat(EmergencyTimeouts.OnSteps), s => Assert.Equal(EmergencyTimeouts.Step(s), defaults.TimeoutFor(s)));
+        // Срок штатной остановки — тот же, что у службы (срок остановки хоста и 2 с на выход процесса).
+        Assert.Equal(ServiceRecovery.StopWaitBeforeKill, EmergencyTimeouts.StopWaitBeforeKill);
+        // Повторная проверка больше не включает повторные снятия: её срок покрывает два завершения и два вызова диспетчера.
+        Assert.True(EmergencyTimeouts.Step(EmergencySteps.ServiceRecheck) >= 2 * (EmergencyTimeouts.KillWait + EmergencyTimeouts.ScmCallTimeout));
+    }
+
+    /// <summary>Самый длинный путь отключения (служба жива до конца) не выходит за шаги договора и не повторяет шаг.</summary>
+    [Fact]
+    public async Task LongestOffPath_UsesOnlyContractSteps()
+    {
+        _system.QueryThrows = true;
+        _system.KillOwnThrows = true;
+        _system.OwnProcesses = 1;
+
+        var report = await Orchestrator().OffAsync(CancellationToken.None);
+
+        Assert.All(report.Steps, s => Assert.Contains(s.Step, EmergencyTimeouts.OffSteps));
+        Assert.Distinct(report.Steps.Select(s => s.Step));
+        Assert.Contains(report.Steps, s => s.Step == EmergencySteps.WfpAgain);
+        Assert.All(report.Steps, s => Assert.Equal(EmergencySteps.Title(s.Step), s.Title));
+        Assert.DoesNotContain(report.Steps, s => s.Title == s.Step);
+    }
+
+    /// <summary>Общий срок команды истёк посреди шагов: оставшиеся не запускаются и честно помечены.</summary>
+    [Fact]
+    public async Task OwnDeadline_StopsRemainingSteps()
+    {
+        _system.Hang.Add("RemoveFilters");
+        var options = Options() with { OffDeadline = TimeSpan.FromMilliseconds(300) };
+
+        var report = await new EmergencyOrchestrator(_system, options).OffAsync(CancellationToken.None);
+
+        Assert.Equal(EmergencyStepOutcome.Timeout, report.Steps.Single(s => s.Step == EmergencySteps.Wfp).Outcome);
+        Assert.Equal(EmergencyOrchestrator.DeadlineSkipDetail, report.Steps.Single(s => s.Step == EmergencySteps.Dns).Detail);
+        Assert.Equal(EmergencyExitCodes.Incomplete, report.ExitCode);
+    }
+
+    /// <summary>
+    /// Шаг не уложился в срок, но ещё дописывает своё: перед выходом команда даёт ему короткий запас, а зависший навсегда
+    /// шаг её не держит.
+    /// </summary>
+    [Fact]
+    public async Task AbandonedStep_GetsShortGrace_ButNeverHangsTheCommand()
+    {
+        var runner = new EmergencyOrchestrator.StepRunner(Options(_ => TimeSpan.FromMilliseconds(50)));
+        var finished = 0;
+        await runner.StepAsync(EmergencySteps.Dns, _ =>
+        {
+            Thread.Sleep(300);
+            Interlocked.Exchange(ref finished, 1);
+            return StepResult.Done();
+        }, CancellationToken.None);
+        Assert.Equal(0, Volatile.Read(ref finished));
+
+        await runner.DrainAbandonedAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, Volatile.Read(ref finished));
+
+        using var never = new ManualResetEventSlim();
+        await runner.StepAsync(EmergencySteps.Wfp, _ => { never.Wait(TimeSpan.FromSeconds(30), CancellationToken.None); return StepResult.Done(); }, CancellationToken.None);
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        await runner.DrainAbandonedAsync(TimeSpan.FromMilliseconds(200));
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5));
+        never.Set();
+    }
+
+    /// <summary>
+    /// Шаг остановки не подтвердил её (не уложился в срок), а процессов службы уже нет: DNS шёл по правилам работающей
+    /// службы, поэтому выполняется ещё раз — по правилам остановленной (иначе остался бы loopback без посредника).
+    /// </summary>
+    [Fact]
+    public async Task ServiceStepTimedOut_NoProcessesLeft_DnsRerunWithStoppedRules()
+    {
+        _system.Hang.Add("RequestStop");
+
+        var report = await Orchestrator(step => step == EmergencySteps.Service ? TimeSpan.FromMilliseconds(200) : TimeSpan.FromSeconds(10))
+            .OffAsync(CancellationToken.None);
+
+        Assert.Equal(EmergencyStepOutcome.Timeout, report.Steps.Single(s => s.Step == EmergencySteps.Service).Outcome);
+        Assert.Equal(EmergencyStepOutcome.Already, report.Steps.Single(s => s.Step == EmergencySteps.ServiceRecheck).Outcome);
+        Assert.True(IsSubsequence(_system.Calls, ["RestoreDns:False", "RestoreWcm", "RestoreDns:True"]), string.Join(", ", _system.Calls));
+        Assert.Contains(report.Steps, s => s.Step == EmergencySteps.DnsAgain && s.Succeeded);
+        Assert.DoesNotContain(report.Steps, s => s.Step == EmergencySteps.WfpAgain);
+        Assert.Equal(EmergencyExitCodes.ServiceNotConfirmed, report.ExitCode);
+        Assert.True(report.NetworkClean);
+    }
+
+    /// <summary>Повторное снятие не удалось — сеть не возвращена (код 3), даже если основной шаг прошёл.</summary>
+    [Fact]
+    public void FailedAgainStep_IsIncomplete()
+    {
+        var steps = OffOrder.Select(step => new EmergencyStepReport(step, EmergencySteps.Title(step), EmergencyStepOutcome.Done, null, 1,
+            Required: !OptionalSteps.Contains(step))).ToList();
+        Assert.True(EmergencyOrchestrator.IsNetworkClean(steps));
+        steps.Add(new EmergencyStepReport(EmergencySteps.DnsAgain, EmergencySteps.Title(EmergencySteps.DnsAgain), EmergencyStepOutcome.Timeout, null, 1));
+
+        Assert.Equal(EmergencyExitCodes.Incomplete, EmergencyOrchestrator.OffExitCode(steps));
+        Assert.False(EmergencyOrchestrator.IsNetworkClean(steps));
+    }
+
+    /// <summary>Код 0 с неудавшимся необязательным шагом: итог не говорит «Не выполнено», а называет это замечанием.</summary>
+    [Fact]
+    public void Summary_SeparatesRequiredFailures_FromRemarks()
+    {
+        var steps = OffOrder.Select(step => new EmergencyStepReport(step, EmergencySteps.Title(step),
+            step == EmergencySteps.FlushDns ? EmergencyStepOutcome.Failed : EmergencyStepOutcome.Done, null, 1,
+            Required: !OptionalSteps.Contains(step))).ToList();
+        Assert.Equal(EmergencyExitCodes.Success, EmergencyOrchestrator.OffExitCode(steps));
+
+        var ok = EmergencyOrchestrator.Summary(EmergencyCommands.Off, EmergencyExitCodes.Success, steps, null);
+        Assert.DoesNotContain("Не выполнено", ok, StringComparison.Ordinal);
+        Assert.Contains("Замечания (на итог не влияют): не удалось — Кеш DNS.", ok, StringComparison.Ordinal);
+
+        steps[steps.FindIndex(s => s.Step == EmergencySteps.Wfp)] = steps.Single(s => s.Step == EmergencySteps.Wfp) with { Outcome = EmergencyStepOutcome.Failed };
+        var bad = EmergencyOrchestrator.Summary(EmergencyCommands.Off, EmergencyExitCodes.Incomplete, steps, null);
+        Assert.Contains("Не выполнено: Фильтры защиты (WFP).", bad, StringComparison.Ordinal);
+        Assert.DoesNotContain("Не выполнено: Фильтры защиты (WFP), Кеш DNS", bad, StringComparison.Ordinal);
+        Assert.True(bad.IndexOf("Не выполнено", StringComparison.Ordinal) < bad.IndexOf("Замечания", StringComparison.Ordinal));
+    }
+
+    /// <summary>Метка запуска: только GUID сразу за ключом; попадает в отчёт.</summary>
+    [Theory]
+    [InlineData(new[] { "emergency-off", "--report-id", "6f9619ff-8b86-d011-b42d-00c04fc964ff" }, "6f9619ff-8b86-d011-b42d-00c04fc964ff")]
+    [InlineData(new[] { "emergency-on", "--REPORT-ID", "6F9619FF-8B86-D011-B42D-00C04FC964FF" }, "6f9619ff-8b86-d011-b42d-00c04fc964ff")]
+    [InlineData(new[] { "emergency-off", "--report-id", "{6f9619ff-8b86-d011-b42d-00c04fc964ff}" }, null)]
+    [InlineData(new[] { "emergency-off", "--report-id", "6f9619ff8b86d011b42d00c04fc964ff" }, null)]
+    [InlineData(new[] { "emergency-off", "--report-id", "00000000-0000-0000-0000-000000000000" }, null)]
+    [InlineData(new[] { "emergency-off", "--report-id", "x" }, null)]
+    [InlineData(new[] { "emergency-off", "--report-id" }, null)]
+    [InlineData(new[] { "emergency-off" }, null)]
+    public void ReportId_IsStrictGuid(string[] args, string? expected)
+    {
+        Assert.Equal(expected is null ? null : Guid.Parse(expected), EmergencyCommands.ParseReportId(args));
+        // Ключ не меняет саму команду.
+        Assert.True(ServiceRecovery.IsRecoveryCommand(args[0]));
+        Assert.NotEqual(RecoveryMode.Recover, ServiceRecovery.ParseMode(args));
+    }
+
+    [Fact]
+    public async Task ReportId_IsEchoedInReport()
+    {
+        var id = Guid.NewGuid();
+
+        var off = await Orchestrator().OffAsync(CancellationToken.None, id);
+        var json = JsonSerializer.Serialize(off, JsonDefaults.Options);
+
+        Assert.Equal(id, off.ReportId);
+        Assert.Equal(id.ToString("D"), JsonDocument.Parse(json).RootElement.GetProperty("reportId").GetString());
+        Assert.Equal(id, EmergencyReportFiles.Parse(json)!.ReportId);
+        Assert.Null((await Orchestrator().OnAsync(CancellationToken.None)).ReportId);
+    }
+
+    /// <summary>
+    /// Рядом выполняется другая команда этой программы: включение отказывается (код 5, ничего не делалось), а отключение
+    /// выполняется (оно идемпотентно).
+    /// </summary>
+    [Fact]
+    public async Task OtherCommandRunning_OnRefusesWithBusy_OffProceeds()
+    {
+        _system.OtherCommand = true;
+        _system.Flag = true;
+
+        var on = await Orchestrator().OnAsync(CancellationToken.None);
+
+        Assert.Equal(EmergencyExitCodes.Busy, on.ExitCode);
+        Assert.Empty(on.Steps);
+        Assert.True(_system.Flag);
+        Assert.DoesNotContain("RequestStop", _system.Calls);
+        Assert.Contains("уже выполняется другая экстренная команда", on.Summary, StringComparison.Ordinal);
+
+        var off = await Orchestrator().OffAsync(CancellationToken.None);
+        Assert.Equal(EmergencyExitCodes.Success, off.ExitCode);
+        Assert.NotEmpty(off.Steps);
+    }
+
+    /// <summary>Другой командой считается процесс того же файла с командой восстановления; служба и пустая строка — нет.</summary>
+    [Theory]
+    [InlineData("\"C:\\Program Files\\SplitVpn\\SplitVpn.Service.exe\" emergency-off --report-id 6f9619ff-8b86-d011-b42d-00c04fc964ff", true)]
+    [InlineData("SplitVpn.Service.exe recover --uninstall-network", true)]
+    [InlineData("SplitVpn.Service.exe EMERGENCY-ON", true)]
+    [InlineData("\"C:\\Program Files\\SplitVpn\\SplitVpn.Service.exe\"", false)]
+    [InlineData("SplitVpn.Service.exe --contentRoot x", false)]
+    public void OtherCommandDetection_ByCommandLine(string commandLine, bool recovery)
+    {
+        Assert.Equal(recovery, SystemEmergency.IsRecoveryCommand(SplitVpn.Windows.Native.ProcessImage.SplitCommandLine(commandLine)));
+        Assert.False(SystemEmergency.IsRecoveryCommand(null));
+    }
+
+    /// <summary>
+    /// Владелец каталога данных — те же правила, что у хранилища секретов: прямой член локальной группы Administrators
+    /// тоже свой (каталог создан повышенным администратором); посторонний пользователь — нет.
+    /// </summary>
+    [Fact]
+    public void DataRootTrust_AcceptsSameOwnersAsSecretStore()
+    {
+        var admin = new System.Security.Principal.SecurityIdentifier("S-1-5-21-1-2-3-1001");
+        var stranger = new System.Security.Principal.SecurityIdentifier("S-1-5-21-1-2-3-1002");
+        var system = new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.LocalSystemSid, null);
+        System.Security.AccessControl.DirectorySecurity Owned(System.Security.Principal.SecurityIdentifier owner)
+        {
+            var security = new System.Security.AccessControl.DirectorySecurity();
+            security.SetOwner(owner);
+            security.SetAccessRuleProtection(true, false);
+            security.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(system, System.Security.AccessControl.FileSystemRights.FullControl,
+                System.Security.AccessControl.AccessControlType.Allow));
+            return security;
+        }
+
+        bool IsAdmin(System.Security.Principal.SecurityIdentifier sid) => sid.Equals(admin);
+        Assert.Null(DataRootTrust.Problem(FileAttributes.Directory, Owned(admin), IsAdmin));
+        Assert.Null(DataRootTrust.Problem(FileAttributes.Directory, Owned(Core.Recovery.AdminOnlyAccess.TrustedInstaller), IsAdmin));
+        Assert.Contains("посторонней", DataRootTrust.Problem(FileAttributes.Directory, Owned(stranger), IsAdmin), StringComparison.Ordinal);
+        Assert.Equal(SplitVpn.Windows.Security.SecretStore.IsAcceptedOwner(admin, IsAdmin), DataRootTrust.Problem(FileAttributes.Directory, Owned(admin), IsAdmin) is null);
+    }
+
     private static bool IsSubsequence(IReadOnlyList<string> calls, IReadOnlyList<string> expected)
     {
         var index = 0;
@@ -685,6 +923,9 @@ internal sealed class FakeEmergencySystem : IEmergencySystem, IDisposable
     public HashSet<string> Hang { get; } = [];
 
     public bool Elevated { get; set; } = true;
+
+    /// <summary>Рядом выполняется другая команда восстановления этой программы.</summary>
+    public bool OtherCommand { get; set; }
     public bool LockBusy { get; set; }
     public bool LockThrows { get; set; }
 
@@ -732,6 +973,12 @@ internal sealed class FakeEmergencySystem : IEmergencySystem, IDisposable
     }
 
     public bool IsElevated() => Elevated;
+
+    public bool OtherRecoveryCommandRunning()
+    {
+        Call("OtherCommand");
+        return OtherCommand;
+    }
 
     public IDisposable? TryAcquireLock(TimeSpan wait)
     {

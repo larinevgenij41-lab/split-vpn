@@ -118,6 +118,42 @@ function Restore-SavedDns($adapter, $dns, $saved, $resolvers, $problems) {
     }
 }
 
+# Можно ли верить каталогу данных или копии DNS — те же правила, что у службы (DataRootTrust): не ссылка; владелец —
+# SYSTEM, Administrators, TrustedInstaller или прямой член локальной группы Administrators; право записи (запись, дописывание,
+# атрибуты, удаление, смена прав и владельца) есть только у SYSTEM, Administrators и TrustedInstaller (правило только для
+# потомков и CREATOR OWNER не в счёт). Ответ — причина недоверия; пусто — верить можно. Любой сбой проверки — недоверие.
+function Get-UntrustedReason($path) {
+    $admins = 'S-1-5-32-544'
+    $trusted = @('S-1-5-18', $admins, 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    # WriteData, AppendData, WriteEA, DeleteChild, WriteAttributes, Delete, WriteDAC, WriteOwner, GENERIC_ALL, GENERIC_WRITE.
+    $writeMask = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+    try {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return "$path - ссылка на другой путь" }
+        $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+        $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($trusted -notcontains $owner) {
+            $member = $false
+            try {
+                foreach ($m in @(Get-LocalGroupMember -SID $admins -ErrorAction Stop)) {
+                    if ($m.SID -and $m.SID.Value -eq $owner) { $member = $true }
+                }
+            } catch { }
+            if (-not $member) { return "$path принадлежит посторонней учётной записи ($owner)" }
+        }
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -ne 'Allow') { continue }
+            if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+            $sid = $rule.IdentityReference.Value
+            if ($trusted -contains $sid -or $sid -eq 'S-1-3-0') { continue }
+            if (([int64]$rule.FileSystemRights -band $writeMask) -ne 0) { return "$path даёт право записи посторонней учётной записи ($sid)" }
+        }
+        return $null
+    } catch {
+        return "$path не проверяется - $($_.Exception.Message)"
+    }
+}
+
 # Процессы службы из каталога программы, кроме команд восстановления (emergency-off, emergency-on, recover): они не служба.
 function Get-ServiceHostProcesses($executables) {
     $found = @()
@@ -251,12 +287,21 @@ if (-not ($networkDone -and $serviceDone)) {
         } catch { $problems.Add("Чтение маршрутов - $_") }
 
         # DNS: по копии программы (dns-backup.json), а без копии — только наш набор (loopback или «адрес, 127.0.0.1»)
-        # сбрасывается на «автоматически»: служба остановлена, и посредник на 127.0.0.1 не отвечает.
+        # сбрасывается на «автоматически»: служба остановлена, и посредник на 127.0.0.1 не отвечает. Копии верим по тем же
+        # правилам, что и служба (DataRootTrust): иначе её мог подложить пользователь, и DNS ушёл бы на его серверы.
         $owned = @{}
         $backupFile = Join-Path $dataRoot 'dns-backup.json'
-        if (Test-Path $backupFile) {
+        $untrusted = $null
+        if (Test-Path -LiteralPath $backupFile) {
+            $untrusted = Get-UntrustedReason $dataRoot
+            if (-not $untrusted) { $untrusted = Get-UntrustedReason $backupFile }
+            if ($untrusted) {
+                $problems.Add("Копия DNS не использована: $untrusted. DNS программы сброшен на «автоматически» по общим правилам.")
+            }
+        }
+        if ((Test-Path -LiteralPath $backupFile) -and -not $untrusted) {
             try {
-                $entries = Get-Content -Raw -Encoding UTF8 $backupFile | ConvertFrom-Json
+                $entries = Get-Content -Raw -Encoding UTF8 -LiteralPath $backupFile | ConvertFrom-Json
                 foreach ($item in $entries) {
                     foreach ($prop in $item.PSObject.Properties) {
                         if ($prop.Name -ieq 'InterfaceGuid') { $owned[([string]$prop.Value).Trim('{}').ToLowerInvariant()] = $item }

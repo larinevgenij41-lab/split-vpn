@@ -167,7 +167,37 @@
                             <ProgressBar Height="3" Margin="0,8,0,0" IsIndeterminate="True" Focusable="False" AutomationProperties.Name="Идёт выполнение команды" />
                         </StackPanel>
                     </Border>
-                    <!-- Итог команды: что получилось, что делать, шаги и путь к отчёту; виден на любой странице, пока не закрыт. -->
+                    <!-- Программа экстренно выключена: спокойный баннер вместо красной «Служба недоступна» и одна кнопка.
+                         Баннер — выше итога команды, а кнопка — рядом с заголовком: при низком окне (шапка не выше 40 % его
+                         высоты) она видна без прокрутки шапки. -->
+                    <Border x:Name="EmergencyBanner" Margin="0,0,0,8" Padding="16,12" CornerRadius="8" BorderThickness="1"
+                            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                            Visibility="{Binding Emergency.IsOff, Converter={StaticResource VisibleWhen}}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <ui:SymbolIcon Symbol="Power24" FontSize="20" Margin="0,1,12,0" VerticalAlignment="Top" views:Tone.Foreground="{x:Static views:StateTone.Caution}" />
+                            <TextBlock Grid.Column="1" VerticalAlignment="Center" FontWeight="SemiBold" TextWrapping="Wrap" Text="{x:Static vm:UiText.EmergencyBannerTitle}"
+                                       Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                                       AutomationProperties.LiveSetting="Polite" views:LiveRegion.Value="{Binding Emergency.IsOff}" />
+                            <ui:Button x:Name="EmergencyTurnOnButton" Grid.Column="2" Margin="12,0,0,0" VerticalAlignment="Top" Appearance="Primary"
+                                       Content="Включить программу" Icon="{ui:SymbolIcon Power24}"
+                                       Command="{Binding Emergency.TurnOnCommand}"
+                                       AutomationProperties.Name="Включить программу"
+                                       AutomationProperties.HelpText="Снять экстренное выключение и запустить службу. Windows запросит права администратора; VPN после этого подключается кнопкой «Подключить»" />
+                            <TextBlock Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,4,0,0" TextWrapping="Wrap" Text="{Binding Emergency.BannerText}"
+                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                        </Grid>
+                    </Border>
+                    <!-- Итог команды: что получилось, что делать, шаги и путь к отчёту; виден на любой странице, пока не закрыт.
+                         «Скопировать отчёт» и «Закрыть» — рядом с заголовком: при низком окне они видны без прокрутки шапки. -->
                     <Border x:Name="EmergencyResult" Margin="0,0,0,8" Padding="16,12" CornerRadius="8" BorderThickness="1"
                             Background="{DynamicResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
                             Visibility="{Binding Emergency.Result, Converter={StaticResource VisibleWhen}}">
@@ -175,22 +205,34 @@
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
                             <ui:SymbolIcon Symbol="{Binding Emergency.Result.Symbol, FallbackValue=Info24}" FontSize="20" Margin="0,1,12,0" VerticalAlignment="Top"
                                            views:Tone.Foreground="{Binding Emergency.Result.Tone, FallbackValue={x:Static views:StateTone.Neutral}}" />
-                            <StackPanel Grid.Column="1">
-                                <TextBlock FontWeight="SemiBold" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorPrimaryBrush}"
-                                           Text="{Binding Emergency.Result.Title, FallbackValue=''}"
-                                           AutomationProperties.Name="{Binding Emergency.Result.Spoken, FallbackValue=''}"
-                                           AutomationProperties.LiveSetting="Assertive" views:LiveRegion.Value="{Binding Emergency.Result.Spoken, FallbackValue=''}" />
-                                <TextBlock Margin="0,2,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                            <TextBlock Grid.Column="1" VerticalAlignment="Center" FontWeight="SemiBold" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                                       Text="{Binding Emergency.Result.Title, FallbackValue=''}"
+                                       AutomationProperties.Name="{Binding Emergency.Result.Spoken, FallbackValue=''}"
+                                       AutomationProperties.LiveSetting="Assertive" views:LiveRegion.Value="{Binding Emergency.Result.Spoken, FallbackValue=''}" />
+                            <StackPanel x:Name="EmergencyResultActions" Grid.Column="2" Margin="12,0,0,0" Orientation="Horizontal" VerticalAlignment="Top">
+                                <ui:Button Margin="0,0,8,0" Appearance="Secondary" Content="Скопировать отчёт" Icon="{ui:SymbolIcon Copy24}"
+                                           Command="{Binding Emergency.CopyReportCommand}" AutomationProperties.Name="Скопировать отчёт" />
+                                <ui:Button Appearance="Transparent" Content="Закрыть" Command="{Binding Emergency.CloseResultCommand}"
+                                           AutomationProperties.Name="Закрыть итог команды" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2">
+                                <TextBlock Margin="0,4,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorPrimaryBrush}"
                                            Text="{Binding Emergency.Result.Summary, FallbackValue=''}" />
                                 <TextBlock Margin="0,4,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                            Text="{Binding Emergency.Result.Advice, FallbackValue=''}"
                                            Visibility="{Binding Emergency.Result.HasAdvice, Converter={StaticResource VisibleWhen}, FallbackValue=Collapsed}" />
-                                <Expander Margin="0,8,0,0" HorizontalContentAlignment="Stretch"
+                                <!-- Раскрыт ли список — свойство модели, заданное заново для каждого итога; дальше его меняет человек (TwoWay). -->
+                                <Expander x:Name="EmergencyStepsExpander" Margin="0,8,0,0" HorizontalContentAlignment="Stretch"
                                           Header="{Binding Emergency.Result.StepsHeader, FallbackValue=''}"
-                                          IsExpanded="{Binding Emergency.Result.HasProblems, Mode=OneWay, FallbackValue=False}"
+                                          IsExpanded="{Binding Emergency.StepsExpanded, Mode=TwoWay}"
                                           Visibility="{Binding Emergency.Result.HasSteps, Converter={StaticResource VisibleWhen}, FallbackValue=Collapsed}">
                                     <ItemsControl Margin="0,6,0,0" Focusable="False" ItemsSource="{Binding Emergency.Result.Steps, FallbackValue={x:Null}}"
                                                   AutomationProperties.Name="Шаги команды">
@@ -218,33 +260,6 @@
                                            Visibility="{Binding Emergency.Result.ReportPath, Converter={StaticResource VisibleWhen}, FallbackValue=Collapsed}">
                                     <Run Text="Отчёт: " /><Run Text="{Binding Emergency.Result.ReportPath, Mode=OneWay, FallbackValue=''}" />
                                 </TextBlock>
-                                <WrapPanel Margin="0,10,0,0">
-                                    <ui:Button Margin="0,0,8,4" Appearance="Secondary" Content="Скопировать отчёт" Icon="{ui:SymbolIcon Copy24}"
-                                               Command="{Binding Emergency.CopyReportCommand}" AutomationProperties.Name="Скопировать отчёт" />
-                                    <ui:Button Margin="0,0,8,4" Appearance="Transparent" Content="Закрыть" Command="{Binding Emergency.CloseResultCommand}"
-                                               AutomationProperties.Name="Закрыть итог команды" />
-                                </WrapPanel>
-                            </StackPanel>
-                        </Grid>
-                    </Border>
-                    <!-- Программа экстренно выключена: спокойный баннер вместо красной «Служба недоступна» и одна кнопка. -->
-                    <Border x:Name="EmergencyBanner" Margin="0,0,0,8" Padding="16,12" CornerRadius="8" BorderThickness="1"
-                            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
-                            Visibility="{Binding Emergency.IsOff, Converter={StaticResource VisibleWhen}}">
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <ui:SymbolIcon Symbol="Power24" FontSize="20" Margin="0,1,12,0" VerticalAlignment="Top" views:Tone.Foreground="{x:Static views:StateTone.Caution}" />
-                            <StackPanel Grid.Column="1">
-                                <TextBlock FontWeight="SemiBold" TextWrapping="Wrap" Text="{x:Static vm:UiText.EmergencyBannerTitle}" Foreground="{DynamicResource TextFillColorPrimaryBrush}"
-                                           AutomationProperties.LiveSetting="Polite" views:LiveRegion.Value="{Binding Emergency.IsOff}" />
-                                <TextBlock Margin="0,2,0,0" TextWrapping="Wrap" Text="{Binding Emergency.BannerText}" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
-                                <ui:Button Margin="0,10,0,0" Appearance="Primary" Content="Включить программу" Icon="{ui:SymbolIcon Power24}"
-                                           Command="{Binding Emergency.TurnOnCommand}"
-                                           AutomationProperties.Name="Включить программу"
-                                           AutomationProperties.HelpText="Снять экстренное выключение и запустить службу. Windows запросит права администратора; VPN после этого подключается кнопкой «Подключить»" />
                             </StackPanel>
                         </Grid>
                     </Border>

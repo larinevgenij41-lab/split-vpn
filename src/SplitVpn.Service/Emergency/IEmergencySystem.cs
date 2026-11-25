@@ -38,6 +38,12 @@ internal interface IEmergencySystem
     /// <summary>Общая блокировка команд; null — занята дольше <paramref name="wait"/>.</summary>
     IDisposable? TryAcquireLock(TimeSpan wait);
 
+    /// <summary>
+    /// Выполняется ли другая команда восстановления этой программы (emergency-off, emergency-on, recover из того же файла
+    /// службы, кроме себя) — по живым процессам, а не по мьютексу.
+    /// </summary>
+    bool OtherRecoveryCommandRunning();
+
     StepResult WriteFlag(DateTimeOffset now);
 
     StepResult ClearFlag();

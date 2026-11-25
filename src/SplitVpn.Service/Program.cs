@@ -3,6 +3,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Serilog;
 using SplitVpn.Core.Diagnostics;
+using SplitVpn.Core.Recovery;
 using SplitVpn.Core.Settings;
 using SplitVpn.Service;
 using SplitVpn.Service.Coordination;
@@ -20,7 +21,7 @@ var paths = ServicePaths.Default;
 if (args.Length > 0 && ServiceRecovery.IsRecoveryCommand(args[0]))
 {
     // emergency-off (и прежнее «recover»), emergency-on, recover --uninstall-network: см. ServiceRecovery.
-    return await ServiceRecovery.RunAsync(paths, ServiceRecovery.ParseMode(args));
+    return await ServiceRecovery.RunAsync(paths, ServiceRecovery.ParseMode(args), EmergencyCommands.ParseReportId(args));
 }
 
 // Владелец, защищённый DACL и права потомков — до первого обращения к данным, в том числе до журнала.

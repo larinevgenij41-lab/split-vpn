@@ -141,7 +141,9 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
     /// <summary>
     /// Снимает действия при сбое, записав прежние в реестр (<see cref="EmergencyRegistry.SavedFailureActionsValue"/>).
     /// Запись осталась от прерванной команды — сейчас у службы снятые (пустые) действия, а настоящие — в записи: они сначала
-    /// возвращаются, и только потом снимаются заново (иначе в запись попали бы пустые).
+    /// возвращаются, и только потом снимаются заново (иначе в запись попали бы пустые). Но если рядом выполняется другая
+    /// команда этой программы, запись — её, живая: она как раз останавливает службу, и возврат автоперезапуска посреди
+    /// этого поднял бы службу снова. Тогда ничего не трогается — действия сняты той командой, и вернёт их она.
     /// </summary>
     public StepResult SuspendFailureActions()
     {
@@ -153,6 +155,11 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
         var notes = new List<string>();
         try
         {
+            if (ServiceFailurePolicy.ReadSaved() is not null && OtherRecoveryCommandRunning())
+            {
+                return StepResult.Already("автоперезапуск уже снят другой выполняющейся командой этой программы; вернёт его она");
+            }
+
             if (FailureActionsSnapshot.Parse(ServiceFailurePolicy.ReadSaved()) is { } leftover)
             {
                 ServiceFailurePolicy.Apply(ServicePaths.ServiceName, leftover);
@@ -171,7 +178,14 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
 
     public StepResult RestoreFailureActions()
     {
-        var snapshot = Interlocked.Exchange(ref _suspendedFailureActions, null) ?? FailureActionsSnapshot.Parse(ServiceFailurePolicy.ReadSaved());
+        var own = Interlocked.Exchange(ref _suspendedFailureActions, null);
+        if (own is null && OtherRecoveryCommandRunning() && ServiceFailurePolicy.ReadSaved() is not null)
+        {
+            // Запись — другой выполняющейся команды: возвращать автоперезапуск, пока она останавливает службу, нельзя.
+            return StepResult.Skipped("автоперезапуск вернёт другая выполняющаяся команда этой программы");
+        }
+
+        var snapshot = own ?? FailureActionsSnapshot.Parse(ServiceFailurePolicy.ReadSaved());
         if (snapshot is null)
         {
             return StepResult.Skipped();
@@ -190,6 +204,18 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
         ServiceFailurePolicy.DeleteSaved();
         return StepResult.Done("действия при сбое службы возвращены");
     }
+
+    /// <summary>
+    /// Выполняется ли другая команда восстановления этой программы: процесс того же SplitVpn.Service.exe (кроме себя), чей
+    /// первый аргумент — emergency-off, emergency-on или recover. Определяется по живым процессам, а не по мьютексу (его
+    /// может занять и обычный пользователь); командную строку не прочитать — процесс командой не считается.
+    /// </summary>
+    public bool OtherRecoveryCommandRunning() =>
+        SystemSshTunnelOps.FindOwn(_serviceImage, Environment.ProcessId, static id => IsRecoveryCommand(ProcessImage.TryGetArguments(id))).Count > 0;
+
+    /// <summary>Командная строка — команда восстановления (первый аргумент после файла).</summary>
+    internal static bool IsRecoveryCommand(IReadOnlyList<string>? arguments) =>
+        arguments is { Count: >= 2 } && ServiceRecovery.IsRecoveryCommand(arguments[1]);
 
     private static bool IsNotInstalled(Exception ex) =>
         ex.InnerException is System.ComponentModel.Win32Exception { NativeErrorCode: (int)ServiceDoesNotExist };

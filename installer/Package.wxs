@@ -46,6 +46,8 @@
 
 
     <Icon Id="AppIcon" SourceFile="$(AssetsDir)\app.ico" />
+    <!-- Свой значок у ярлыков «Экстренно выключить» — красная кнопка питания, чтобы их не путали с ярлыком программы. -->
+    <Icon Id="EmergencyIcon" SourceFile="$(AssetsDir)\emergency.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
     <Property Id="ARPNOMODIFY" Value="1" />
 
@@ -189,12 +191,12 @@
     <ComponentGroup Id="ShortcutComponents">
       <Component Id="MenuShortcuts" Directory="MenuFolder" Guid="D7E3B9A1-4C6F-4A2D-B8E5-3F1C7A9D2B64">
         <Shortcut Id="AppShortcut" Name="Раздельный VPN" Description="Российские адреса напрямую, остальные через VPN" Target="[INSTALLFOLDER]SplitVpn.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
-        <Shortcut Id="RecoverShortcut" Name="Экстренно выключить Раздельный VPN" Description="Отключить VPN и защиту и остановить службу, даже если программа не отвечает (нужны права администратора)" Target="[INSTALLFOLDER]SplitVpn.exe" Arguments="--emergency-off" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+        <Shortcut Id="RecoverShortcut" Name="Экстренно выключить Раздельный VPN" Description="Отключить VPN и защиту и остановить службу, даже если программа не отвечает (нужны права администратора)" Target="[INSTALLFOLDER]SplitVpn.exe" Arguments="--emergency-off" WorkingDirectory="INSTALLFOLDER" Icon="EmergencyIcon" />
         <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
         <RegistryValue Root="HKCU" Key="Software\SplitVpn" Name="MenuShortcuts" Type="integer" Value="1" KeyPath="yes" />
       </Component>
       <Component Id="DesktopShortcuts" Directory="DesktopFolder" Guid="E8F4C2B6-7A1D-4E3B-9C5A-4D2F8B6E1C97">
-        <Shortcut Id="DesktopRecoverShortcut" Name="Экстренно выключить Раздельный VPN" Description="Отключить VPN и защиту и остановить службу, даже если программа не отвечает (нужны права администратора)" Target="[INSTALLFOLDER]SplitVpn.exe" Arguments="--emergency-off" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+        <Shortcut Id="DesktopRecoverShortcut" Name="Экстренно выключить Раздельный VPN" Description="Отключить VPN и защиту и остановить службу, даже если программа не отвечает (нужны права администратора)" Target="[INSTALLFOLDER]SplitVpn.exe" Arguments="--emergency-off" WorkingDirectory="INSTALLFOLDER" Icon="EmergencyIcon" />
         <RegistryValue Root="HKCU" Key="Software\SplitVpn" Name="DesktopShortcuts" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </ComponentGroup>

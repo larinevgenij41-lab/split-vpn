@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using SplitVpn.Core.Recovery;
 using SplitVpn.Core.State;
 
 namespace SplitVpn.App.Services;
@@ -13,28 +14,68 @@ public static class NetworkRecovery
 {
     private const string ServiceFileName = "SplitVpn.Service.exe";
 
-    /// <summary>
-    /// Файл службы: по её регистрации (путь пишет установщик, каталог закрыт для записи пользователям); если регистрация
-    /// не читается или службы нет — из каталога установки рядом с приложением, затем известные пути установки.
-    /// </summary>
-    public static string? FindServiceExecutable() => FindServiceExecutable(WindowsServiceHost.RegisteredExecutable(), AppContext.BaseDirectory, File.Exists);
+    /// <summary>Скрипт последнего средства в каталоге установки (подпапка scripts).</summary>
+    internal const string RecoveryScriptName = "recover-network.cmd";
 
-    internal static string? FindServiceExecutable(string? registered, string appDirectory, Func<string, bool> exists)
+    /// <summary>
+    /// Файл службы для запуска с правами администратора: путь из регистрации службы (ImagePath) или
+    /// %ProgramFiles%\SplitVpn\SplitVpn.Service.exe — и только если файл и каждый каталог до корня диска не ссылки и
+    /// закрыты для записи обычным пользователям (<see cref="AdminOnlyAccess.ElevationTargetProblem(string)"/>). Файл рядом с
+    /// приложением или в каталоге, куда может писать пользователь, не годится: окно UAC запустило бы его подмену от имени
+    /// администратора. Не найден — null (совет: recover-network.cmd от имени администратора).
+    /// </summary>
+    public static string? FindServiceExecutable() =>
+        FindServiceExecutable(WindowsServiceHost.RegisteredExecutable(), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            AdminOnlyAccess.ElevationTargetProblem);
+
+    /// <summary>Шов для тестов: <paramref name="problem"/> — почему файл нельзя запускать с повышением (null — можно).</summary>
+    internal static string? FindServiceExecutable(string? registered, string programFiles, Func<string, string?> problem)
     {
-        if (registered is not null)
+        ArgumentNullException.ThrowIfNull(problem);
+        foreach (var candidate in new[] { registered, Path.Combine(programFiles, "SplitVpn", ServiceFileName) })
         {
-            return registered;
+            if (candidate is null)
+            {
+                continue;
+            }
+
+            if (problem(candidate) is not { } why)
+            {
+                return candidate;
+            }
+
+            SplitVpn.Core.Diagnostics.Verbose.Write("Ui", "файл службы не годится для запуска с правами администратора: " + why);
         }
 
-        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-        return new[]
-        {
-            Path.Combine(appDirectory, ServiceFileName),
-            Path.Combine(appDirectory, "service", ServiceFileName),
-            Path.Combine(programFiles, "SplitVpn", ServiceFileName),
-            Path.Combine(programFiles, "SplitVpn.Dev", "service", ServiceFileName),
-        }.FirstOrDefault(exists);
+        return null;
     }
+
+    /// <summary>
+    /// Скрипт последнего средства (scripts\recover-network.cmd и recover-network.ps1 рядом) в каталоге найденного файла
+    /// службы — по тем же правилам, что и сам файл службы. null — не найден или не годится.
+    /// </summary>
+    public static string? FindRecoveryScript() => FindRecoveryScript(FindServiceExecutable(), AdminOnlyAccess.ElevationTargetProblem);
+
+    internal static string? FindRecoveryScript(string? serviceExecutable, Func<string, string?> problem)
+    {
+        ArgumentNullException.ThrowIfNull(problem);
+        if (serviceExecutable is null || Path.GetDirectoryName(serviceExecutable) is not { } installDirectory)
+        {
+            return null;
+        }
+
+        var script = Path.Combine(installDirectory, "scripts", RecoveryScriptName);
+        var powershell = Path.ChangeExtension(script, ".ps1");
+        return problem(script) is null && problem(powershell) is null ? script : null;
+    }
+
+    /// <summary>Запуск скрипта последнего средства с правами администратора (окно UAC); ожидания нет — у скрипта своё окно.</summary>
+    public static ProcessStartInfo RecoveryScriptStartInfo(string script) => new(script)
+    {
+        UseShellExecute = true,
+        Verb = "runas",
+        WorkingDirectory = Environment.SystemDirectory,
+    };
 
     /// <summary>Запуск службы после аварийного восстановления: «sc start» с повышением (UAC). Возвращает текст для пользователя.</summary>
     public static async Task<(bool Success, string Text)> StartServiceElevatedAsync()

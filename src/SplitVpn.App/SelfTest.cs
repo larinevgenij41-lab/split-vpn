@@ -189,16 +189,17 @@ internal static class SelfTest
 
         CheckHomeSetup(main, host, shots, errors);
 
-        // Главная после экстренного выключения: вместо «Подключить» — «Включить программу» и пояснение.
+        // Главная после экстренного выключения: вместо «Подключить» — подсказка, что программу включает кнопка в баннере над
+        // страницей. Второй кнопки «Включить программу» на главной нет: она одна, в баннере.
         var (homeTone, homeSymbol, homeState, homeSummary) = (main.Home.Tone, main.Home.StateSymbol, main.StateText, main.SummaryText);
         main.Emergency.Show(new Core.Recovery.EmergencyFlag(DateTimeOffset.UtcNow.AddHours(-3)));
         host.Content = null;
         host.Content = main.Home;
         Settle(host);
         Shot(host, shots, "home-emergency");
-        if (!HasVisibleText(host, "Включить программу") || HasVisibleText(host, "Подключить"))
+        if (!HasVisibleText(host, UiText.EmergencyHomeHint) || HasVisibleText(host, "Подключить") || CountVisibleButtons(host, "Включить программу") != 0)
         {
-            errors.AppendLine("Главная после экстренного выключения: нет «Включить программу» или видна «Подключить».");
+            errors.AppendLine("Главная после экстренного выключения: нет подсказки о «Включить программу», видна «Подключить» или вторая кнопка включения.");
         }
 
         main.Emergency.Show(null);
@@ -733,16 +734,51 @@ internal static class SelfTest
                 new("flush-dns", "Кеш DNS", Core.Recovery.EmergencyStepOutcome.Failed, "ipconfig /flushdns: код 1", 900, Required: false),
             ],
         };
-        main.Emergency.Result = EmergencyRunResult.FromExitCode(on: false, 3, report, Core.Recovery.EmergencyReportFiles.LastPath);
-        Settle(root);
-        Shot(root, shots, "window-emergency-result");
-        if (!window.EmergencyResult.IsVisible || !main.Emergency.Result.Advice.Contains("Перезагрузите", StringComparison.Ordinal))
+        if (CountVisibleButtons(root, "Включить программу") != 1)
         {
-            errors.AppendLine("Итог экстренного выключения не показан или без совета перезагрузить компьютер.");
+            errors.AppendLine("Экстренно выключена: кнопка «Включить программу» в окне не одна.");
         }
 
         var height = window.Height;
+        if (window.ActualHeight < MainWindow.CompactHeight)
+        {
+            window.Height = MainWindow.CompactHeight + 120;
+            Settle(root);
+        }
+
+        var result = EmergencyRunResult.FromExitCode(on: false, 3, report, Core.Recovery.EmergencyReportFiles.LastPath);
+        main.Emergency.Result = result;
+        Settle(root);
+        Shot(root, shots, "window-emergency-result");
+        if (!window.EmergencyResult.IsVisible || !result.Advice.Contains("Перезагрузите", StringComparison.Ordinal) || !window.EmergencyStepsExpander.IsExpanded)
+        {
+            errors.AppendLine("Итог экстренного выключения не показан, без совета перезагрузить компьютер или шаги со сбоями не раскрыты.");
+        }
+
+        // Свернул человек — так и остаётся (двусторонняя привязка); новый итог снова задаёт раскрытие.
+        window.EmergencyStepsExpander.IsExpanded = false;
+        Settle(root);
+        if (main.Emergency.StepsExpanded)
+        {
+            errors.AppendLine("Свёрнутый вручную список шагов итога не дошёл до модели.");
+        }
+
+        main.Emergency.Result = null;
+        main.Emergency.Result = result;
+        Settle(root);
+        if (!window.EmergencyStepsExpander.IsExpanded)
+        {
+            errors.AppendLine("Новый итог со сбоями не раскрыл список шагов.");
+        }
+
+        // Минимальная высота: шаги нового итога свёрнуты, а «Включить программу», «Скопировать отчёт» и «Закрыть» видны без
+        // прокрутки шапки.
         window.Height = window.MinHeight;
+        Settle(root);
+        main.Emergency.Result = null;
+        main.Emergency.Result = result;
+        Settle(root);
+        window.HeaderScroll.ScrollToTop();
         Settle(root);
         Shot(root, shots, "window-emergency-result-min-height");
         if (window.HeaderScroll.ActualHeight / window.ActualHeight > 0.41)
@@ -750,6 +786,36 @@ internal static class SelfTest
             errors.AppendLine("Итог экстренного выключения при минимальной высоте занимает больше 40 % окна.");
         }
 
+        if (window.EmergencyStepsExpander.IsExpanded)
+        {
+            errors.AppendLine("Итог экстренного выключения при минимальной высоте: шаги не свёрнуты.");
+        }
+
+        foreach (var (element, name) in new (FrameworkElement, string)[]
+        {
+            (window.EmergencyTurnOnButton, "«Включить программу»"), (window.EmergencyResultActions, "«Скопировать отчёт» и «Закрыть»"),
+        })
+        {
+            if (!FullyInViewport(element, window.HeaderScroll))
+            {
+                errors.AppendLine("При минимальной высоте окна " + name + " не видны без прокрутки шапки.");
+            }
+        }
+
+        // Команда не уложилась в ожидание: «ещё выполняется», кнопки выключения и включения недоступны.
+        var pending = new TaskCompletionSource<EmergencyRunResult>();
+        main.Emergency.Result = EmergencyRunResult.Overdue(on: false, TimeSpan.FromMinutes(19), pending.Task);
+        main.Emergency.IsRunning = true;
+        main.Emergency.RunningText = UiText.EmergencyStillRunningText(false);
+        Settle(root);
+        Shot(root, shots, "window-emergency-overdue");
+        if (main.Emergency.TurnOnCommand.CanExecute(null) || main.Emergency.TurnOffCommand.CanExecute(null) || !HasVisibleText(root, "Экстренное выключение ещё выполняется"))
+        {
+            errors.AppendLine("Команда ещё выполняется: нет надписи или кнопки выключения и включения доступны.");
+        }
+
+        main.Emergency.IsRunning = false;
+        main.Emergency.RunningText = "";
         window.Height = height;
         main.Emergency.Result = null;
         main.Emergency.Show(null);
@@ -1016,6 +1082,37 @@ internal static class SelfTest
     }
 
     /// <summary>Видимый текст, начинающийся с заданных слов: подписи пустых состояний и загрузки.</summary>
+    /// <summary>Сколько видимых кнопок с таким именем для экранного диктора.</summary>
+    private static int CountVisibleButtons(DependencyObject root, string name)
+    {
+        var count = 0;
+        for (var i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(root); i++)
+        {
+            var child = System.Windows.Media.VisualTreeHelper.GetChild(root, i);
+            if (child is System.Windows.Controls.Primitives.ButtonBase button && button.IsVisible
+                && System.Windows.Automation.AutomationProperties.GetName(button) == name)
+            {
+                count++;
+            }
+
+            count += CountVisibleButtons(child, name);
+        }
+
+        return count;
+    }
+
+    /// <summary>Элемент целиком в видимой части прокручиваемой области при её текущей прокрутке.</summary>
+    private static bool FullyInViewport(FrameworkElement element, ScrollViewer viewer)
+    {
+        if (!element.IsVisible)
+        {
+            return false;
+        }
+
+        var bounds = element.TransformToAncestor(viewer).TransformBounds(new Rect(0, 0, element.ActualWidth, element.ActualHeight));
+        return bounds.Top >= -0.5 && bounds.Bottom <= viewer.ViewportHeight + 0.5 && bounds.Left >= -0.5 && bounds.Right <= viewer.ViewportWidth + 0.5;
+    }
+
     private static bool HasVisibleText(DependencyObject root, string prefix)
     {
         for (var i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(root); i++)

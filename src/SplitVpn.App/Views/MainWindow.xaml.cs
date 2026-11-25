@@ -42,6 +42,11 @@ public partial class MainWindow : FluentWindow
         {
             AdaptPane();
             HeaderScroll.MaxHeight = Math.Max(120, ActualHeight * 0.4);
+            if (DataContext is MainViewModel model)
+            {
+                // Низкое окно: шаги нового итога экстренной команды свёрнуты — кнопки итога и баннера видны без прокрутки шапки.
+                model.Emergency.CompactLayout = ActualHeight < CompactHeight;
+            }
         };
         Navigation.Navigated += (_, e) =>
         {
@@ -53,6 +58,9 @@ public partial class MainWindow : FluentWindow
             Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () => NameUnlabeledButtons(this));
         };
     }
+
+    /// <summary>Ниже этой высоты окна шаги итога экстренной команды по умолчанию свёрнуты.</summary>
+    internal const double CompactHeight = 640;
 
     /// <summary>Закрытие окна прячет его в трей; выход — из меню трея.</summary>
     public bool AllowClose { get; set; }

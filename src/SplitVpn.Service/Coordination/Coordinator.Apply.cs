@@ -30,8 +30,12 @@ public sealed partial class Coordinator
 
     internal static readonly TimeSpan ContestedDnsWindow = TimeSpan.FromMinutes(10);
 
-    /// <summary>Когда замечены внешние правки DNS адаптера (в пределах <see cref="ContestedDnsWindow"/>).</summary>
-    private readonly Dictionary<Guid, Queue<DateTimeOffset>> _externalDnsChanges = [];
+    /// <summary>
+    /// Когда замечены внешние правки DNS адаптера (в пределах <see cref="ContestedDnsWindow"/>): монотонные отметки
+    /// <see cref="TimeProvider.GetTimestamp"/>, а не часы — перевод часов (или их скачок после сна) не растягивает и не
+    /// сжимает окно, и учитывать эти отметки при сдвиге сроков не нужно.
+    /// </summary>
+    private readonly Dictionary<Guid, Queue<long>> _externalDnsChanges = [];
 
     /// <summary>Адаптеры, за DNS которых идёт борьба: до перезапуска службы внешние значения не запоминаются.</summary>
     private readonly HashSet<Guid> _contestedDns = [];
@@ -1923,15 +1927,27 @@ public sealed partial class Coordinator
             return existing;
         }
 
-        var now = _deps.Time.GetUtcNow();
+        // Сначала снимок: совпадает с копией — это не правка извне (запись посредника не удалась, и на адаптере остался
+        // исходный DNS, или возврат был неполным). Такая сверка не считается правкой и не пишется в журнал: иначе
+        // постоянный сбой записи за три сверки ошибочно объявил бы адаптер «спорным».
+        var fresh = _deps.Dns.Capture(interfaceGuid, existing);
+        if (InterfaceDnsOps.SameServers(fresh.NameServerV4, existing.NameServerV4)
+            && InterfaceDnsOps.SameServers(fresh.NameServerV6, existing.NameServerV6)
+            && fresh.Ipv6Unknown == existing.Ipv6Unknown
+            && string.Equals(fresh.SearchList, existing.SearchList, StringComparison.OrdinalIgnoreCase))
+        {
+            return existing;
+        }
+
+        var now = _deps.Time.GetTimestamp();
         if (!_externalDnsChanges.TryGetValue(interfaceGuid, out var seen))
         {
-            seen = new Queue<DateTimeOffset>();
+            seen = new Queue<long>();
             _externalDnsChanges[interfaceGuid] = seen;
         }
 
         seen.Enqueue(now);
-        while (seen.Count > 0 && now - seen.Peek() > ContestedDnsWindow)
+        while (seen.Count > 0 && _deps.Time.GetElapsedTime(seen.Peek(), now) > ContestedDnsWindow)
         {
             seen.Dequeue();
         }
@@ -1947,16 +1963,6 @@ public sealed partial class Coordinator
                 + "похоже, его меняет другая программа. Исходным снова считается первый сохранённый DNS, новые значения до перезапуска службы не запоминаются; "
                 + "пока возвращён локальный посредник.");
             return restored;
-        }
-
-        var fresh = _deps.Dns.Capture(interfaceGuid, existing);
-        if (InterfaceDnsOps.SameServers(fresh.NameServerV4, existing.NameServerV4)
-            && InterfaceDnsOps.SameServers(fresh.NameServerV6, existing.NameServerV6)
-            && fresh.Ipv6Unknown == existing.Ipv6Unknown
-            && string.Equals(fresh.SearchList, existing.SearchList, StringComparison.OrdinalIgnoreCase))
-        {
-            Journal("Предупреждение", "DNS адаптера изменён извне: возвращён локальный посредник.");
-            return existing;
         }
 
         // Снимок сам отличает свои суффиксы шлюза от правки пользователя (по отметке применённого списка в прежней копии).

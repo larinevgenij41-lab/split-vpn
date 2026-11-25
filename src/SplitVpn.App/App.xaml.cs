@@ -33,8 +33,29 @@ public partial class App : Application
         if (EmergencyCommandLine.IsEmergencyOff(e.Args))
         {
             // Ярлык «Экстренно выключить»: раньше окон, трея, единственного экземпляра и канала службы — работает,
-            // когда приложение уже открыто и когда служба не отвечает. Код завершения — код команды.
-            Environment.Exit(EmergencyCommandLine.Run());
+            // когда приложение уже открыто и когда служба не отвечает. Код завершения — код команды. Ни одна ошибка не
+            // должна закрыть процесс молча: она пишется в ui-errors.log, а человеку показывается, что делать дальше.
+            int code;
+            try
+            {
+                code = EmergencyCommandLine.Run();
+            }
+            catch (Exception ex)
+            {
+                RecordHandled(ex);
+                try
+                {
+                    EmergencyCommandLine.NativeOk(EmergencyCommandLine.FallbackText, error: true);
+                }
+                catch (Exception shown) when (shown is not OutOfMemoryException)
+                {
+                    RecordHandled(shown);
+                }
+
+                code = Core.Recovery.EmergencyExitCodes.Unexpected;
+            }
+
+            Environment.Exit(code);
             return;
         }
 

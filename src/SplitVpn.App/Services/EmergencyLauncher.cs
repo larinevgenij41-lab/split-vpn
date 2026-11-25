@@ -11,20 +11,26 @@ namespace SplitVpn.App.Services;
 /// <summary>Запуск процесса с правами администратора (окно UAC) и ожидание его завершения; в проверках подменяется.</summary>
 public interface IElevatedProcessRunner
 {
-    /// <summary>Запускает процесс и ждёт его не дольше <paramref name="timeout"/>; процесс по сроку не завершается.</summary>
+    /// <summary>
+    /// Запускает процесс и ждёт его не дольше <paramref name="timeout"/>. Процесс по сроку не завершается: итог
+    /// «не завершился в срок» несёт задачу, которая завершится его кодом, когда он всё-таки выйдет.
+    /// </summary>
     Task<ElevatedProcessOutcome> RunAsync(ProcessStartInfo startInfo, TimeSpan timeout, CancellationToken cancellationToken);
 }
 
 /// <summary>
-/// Итог запуска: код завершения, ошибка запуска Win32 (1223 — отказ в окне UAC) или «не завершился в срок».
+/// Итог запуска: код завершения, ошибка запуска Win32 (1223 — отказ в окне UAC) или «ещё выполняется» — тогда
+/// <paramref name="StillRunning"/> завершится кодом процесса, когда он выйдет (процесс не завершается принудительно).
 /// </summary>
-public sealed record ElevatedProcessOutcome(int? ExitCode, int? StartError, bool TimedOut)
+public sealed record ElevatedProcessOutcome(int? ExitCode, int? StartError, Task<int>? StillRunning)
 {
-    public static ElevatedProcessOutcome Exited(int code) => new(code, null, false);
+    public bool TimedOut => StillRunning is not null;
 
-    public static ElevatedProcessOutcome NotStarted(int win32Error) => new(null, win32Error, false);
+    public static ElevatedProcessOutcome Exited(int code) => new(code, null, null);
 
-    public static ElevatedProcessOutcome Overdue { get; } = new(null, null, true);
+    public static ElevatedProcessOutcome NotStarted(int win32Error) => new(null, win32Error, null);
+
+    public static ElevatedProcessOutcome Overdue(Task<int> stillRunning) => new(null, null, stillRunning);
 }
 
 /// <summary>ShellExecute с глаголом «runas»: Windows показывает окно контроля учётных записей.</summary>
@@ -36,7 +42,8 @@ public sealed class ShellElevatedProcessRunner : IElevatedProcessRunner
         Process? process;
         try
         {
-            process = Process.Start(startInfo);
+            // ShellExecute с «runas» ждёт ответа в окне UAC: не в потоке интерфейса (окно не замирает).
+            process = await Task.Run(() => Process.Start(startInfo), CancellationToken.None);
         }
         catch (Win32Exception ex)
         {
@@ -49,12 +56,25 @@ public sealed class ShellElevatedProcessRunner : IElevatedProcessRunner
             return ElevatedProcessOutcome.NotStarted(0);
         }
 
+        // Отмена и срок ожидания не завершают команду: она должна дойти до конца, иначе сеть останется наполовину.
+        if (await WindowsServiceHost.ExitsWithinAsync(token => process.WaitForExitAsync(token).WaitAsync(cancellationToken), timeout))
+        {
+            using (process)
+            {
+                return ElevatedProcessOutcome.Exited(process.ExitCode);
+            }
+        }
+
+        // Не дождались: дескриптор процесса остаётся у нас, и итог придёт, когда команда действительно выйдет.
+        return ElevatedProcessOutcome.Overdue(WaitExitAsync(process));
+    }
+
+    private static async Task<int> WaitExitAsync(Process process)
+    {
         using (process)
         {
-            // Отмена ожидания не завершает команду: она должна дойти до конца, иначе сеть останется наполовину.
-            return await WindowsServiceHost.ExitsWithinAsync(token => process.WaitForExitAsync(token).WaitAsync(cancellationToken), timeout)
-                ? ElevatedProcessOutcome.Exited(process.ExitCode)
-                : ElevatedProcessOutcome.Overdue;
+            await process.WaitForExitAsync(CancellationToken.None);
+            return process.ExitCode;
         }
     }
 }
@@ -78,27 +98,32 @@ public interface IEmergencyLauncher
 }
 
 /// <summary>
-/// «Экстренно выключить» и «Включить программу»: «SplitVpn.Service.exe emergency-off|emergency-on» с правами
-/// администратора. Канал управления не используется вовсе: команда работает, когда служба зависла, остановлена или
-/// канал занят чужим процессом. После завершения читается отчёт команды (<see cref="EmergencyReportFiles.LastPath"/>),
-/// но только записанный этим запуском.
+/// «Экстренно выключить» и «Включить программу»: «SplitVpn.Service.exe emergency-off|emergency-on ‐‐report-id &lt;guid&gt;»
+/// с правами администратора. Канал управления не используется вовсе: команда работает, когда служба зависла, остановлена
+/// или канал занят чужим процессом. После завершения читается отчёт команды (<see cref="EmergencyReportFiles.LastPath"/>),
+/// но только этого запуска: с той же меткой, той же командой и тем же кодом завершения.
 /// </summary>
 public sealed class EmergencyLauncher : IEmergencyLauncher
 {
-    /// <summary>
-    /// Срок ожидания emergency-off: с запасом больше худшего случая команды — сумма сроков всех шагов в
-    /// EmergencyOrchestrator (блокировка 15 с, остановка службы до 2 мин 15 с, фильтры WFP 2 мин, DNS 1,5 мин,
-    /// маршруты 1 мин и остальные шаги) — около 11 минут.
-    /// </summary>
-    internal static readonly TimeSpan OffTimeout = TimeSpan.FromMinutes(12);
+    /// <summary>Запас сверх худшего случая команды: запуск процесса, запись отчёта, медленный диск.</summary>
+    internal static readonly TimeSpan WaitMargin = TimeSpan.FromMinutes(2);
 
-    /// <summary>Срок emergency-on: остановка «пустой» службы, флаг, тип запуска и запуск службы — около 6 минут в худшем случае.</summary>
-    internal static readonly TimeSpan OnTimeout = TimeSpan.FromMinutes(7);
+    /// <summary>
+    /// Срок ожидания emergency-off: худший случай команды из договора (<see cref="EmergencyTimeouts.OffWorstCase"/> —
+    /// он же общий срок команды в службе) и запас. Не дождались — команда ещё выполняется, и итог придёт позже.
+    /// </summary>
+    internal static readonly TimeSpan OffTimeout = EmergencyTimeouts.OffWorstCase + WaitMargin;
+
+    /// <summary>Срок emergency-on: <see cref="EmergencyTimeouts.OnWorstCase"/> и запас.</summary>
+    internal static readonly TimeSpan OnTimeout = EmergencyTimeouts.OnWorstCase + WaitMargin;
 
     /// <summary>ERROR_CANCELLED: пользователь отказался в окне UAC.</summary>
     public const int UacCancelled = 1223;
 
-    /// <summary>Допуск на расхождение часов процессов: отчёт с началом раньше запуска больше этого — прежний.</summary>
+    /// <summary>Больше этого отчёт не читается: настоящий занимает единицы килобайт.</summary>
+    internal const int MaxReportBytes = 1024 * 1024;
+
+    /// <summary>Допуск на расхождение часов процессов при сверке времени отчёта.</summary>
     private static readonly TimeSpan ClockSkew = TimeSpan.FromSeconds(5);
 
     private readonly IElevatedProcessRunner _runner;
@@ -106,26 +131,30 @@ public sealed class EmergencyLauncher : IEmergencyLauncher
     private readonly Func<string, string?> _readFile;
     private readonly string _reportPath;
     private readonly TimeProvider _time;
+    private readonly Func<Guid> _newReportId;
 
     public EmergencyLauncher()
-        : this(new ShellElevatedProcessRunner(), NetworkRecovery.FindServiceExecutable, ReadReport, EmergencyReportFiles.LastPath, TimeProvider.System)
+        : this(new ShellElevatedProcessRunner(), NetworkRecovery.FindServiceExecutable, ReadTrustedReport, EmergencyReportFiles.LastPath, TimeProvider.System)
     {
     }
 
-    internal EmergencyLauncher(IElevatedProcessRunner runner, Func<string?> findExecutable, Func<string, string?> readFile, string reportPath, TimeProvider time)
+    internal EmergencyLauncher(IElevatedProcessRunner runner, Func<string?> findExecutable, Func<string, string?> readFile, string reportPath,
+        TimeProvider time, Func<Guid>? newReportId = null)
     {
         _runner = runner;
         _findExecutable = findExecutable;
         _readFile = readFile;
         _reportPath = reportPath;
         _time = time;
+        _newReportId = newReportId ?? Guid.NewGuid;
     }
 
     /// <summary>
     /// Запуск команды: ShellExecute с «runas» (окно UAC), скрытое окно консоли, рабочий каталог — System32
-    /// (повышенный процесс не ищет библиотеки в каталоге, откуда запущен интерфейс).
+    /// (повышенный процесс не ищет библиотеки в каталоге, откуда запущен интерфейс), метка запуска для отчёта.
     /// </summary>
-    public static ProcessStartInfo BuildStartInfo(string executable, bool on) => new(executable, on ? EmergencyCommands.On : EmergencyCommands.Off)
+    public static ProcessStartInfo BuildStartInfo(string executable, bool on, Guid reportId) => new(executable,
+        (on ? EmergencyCommands.On : EmergencyCommands.Off) + " " + EmergencyCommands.ReportIdOption + " " + reportId.ToString("D"))
     {
         UseShellExecute = true,
         Verb = "runas",
@@ -135,64 +164,141 @@ public sealed class EmergencyLauncher : IEmergencyLauncher
 
     public async Task<EmergencyRunResult> RunAsync(bool on, CancellationToken cancellationToken = default)
     {
-        var executable = _findExecutable();
+        string? executable;
+        try
+        {
+            // Проверка прав на каталоги до корня диска читает дескрипторы — не в потоке интерфейса.
+            executable = await Task.Run(_findExecutable, CancellationToken.None);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Verbose.Write("Ui", "файл службы не найден: " + ex.GetType().Name + " «" + ex.Message + "»");
+            executable = null;
+        }
+
         if (executable is null)
         {
             return EmergencyRunResult.NotFound(on);
         }
 
+        var reportId = _newReportId();
         var started = _time.GetUtcNow();
+        var timeout = on ? OnTimeout : OffTimeout;
         Verbose.Write("Ui", (on ? "включение программы" : "экстренное выключение") + ": запуск «" + executable + "»");
-        var outcome = await _runner.RunAsync(BuildStartInfo(executable, on), on ? OnTimeout : OffTimeout, cancellationToken);
+        var outcome = await _runner.RunAsync(BuildStartInfo(executable, on, reportId), timeout, cancellationToken);
         if (outcome.StartError is { } error)
         {
             return error == UacCancelled ? EmergencyRunResult.Cancelled(on) : EmergencyRunResult.StartFailed(on, error);
         }
 
-        var report = FreshReport(on, started);
-        Verbose.Write("Ui", (on ? "включение программы" : "экстренное выключение") + ": "
-            + (outcome.TimedOut ? "не завершилось в срок" : "код " + outcome.ExitCode?.ToString(CultureInfo.InvariantCulture))
-            + (report is null ? ", отчёта этого запуска нет" : ", отчёт прочитан"));
-        return outcome.TimedOut
-            ? EmergencyRunResult.Overdue(on, on ? OnTimeout : OffTimeout, report, report is null ? null : _reportPath)
-            : EmergencyRunResult.FromExitCode(on, outcome.ExitCode ?? EmergencyExitCodes.Unexpected, report, report is null ? null : _reportPath);
+        if (outcome.StillRunning is { } stillRunning)
+        {
+            Verbose.Write("Ui", (on ? "включение программы" : "экстренное выключение") + ": не завершилось за отведённое время, ждём дальше");
+            return EmergencyRunResult.Overdue(on, timeout, CompleteAsync(on, reportId, started, stillRunning));
+        }
+
+        return await FinishAsync(on, outcome.ExitCode ?? EmergencyExitCodes.Unexpected, reportId, started);
     }
 
-    /// <summary>Отчёт этого запуска; прежний (другая команда или начат раньше запуска) не годится.</summary>
-    internal EmergencyReport? FreshReport(bool on, DateTimeOffset launchedUtc)
+    /// <summary>Итог команды, которая не уложилась в ожидание: когда процесс выйдет. Исключений не бросает.</summary>
+    private async Task<EmergencyRunResult> CompleteAsync(bool on, Guid reportId, DateTimeOffset started, Task<int> stillRunning)
     {
-        string? text;
+        int code;
         try
         {
-            text = _readFile(_reportPath);
+            code = await stillRunning.ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Verbose.Write("Ui", "окончание команды не дождались: " + ex.GetType().Name + " «" + ex.Message + "»");
+            return EmergencyRunResult.FromExitCode(on, EmergencyExitCodes.Unexpected, null, null);
+        }
+
+        return await FinishAsync(on, code, reportId, started).ConfigureAwait(false);
+    }
+
+    private async Task<EmergencyRunResult> FinishAsync(bool on, int code, Guid reportId, DateTimeOffset started)
+    {
+        // Отчёт читается и проверяется (владелец каталога и файла, размер, разбор) не в потоке интерфейса.
+        var report = await Task.Run(() => FreshReport(on, reportId, code, started), CancellationToken.None).ConfigureAwait(false);
+        Verbose.Write("Ui", (on ? "включение программы" : "экстренное выключение") + ": код " + code.ToString(CultureInfo.InvariantCulture)
+            + (report is null ? ", отчёта этого запуска нет" : ", отчёт прочитан"));
+        return EmergencyRunResult.FromExitCode(on, code, report, report is null ? null : _reportPath);
+    }
+
+    /// <summary>
+    /// Отчёт этого запуска; любой другой (прежний, другой команды, с другой меткой или кодом, подложенный, повреждённый) —
+    /// null. Исключений не бросает: без отчёта итог строится по коду завершения.
+    /// </summary>
+    internal EmergencyReport? FreshReport(bool on, Guid reportId, int exitCode, DateTimeOffset launchedUtc)
+    {
+        try
+        {
+            var text = _readFile(_reportPath);
+            var report = text is null ? null : EmergencyReportFiles.Parse(text);
+            return IsThisRun(report, on, reportId, exitCode, launchedUtc, _time.GetUtcNow()) ? report : null;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             Verbose.Write("Ui", "отчёт экстренного выключения не прочитан: " + ex.GetType().Name + " «" + ex.Message + "»");
             return null;
         }
-
-        var report = text is null ? null : EmergencyReportFiles.Parse(text);
-        return IsFresh(report, on, launchedUtc) ? report : null;
     }
 
-    internal static bool IsFresh(EmergencyReport? report, bool on, DateTimeOffset launchedUtc) =>
+    /// <summary>
+    /// Отчёт — этого запуска: та же метка, та же команда, тот же код завершения, начат не раньше запуска и не позже
+    /// «сейчас» (с допуском на часы), закончен не раньше начала, и список шагов цел (нет null).
+    /// </summary>
+    internal static bool IsThisRun(EmergencyReport? report, bool on, Guid reportId, int exitCode, DateTimeOffset launchedUtc, DateTimeOffset nowUtc) =>
         report is not null
+        && report.ReportId == reportId
         && string.Equals(report.Command, on ? EmergencyCommands.On : EmergencyCommands.Off, StringComparison.Ordinal)
+        && report.ExitCode == exitCode
+        && report.Steps is { } steps && steps.All(s => s is not null && s.Step is not null)
+        && report.Summary is not null
         && report.StartedUtc >= launchedUtc - ClockSkew
+        && report.StartedUtc <= nowUtc + ClockSkew
         && report.FinishedUtc >= report.StartedUtc;
 
-    private static string? ReadReport(string path)
+    /// <summary>
+    /// Текст отчёта, если ему можно верить: каталог отчётов и сам файл — не ссылки и принадлежат SYSTEM или
+    /// Administrators (записать их могла только команда с правами администратора), файл не больше
+    /// <see cref="MaxReportBytes"/>. Иначе null.
+    /// </summary>
+    internal static string? ReadTrustedReport(string path) => ReadTrustedReport(path, AdminOnlyAccess.OwnedByAdminsProblem);
+
+    /// <summary>Шов для тестов: <paramref name="trust"/> — почему объекту нельзя верить (null — можно).</summary>
+    internal static string? ReadTrustedReport(string path, Func<FileSystemInfo, string?> trust)
     {
-        if (!File.Exists(path))
+        ArgumentNullException.ThrowIfNull(trust);
+        if (!File.Exists(path) || Path.GetDirectoryName(path) is not { } directory)
         {
+            return null;
+        }
+
+        if ((trust(new DirectoryInfo(directory)) ?? trust(new FileInfo(path))) is { } problem)
+        {
+            Verbose.Write("Ui", "отчёт экстренного выключения не прочитан: " + problem);
             return null;
         }
 
         // Команда пишет отчёт до своего завершения; чтение не мешает следующей команде его заменить.
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var reader = new StreamReader(stream, Encoding.UTF8);
-        return reader.ReadToEnd();
+        var buffer = new byte[MaxReportBytes + 1];
+        var total = 0;
+        int read;
+        while (total < buffer.Length && (read = stream.Read(buffer, total, buffer.Length - total)) > 0)
+        {
+            total += read;
+        }
+
+        if (total > MaxReportBytes)
+        {
+            Verbose.Write("Ui", "отчёт экстренного выключения не прочитан: больше 1 МБ");
+            return null;
+        }
+
+        return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false).GetString(buffer, 0, total).TrimStart('﻿');
     }
 }
 
@@ -205,13 +311,13 @@ public enum EmergencyRunKind
     /// <summary>Отказ в окне UAC: ничего не делалось.</summary>
     Cancelled,
 
-    /// <summary>Уже выполняется другая такая команда (код 5).</summary>
+    /// <summary>Уже выполняется другая экстренная команда этой программы (код 5): включение ничего не делало.</summary>
     Busy,
 
     /// <summary>Сделано не всё (коды 1-4), команда не запустилась или файл службы не найден.</summary>
     Failed,
 
-    /// <summary>Команда не завершилась в срок ожидания.</summary>
+    /// <summary>Команда не завершилась за отведённое время и ещё выполняется: итог придёт в <see cref="EmergencyRunResult.Completion"/>.</summary>
     Overdue,
 }
 
@@ -274,7 +380,7 @@ public sealed record EmergencyRunResult
 
     public EmergencyRunKind Kind { get; init; }
 
-    /// <summary>Код завершения команды; null — команда не запускалась или не завершилась.</summary>
+    /// <summary>Код завершения команды; null — команда не запускалась или ещё не завершилась.</summary>
     public int? ExitCode { get; init; }
 
     public string Title { get; init; } = "";
@@ -289,13 +395,23 @@ public sealed record EmergencyRunResult
     /// <summary>Файл отчёта этого запуска; null — отчёта нет.</summary>
     public string? ReportPath { get; init; }
 
-    public bool IsError => Kind is not (EmergencyRunKind.Succeeded or EmergencyRunKind.Cancelled);
+    /// <summary>
+    /// Только у <see cref="EmergencyRunKind.Overdue"/>: окончательный итог, когда команда действительно завершится.
+    /// Задача не завершается исключением; команда при этом не прерывается.
+    /// </summary>
+    public Task<EmergencyRunResult>? Completion { get; init; }
+
+    public bool IsError => Kind is not (EmergencyRunKind.Succeeded or EmergencyRunKind.Cancelled or EmergencyRunKind.Overdue);
 
     public bool HasSteps => Steps.Count > 0;
 
     public bool HasAdvice => Advice.Length > 0;
 
-    /// <summary>Значок итога: успех, «подождите» (занято, не дождались) или «сделано не всё».</summary>
+    /// <summary>Сделано не всё, и последнее средство может помочь: команда не запустилась, код 1 или 3 и выше (кроме 5).</summary>
+    public bool OffersLastResort => !On && Kind == EmergencyRunKind.Failed
+        && ExitCode is null or EmergencyExitCodes.Unexpected or >= EmergencyExitCodes.Incomplete and not EmergencyExitCodes.Busy;
+
+    /// <summary>Значок итога: успех, «подождите» (занято, ещё выполняется) или «сделано не всё».</summary>
     public Views.StateTone Tone => Kind switch
     {
         EmergencyRunKind.Succeeded or EmergencyRunKind.Cancelled => Views.StateTone.Success,
@@ -313,7 +429,7 @@ public sealed record EmergencyRunResult
     /// <summary>Для экранного диктора: заголовок и итог одной строкой.</summary>
     public string Spoken => Title + ": " + Summary;
 
-    /// <summary>Есть неудавшиеся шаги или предупреждения: список шагов раскрыт сразу.</summary>
+    /// <summary>Есть неудавшиеся шаги или предупреждения.</summary>
     public bool HasProblems => Steps.Any(s => s.IsProblem);
 
     public string StepsHeader => $"Шаги ({Steps.Count})";
@@ -322,6 +438,9 @@ public sealed record EmergencyRunResult
     public int ProcessExitCode => ExitCode ?? (Kind == EmergencyRunKind.Cancelled ? EmergencyLauncher.UacCancelled : EmergencyExitCodes.Unexpected);
 
     private static string TitleFor(bool on) => on ? "Включение программы" : "Экстренное выключение";
+
+    private const string LastResort =
+        "Если интернет не работает, запустите от имени администратора recover-network.cmd из папки программы (подпапка scripts) или перезагрузите компьютер.";
 
     public static EmergencyRunResult Cancelled(bool on) => new()
     {
@@ -336,10 +455,11 @@ public sealed record EmergencyRunResult
         On = on,
         Kind = EmergencyRunKind.Failed,
         Title = TitleFor(on),
-        Summary = "Файл службы «Раздельного VPN» не найден: программа удалена или установка повреждена.",
+        Summary = "Файл службы «Раздельного VPN» не найден в папке установки или лежит там, куда может писать обычный пользователь: "
+            + "запускать его с правами администратора небезопасно.",
         Advice = on
             ? "Переустановите программу."
-            : "Если интернет не работает, запустите от имени администратора recover-network.cmd из папки программы (подпапка scripts) или перезагрузите компьютер.",
+            : "Если интернет не работает, запустите от имени администратора recover-network.cmd из папки программы (подпапка scripts) или переустановите программу.",
     };
 
     public static EmergencyRunResult StartFailed(bool on, int win32Error) => new()
@@ -348,25 +468,22 @@ public sealed record EmergencyRunResult
         Kind = EmergencyRunKind.Failed,
         Title = TitleFor(on),
         Summary = string.Create(CultureInfo.InvariantCulture, $"Windows не запустила команду с правами администратора (код {win32Error})."),
-        Advice = on
-            ? "Повторите «Включить программу». Если не помогает — перезагрузите компьютер и повторите."
-            : "Если интернет не работает, запустите от имени администратора recover-network.cmd из папки программы (подпапка scripts) или перезагрузите компьютер.",
+        Advice = on ? "Повторите «Включить программу». Если не помогает — перезагрузите компьютер и повторите." : LastResort,
     };
 
-    public static EmergencyRunResult Overdue(bool on, TimeSpan waited, EmergencyReport? report, string? reportPath) => new()
+    /// <summary>Команда идёт дольше отведённого: итог ещё будет (<paramref name="completion"/>), команда не прерывается.</summary>
+    public static EmergencyRunResult Overdue(bool on, TimeSpan waited, Task<EmergencyRunResult> completion) => new()
     {
         On = on,
         Kind = EmergencyRunKind.Overdue,
         Title = TitleFor(on),
-        Summary = string.Create(CultureInfo.InvariantCulture, $"Команда не завершилась за {waited.TotalMinutes:0} мин."),
-        Advice = "Она может ещё выполняться. Проверьте состояние через несколько минут; если интернет так и не заработает — перезагрузите компьютер.",
-        Steps = Rows(report),
-        ReportPath = reportPath,
+        Summary = string.Create(CultureInfo.InvariantCulture, $"Команда ещё выполняется: она идёт дольше {waited.TotalMinutes:0} мин."),
+        Advice = "Дождитесь её окончания — итог появится сам. Не запускайте команду повторно и не перезагружайте компьютер, пока она идёт.",
+        Completion = completion,
     };
 
     public static EmergencyRunResult FromExitCode(bool on, int code, EmergencyReport? report, string? reportPath)
     {
-        var steps = Rows(report);
         var summary = report is { Summary.Length: > 0 } ? report.Summary : EmergencyExitCodes.Describe(code, on);
         return new EmergencyRunResult
         {
@@ -380,18 +497,16 @@ public sealed record EmergencyRunResult
             ExitCode = code,
             Title = TitleFor(on),
             Summary = summary,
-            Advice = Advise(on, code, report),
-            Steps = steps,
+            Advice = string.Join(" ", new[] { Advise(on, code, report), StaticAddressNotes(report) }.Where(s => s.Length > 0)),
+            Steps = Rows(report),
             ReportPath = reportPath,
         };
     }
 
     private static List<EmergencyStepRow> Rows(EmergencyReport? report) =>
-        report?.Steps.Select(EmergencyStepRow.From).ToList() ?? [];
+        report?.Steps?.Where(s => s is not null).Select(EmergencyStepRow.From).ToList() ?? [];
 
-    private const string LastResort =
-        "Если интернет не работает, запустите от имени администратора recover-network.cmd из папки программы (подпапка scripts) или перезагрузите компьютер.";
-
+    /// <summary>Совет по коду и отчёту. Список неудавшихся шагов уже есть в итоге команды и здесь не повторяется.</summary>
     private static string Advise(bool on, int code, EmergencyReport? report) => (on, code) switch
     {
         (false, EmergencyExitCodes.Success) =>
@@ -399,30 +514,72 @@ public sealed record EmergencyRunResult
         (true, EmergencyExitCodes.Success) =>
             "VPN сам не подключается: нажмите «Подключить», когда он понадобится.",
         (false, EmergencyExitCodes.ServiceNotConfirmed) =>
-            "Интернет уже работает без программы. Проверьте службу «Раздельный VPN» в «Службах» Windows: если она ещё работает, повторите экстренное выключение.",
+            "Интернет уже работает без программы, и служба сейчас не работает, но не подтверждено, что она не запустится снова "
+            + "(отметка отключения, ручной запуск или остановка службы). После перезагрузки программа может снова включиться — повторите экстренное выключение.",
         (true, EmergencyExitCodes.ServiceNotConfirmed) =>
             "Запустите службу кнопкой в меню слева или перезагрузите компьютер.",
-        (false, EmergencyExitCodes.Incomplete) => NotRestored(report)
-            + "Перезагрузите компьютер: служба теперь запускается только вручную, поэтому после перезагрузки Windows не применит оставшиеся фильтры программы.",
+        (false, EmergencyExitCodes.Incomplete) => IncompleteAdvice(report),
         (true, EmergencyExitCodes.Incomplete) =>
             "Программа по-прежнему выключена. Повторите «Включить программу».",
         (_, EmergencyExitCodes.NotElevated) =>
-            "Повторите и подтвердите запрос Windows на права администратора.",
-        (_, EmergencyExitCodes.Busy) =>
-            "Уже выполняется другое экстренное выключение или включение. Дождитесь его окончания — это может занять несколько минут — и при необходимости повторите.",
+            "Нужна учётная запись администратора: повторите и в окне Windows подтвердите действие от имени администратора (или попросите администратора компьютера).",
+        (true, EmergencyExitCodes.Busy) =>
+            "Сейчас выполняется другая экстренная команда этой программы (с ярлыка, из скрипта или из второго окна). Дождитесь её окончания — это может занять несколько минут — и повторите «Включить программу».",
+        (false, EmergencyExitCodes.Busy) =>
+            "Сейчас выполняется другая экстренная команда этой программы. Дождитесь её окончания и при необходимости повторите.",
         (true, _) => "Повторите «Включить программу». Если не помогает — перезагрузите компьютер и повторите.",
         _ => LastResort,
     };
 
-    /// <summary>Что не вернулось: неудавшиеся обязательные шаги отчёта.</summary>
-    private static string NotRestored(EmergencyReport? report)
+    /// <summary>
+    /// Код 3: сеть возвращена не полностью. Совет перезагрузиться опирается на ручной запуск службы — только если отметка
+    /// отключения и ручной запуск подтверждены отчётом; служба всё ещё работает — об этом прямо.
+    /// </summary>
+    private static string IncompleteAdvice(EmergencyReport? report)
     {
-        var failed = report?.Steps.Where(s => !s.Succeeded && s.Required)
-            .Select(s => string.IsNullOrWhiteSpace(s.Title) ? EmergencySteps.Title(s.Step) : s.Title).ToList() ?? [];
-        return failed.Count == 0 ? "" : "Не возвращено: " + string.Join(", ", failed) + ". ";
+        var steps = report?.Steps?.Where(s => s is not null).ToList() ?? [];
+        var stillRunning = steps.Any(s => s.Step == EmergencySteps.ServiceRecheck && !s.Succeeded
+            && s.Detail?.StartsWith("служба всё ещё работает", StringComparison.Ordinal) == true);
+        var manualConfirmed = steps.Any(s => s.Step == EmergencySteps.Flag && s.Succeeded)
+            && steps.Any(s => s.Step == EmergencySteps.StartType && s.Succeeded);
+        var text = new StringBuilder();
+        if (stillRunning)
+        {
+            text.Append("Служба программы всё ещё работает и может снова применить фильтры, маршруты и DNS. ");
+        }
+
+        if (manualConfirmed)
+        {
+            text.Append("Перезагрузите компьютер: служба теперь запускается только вручную, поэтому после перезагрузки Windows не применит оставшиеся фильтры программы. ");
+        }
+        else if (report is null)
+        {
+            text.Append("Перезагрузите компьютер. ");
+        }
+        else
+        {
+            text.Append("Отметка отключения или ручной запуск службы не подтверждены: после перезагрузки программа может снова включиться. Повторите экстренное выключение. ");
+        }
+
+        return text.Append("Если интернет так и не заработает, запустите от имени администратора recover-network.cmd из папки программы (подпапка scripts).").ToString();
     }
 
-    /// <summary>Текст для окна сообщения (запуск с ‐‐emergency-off): итог, совет, неудавшиеся шаги, путь к отчёту.</summary>
+    /// <summary>
+    /// Адаптеры со статическим адресом, чей DNS программы оставлен как есть (без DHCP «автоматически» оставило бы их без
+    /// DNS): человеку нужно указать DNS вручную. Берётся из подробностей шагов DNS отчёта.
+    /// </summary>
+    private static string StaticAddressNotes(EmergencyReport? report)
+    {
+        var notes = report?.Steps?
+            .Where(s => s is { Step: EmergencySteps.Dns or EmergencySteps.DnsAgain, Detail: not null })
+            .SelectMany(s => s.Detail!.Split("; ", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            .Where(part => part.Contains(EmergencyNotes.StaticAddress, StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToList() ?? [];
+        return notes.Count == 0 ? "" : "Обратите внимание: " + string.Join("; ", notes) + ".";
+    }
+
+    /// <summary>Текст для окна сообщения (запуск с ‐‐emergency-off): итог, совет, подробности неудавшихся шагов, путь к отчёту.</summary>
     public string ToMessageText()
     {
         var text = new StringBuilder(Summary);
@@ -434,7 +591,7 @@ public sealed record EmergencyRunResult
         var problems = Steps.Where(s => s.IsProblem).ToList();
         if (problems.Count > 0)
         {
-            text.AppendLine().AppendLine().Append("Не получилось:");
+            text.AppendLine().AppendLine().Append("Подробности:");
             foreach (var step in problems)
             {
                 text.AppendLine().Append("• ").Append(step.Spoken).Append(step.IsWarning ? " — не влияет на итог" : "");

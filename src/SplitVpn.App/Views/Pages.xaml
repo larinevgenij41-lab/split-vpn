@@ -133,11 +133,10 @@
                                    AutomationProperties.Name="{Binding ButtonText}" Command="{Binding PrimaryActionCommand}"
                                    Content="{Binding ButtonText}" IsEnabled="{Binding Main.ServiceAvailable}"
                                    Visibility="{Binding Main.Emergency.IsOff, Converter={StaticResource VisibleWhen}, ConverterParameter=invert}" />
-                        <!-- Программа экстренно выключена: подключать нечего, главная кнопка включает программу. «Подключить» — после. -->
-                        <ui:Button Height="52" FontSize="16" Appearance="Primary" HorizontalAlignment="Stretch" Margin="0"
-                                   Content="Включить программу" Icon="{ui:SymbolIcon Power24}" Command="{Binding Main.Emergency.TurnOnCommand}"
-                                   AutomationProperties.Name="Включить программу"
-                                   AutomationProperties.HelpText="Снять экстренное выключение и запустить службу. Windows запросит права администратора"
+                        <!-- Программа экстренно выключена: подключать нечего. Кнопка «Включить программу» — одна, в баннере над
+                             страницей (виден на любой странице); здесь — только подсказка, где она. -->
+                        <TextBlock Style="{StaticResource Body}" Text="{x:Static vm:UiText.EmergencyHomeHint}" TextWrapping="Wrap"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                    Visibility="{Binding Main.Emergency.IsOff, Converter={StaticResource VisibleWhen}}" />
                         <TextBlock Style="{StaticResource Hint}" Text="{Binding SetupHint}"
                                    Visibility="{Binding SetupHint, Converter={StaticResource VisibleWhen}}" />

@@ -13,7 +13,11 @@ namespace SplitVpn.Core.Recovery;
 /// </summary>
 public static class EmergencyCommands
 {
-    /// <summary>«SplitVpn.Service.exe emergency-off»: выключить всё. Нужны права администратора.</summary>
+    /// <summary>
+    /// «SplitVpn.Service.exe emergency-off [‐‐report-id &lt;guid&gt;]»: выключить всё. Нужны права администратора. Ключ
+    /// <see cref="ReportIdOption"/> — метка запуска: она повторяется в отчёте (<see cref="EmergencyReport.ReportId"/>), и
+    /// запустивший команду отличает свой отчёт от прежнего или подложенного.
+    /// </summary>
     public const string Off = "emergency-off";
 
     /// <summary>«SplitVpn.Service.exe emergency-on»: снять отключение и запустить службу; защита не применяется до «Подключить».</summary>
@@ -21,6 +25,27 @@ public static class EmergencyCommands
 
     /// <summary>Прежнее имя: «recover» без ключей — то же, что <see cref="Off"/>.</summary>
     public const string RecoverAlias = "recover";
+
+    /// <summary>Ключ метки запуска (только для <see cref="Off"/> и <see cref="On"/>): за ним — GUID.</summary>
+    public const string ReportIdOption = "--report-id";
+
+    /// <summary>
+    /// Метка запуска из аргументов: значение сразу за <see cref="ReportIdOption"/>, строго GUID в виде «D» (36 знаков с
+    /// дефисами, без скобок), не нулевой. Нет ключа, нет значения или оно не такое — null (ключ тогда не учитывается).
+    /// </summary>
+    public static Guid? ParseReportId(IReadOnlyList<string> args)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+        for (var i = 0; i < args.Count - 1; i++)
+        {
+            if (string.Equals(args[i], ReportIdOption, StringComparison.OrdinalIgnoreCase))
+            {
+                return Guid.TryParseExact(args[i + 1], "D", out var id) && id != Guid.Empty ? id : null;
+            }
+        }
+
+        return null;
+    }
 }
 
 /// <summary>Коды завершения команд <see cref="EmergencyCommands"/>.</summary>
@@ -42,10 +67,11 @@ public static class EmergencyExitCodes
     public const int NotElevated = 4;
 
     /// <summary>
-    /// Прежде: уже выполняется другая команда, ничего не делалось. Команды emergency-off и emergency-on этот код больше
-    /// не возвращают: блокировку мог занять заранее обычный пользователь (мьютекс в Global\ создаётся без особых прав),
-    /// поэтому после ограниченного ожидания команда выполняется без блокировки, а в итоге (summary) об этом сказано.
-    /// Константа остаётся для скриптов и приложения, которые запускают прежние сборки.
+    /// on: уже выполняется другая команда восстановления этой программы (emergency-off, emergency-on или recover из того же
+    /// SplitVpn.Service.exe) — включение ничего не делало, его нужно повторить после её окончания. Другая команда
+    /// определяется по живым процессам (файл и командная строка), а не по мьютексу: мьютекс в Global\ может заранее занять
+    /// и обычный пользователь. off этот код не возвращает: экстренное отключение выполняется и рядом с другой командой
+    /// (шаги идемпотентны), а блокировка, занятая дольше срока, только упоминается в итоге.
     /// </summary>
     public const int Busy = 5;
 
@@ -56,7 +82,9 @@ public static class EmergencyExitCodes
         ServiceNotConfirmed => on ? "Программа включена, но запуск службы не подтверждён." : "Сеть возвращена, но остановка службы не подтверждена.",
         Incomplete => on ? "Программа не включена: флаг отключения не снят." : "Сеть возвращена не полностью.",
         NotElevated => "Нужны права администратора.",
-        Busy => "Уже выполняется другое экстренное отключение или включение.",
+        Busy => on
+            ? "Программа не включена: уже выполняется другая экстренная команда этой программы."
+            : "Уже выполняется другая экстренная команда этой программы.",
         _ => "Непредвиденная ошибка.",
     };
 }
@@ -136,6 +164,100 @@ public static class EmergencyRegistry
         flag is int value && value != 0
             ? new EmergencyFlag(since is string text && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var when) ? when : null)
             : null;
+}
+
+/// <summary>
+/// Сроки команд — единственный источник: из них заданы сроки шагов и общий срок команды в службе (EmergencyOptions), и из
+/// них же приложение выводит своё ожидание (<see cref="OffWorstCase"/>, <see cref="OnWorstCase"/> плюс запас).
+/// </summary>
+public static class EmergencyTimeouts
+{
+    /// <summary>Сколько ждать занятую блокировку команд.</summary>
+    public static readonly TimeSpan LockWait = TimeSpan.FromSeconds(15);
+
+    /// <summary>Проверка, не выполняется ли другая команда этой программы (перечисление процессов).</summary>
+    public static readonly TimeSpan OtherCommandCheck = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Сколько ждать штатной остановки службы до принудительного завершения: срок остановки хоста службы (28 с) и 2 с на
+    /// выход процесса (в службе — ServiceRecovery.StopWaitBeforeKill; тест сверяет их).
+    /// </summary>
+    public static readonly TimeSpan StopWaitBeforeKill = TimeSpan.FromSeconds(30);
+
+    /// <summary>Сколько ждать выхода завершаемого процесса.</summary>
+    public static readonly TimeSpan KillWait = TimeSpan.FromSeconds(10);
+
+    /// <summary>Срок одного вызова диспетчера служб.</summary>
+    public static readonly TimeSpan ScmCallTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>Сколько ждать запуска службы.</summary>
+    public static readonly TimeSpan StartWait = TimeSpan.FromSeconds(45);
+
+    /// <summary>
+    /// Перед выходом процесса шагам, не уложившимся в свой срок и ещё работающим в фоне, даётся столько, чтобы начатая
+    /// запись (копия DNS, состояние) не оборвалась на середине. Дольше процесс их не ждёт.
+    /// </summary>
+    public static readonly TimeSpan AbandonedStepGrace = TimeSpan.FromSeconds(10);
+
+    /// <summary>Срок шага, не названного в <see cref="Step"/>.</summary>
+    public static readonly TimeSpan DefaultStep = TimeSpan.FromSeconds(30);
+
+    /// <summary>Срок шага.</summary>
+    public static TimeSpan Step(string step) => step switch
+    {
+        EmergencySteps.Service => StopWaitBeforeKill + (3 * (KillWait + ScmCallTimeout)) + TimeSpan.FromSeconds(30),
+        EmergencySteps.StartService => StartWait + ScmCallTimeout + TimeSpan.FromSeconds(10),
+        EmergencySteps.Wfp or EmergencySteps.WfpAgain => TimeSpan.FromMinutes(2),
+        EmergencySteps.Dns or EmergencySteps.DnsAgain => TimeSpan.FromSeconds(90),
+        EmergencySteps.Routes or EmergencySteps.RoutesAgain => TimeSpan.FromSeconds(60),
+        EmergencySteps.Ras => TimeSpan.FromSeconds(45),
+        EmergencySteps.Flag or EmergencySteps.ClearFlag or EmergencySteps.Wcm => TimeSpan.FromSeconds(15),
+        EmergencySteps.FlushDns => TimeSpan.FromSeconds(20),
+        // Только подсчёт и завершение процессов службы: повторные снятия — отдельные шаги со своими сроками.
+        EmergencySteps.ServiceRecheck => (2 * (KillWait + ScmCallTimeout)) + TimeSpan.FromSeconds(10),
+        _ => DefaultStep,
+    };
+
+    /// <summary>
+    /// Все шаги, которые может выполнить emergency-off, — каждый не больше одного раза (повторные снятия — только когда
+    /// нужны, возврат автоперезапуска — в одном из двух мест).
+    /// </summary>
+    public static IReadOnlyList<string> OffSteps { get; } =
+    [
+        EmergencySteps.Flag, EmergencySteps.StartType, EmergencySteps.FailureActions, EmergencySteps.Service, EmergencySteps.RestoreFailureActions,
+        EmergencySteps.Helpers, EmergencySteps.Wfp, EmergencySteps.Ras, EmergencySteps.Routes, EmergencySteps.Dns, EmergencySteps.Wcm,
+        EmergencySteps.ServiceRecheck, EmergencySteps.WfpAgain, EmergencySteps.RoutesAgain, EmergencySteps.DnsAgain,
+        EmergencySteps.SuspendState, EmergencySteps.FlushDns,
+    ];
+
+    /// <summary>Все шаги emergency-on.</summary>
+    public static IReadOnlyList<string> OnSteps { get; } =
+    [
+        EmergencySteps.FailureActions, EmergencySteps.Service, EmergencySteps.RestoreFailureActions, EmergencySteps.SuspendState,
+        EmergencySteps.ClearFlag, EmergencySteps.RestoreStartType, EmergencySteps.StartService,
+    ];
+
+    /// <summary>
+    /// Худший случай emergency-off: ожидание блокировки, проверка другой команды, сумма сроков всех шагов и запас шагам, не
+    /// уложившимся в срок. Это же — общий срок команды в службе: дольше она не работает. Сейчас — 17 мин.
+    /// </summary>
+    public static TimeSpan OffWorstCase { get; } = WorstCase(OffSteps);
+
+    /// <summary>Худший случай emergency-on (так же, как <see cref="OffWorstCase"/>). Сейчас — 6 мин 20 с.</summary>
+    public static TimeSpan OnWorstCase { get; } = WorstCase(OnSteps);
+
+    private static TimeSpan WorstCase(IEnumerable<string> steps) =>
+        steps.Aggregate(LockWait + OtherCommandCheck + AbandonedStepGrace, (total, step) => total + Step(step));
+}
+
+/// <summary>Общие для службы и приложения фрагменты подробностей шагов.</summary>
+public static class EmergencyNotes
+{
+    /// <summary>
+    /// В подробностях шага DNS: адаптер со статическим IPv4-адресом оставлен как есть (без DHCP «автоматически» оставило
+    /// бы его без DNS) — DNS нужно указать вручную. Приложение показывает такие пояснения отдельно.
+    /// </summary>
+    public const string StaticAddress = "со статическим адресом";
 }
 
 /// <summary>Программа экстренно отключена; <paramref name="SinceUtc"/> — когда (если известно).</summary>
@@ -219,9 +341,22 @@ public static class EmergencySteps
 
     /// <summary>
     /// После сетевых шагов: процессы службы ещё живы (остановка не удалась) — завершаются, и фильтры, маршруты и DNS
-    /// снимаются ещё раз. Остались процессы — сеть не считается возвращённой (код 3): живая служба вернёт своё.
+    /// снимаются ещё раз отдельными шагами (<see cref="WfpAgain"/>, <see cref="RoutesAgain"/>, <see cref="DnsAgain"/>).
+    /// Остались процессы — сеть не считается возвращённой (код 3): живая служба вернёт своё.
     /// </summary>
     public const string ServiceRecheck = "service-recheck";
+
+    /// <summary>Фильтры снимаются повторно: процессы службы были живы после сетевых шагов.</summary>
+    public const string WfpAgain = "wfp-again";
+
+    /// <summary>Маршруты снимаются повторно: процессы службы были живы после сетевых шагов.</summary>
+    public const string RoutesAgain = "routes-again";
+
+    /// <summary>
+    /// DNS возвращается повторно: процессы службы были живы, или шаг DNS шёл по правилам работающей службы, а процессов
+    /// службы уже нет (тогда — по правилам остановленной: иначе на адаптерах остался бы loopback без посредника).
+    /// </summary>
+    public const string DnsAgain = "dns-again";
 
     public const string FlushDns = "flush-dns";
     public const string RestoreFailureActions = "restore-failure-actions";
@@ -245,6 +380,9 @@ public static class EmergencySteps
         [Dns] = "DNS адаптеров",
         [Wcm] = "Настройка Wi-Fi Windows",
         [ServiceRecheck] = "Повторная проверка службы",
+        [WfpAgain] = "Фильтры защиты — повторно",
+        [RoutesAgain] = "Маршруты программы — повторно",
+        [DnsAgain] = "DNS адаптеров — повторно",
         [FlushDns] = "Кеш DNS",
         [RestoreFailureActions] = "Автоперезапуск службы возвращён",
         [ClearFlag] = "Отметка отключения снята",
@@ -276,6 +414,9 @@ public sealed record EmergencyReport
 
     /// <summary><see cref="EmergencyCommands.Off"/>, <see cref="EmergencyCommands.On"/> или «uninstall-network».</summary>
     public string Command { get; init; } = "";
+
+    /// <summary>Метка запуска из <see cref="EmergencyCommands.ReportIdOption"/>; null — команду запустили без неё.</summary>
+    public Guid? ReportId { get; init; }
 
     public DateTimeOffset StartedUtc { get; init; }
 
