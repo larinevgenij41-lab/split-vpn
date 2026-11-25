@@ -603,7 +603,8 @@ public static class SettingsValidator
             }
         }
 
-        errors.AddRange(VpnProtocols.ValidateAuthentication(profile, protocolKnown, authKnown));
+        // Выключенный профиль без клиентского сертификата EAP-TLS (импорт) допустим: включить его без сертификата нельзя.
+        errors.AddRange(VpnProtocols.ValidateAuthentication(profile, protocolKnown, authKnown, requireClientCertificate: profile.Role != ProfileRole.Off));
 
         if (authKnown && VpnProtocols.NeedsPassword(profile.AuthMethod) && string.IsNullOrWhiteSpace(profile.UserName))
         {

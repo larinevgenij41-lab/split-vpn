@@ -60,6 +60,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         Emergency = new EmergencyViewModel(this);
         Emergency.PropertyChanged += OnEmergencyChanged;
         Service.EmergencyOffRefused += OnEmergencyOffRefused;
+        Service.WaitingForDial += OnWaitingForDial;
         Preferences = preferences;
         Home = new HomeViewModel(this);
         Connections = new ConnectionsViewModel(this);
@@ -344,6 +345,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         }
 
         Service.EmergencyOffRefused -= OnEmergencyOffRefused;
+        Service.WaitingForDial -= OnWaitingForDial;
         Emergency.PropertyChanged -= OnEmergencyChanged;
 
         ServiceHost.Dispose();
@@ -631,6 +633,43 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         ApplyEmergencyText();
         Home.ApplyEmergency();
         Diagnostics.OnEmergencyChanged();
+    }
+
+    /// <summary>Длиннее предела автоскрытия: ожидание дозвона длится до полутора минут, и сообщение не должно пропасть раньше.</summary>
+    internal const string SavingAfterDialText = "Сохраняю после завершения дозвона… Изменения будут приняты, как только подключение завершится (до полутора минут).";
+
+    /// <summary>
+    /// Служба отложила изменение настроек до конца дозвона, а приложение повторяет команду само: вместо ошибки
+    /// открытая страница (или мастер) показывает, что сохранение ждёт. Итог команды потом заменит это сообщение.
+    /// </summary>
+    private void OnWaitingForDial(bool waiting)
+    {
+        void Show()
+        {
+            if (Wizard is { } wizard)
+            {
+                if (waiting) { wizard.Progress = SavingAfterDialText; }
+                return;
+            }
+
+            if (waiting)
+            {
+                CurrentPage.ShowInfo(SavingAfterDialText);
+            }
+            else if (CurrentPage.Message == SavingAfterDialText)
+            {
+                CurrentPage.ClearSuccessMessage();
+            }
+        }
+
+        if (_ui is null || SynchronizationContext.Current == _ui)
+        {
+            Show();
+        }
+        else
+        {
+            _ui.Post(_ => Show(), null);
+        }
     }
 
     /// <summary>Служба отказала с кодом «emergency-off»: показываем состояние «выключена», а не ошибку.</summary>

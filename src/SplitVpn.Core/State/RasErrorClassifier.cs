@@ -19,6 +19,13 @@ public static class RasErrorClassifier
         [741] = ErrorCategory.Authentication, // не согласовано шифрование
         [742] = ErrorCategory.Authentication, // сервер требует другое шифрование
         [850] = ErrorCategory.Authentication, // тип EAP не установлен в системе
+        [734] = ErrorCategory.Authentication, // согласование PPP (LCP) прервано: способ входа не принят сервером
+        [13843] = ErrorCategory.Authentication, // IKE: неверные данные согласования (обычно не совпал общий ключ)
+        [13868] = ErrorCategory.Authentication, // IKE: нет общей политики шифрования с сервером
+        [732] = ErrorCategory.Other, // не согласованы протоколы управления PPP: повтор, но со своей расшифровкой
+        [735] = ErrorCategory.Other, // сервер отклонил запрошенный адрес: обычно проходит при повторе
+        [619] = ErrorCategory.ServerUnreachable, // порт закрыт: соединение с сервером не установилось
+        [13809] = ErrorCategory.ServerUnreachable, // IKE: запрос согласования слишком долго ждал ответа
         [766] = ErrorCategory.Certificate, // сертификат не найден
         [798] = ErrorCategory.Certificate, // не найден сертификат для EAP
         [781] = ErrorCategory.Certificate, // нет действительного сертификата L2TP
@@ -38,6 +45,8 @@ public static class RasErrorClassifier
         [-2146762495] = ErrorCategory.Certificate, // 0x800B0101 срок действия истёк
         [-2146885613] = ErrorCategory.Certificate, // 0x80092013 проверка отзыва недоступна
         [-2146885616] = ErrorCategory.Certificate, // 0x80092010 сертификат отозван
+        [-2146885614] = ErrorCategory.Certificate, // 0x80092012 проверка отзыва не выполнена
+        [-2146762486] = ErrorCategory.Certificate, // 0x800B010A цепочка не строится до доверенного корня
     };
 
     /// <summary>Коды, которые программа узнаёт по имени: у каждого есть своя расшифровка для интерфейса.</summary>

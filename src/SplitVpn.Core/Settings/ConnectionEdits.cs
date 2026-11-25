@@ -89,6 +89,8 @@ public static class ConnectionEdits
     /// Готовит профили из файла экспорта: новые идентификаторы, уникальные названия (в том числе внутри файла),
     /// роль «Выключено», автоматический выбор адаптера и повторы по умолчанию. Подключение из чужого файла
     /// не должно само дозваниваться, забирать опорную роль или ссылаться на адаптер другого компьютера.
+    /// Параметры, влияющие на безопасность, ставятся безопасными (см. ниже); имена сервера EAP и доверенные
+    /// корневые CA остаются — их интерфейс перечисляет в подтверждении импорта.
     /// </summary>
     public static List<ConnectionProfile> PrepareImport(IEnumerable<string> existingNames, IEnumerable<ConnectionProfile?> imported)
     {
@@ -100,13 +102,14 @@ public static class ConnectionEdits
         // Служебный раздел исходных значений (UnknownSettingValues.PreservedKey) из чужого файла не принимается:
         // при записи файла настроек он вернул бы на место непроверенные роль, протокол и способ входа.
         var profiles = imported.OfType<ConnectionProfile>().Select(p => UnknownSettingValues.WithoutPreserved(SettingsSerializer.NormalizeProfile(p))).ToList();
-        // Прежний идентификатор из файла -> новый: ссылки между подключениями файла (цель сетей шлюза) переносятся вместе с ними.
+        // Прежний идентификатор из файла -> новый.
         var newIds = new Dictionary<Guid, Guid>();
         foreach (var profile in profiles)
         {
             newIds.TryAdd(profile.Id, Guid.NewGuid());
         }
 
+        // Повтор идентификатора в файле получает свой новый идентификатор.
         var assigned = new HashSet<Guid>();
         foreach (var profile in profiles)
         {
@@ -117,8 +120,17 @@ public static class ConnectionEdits
             result.Add(profile with
             {
                 Id = importedId,
-                AnyConnect = profile.AnyConnect with { ServerNetworksTarget = profile.AnyConnect.ServerNetworksTarget == RouteTarget.Tunnel(profile.Id)
-                    ? RouteTarget.Tunnel(importedId) : Remap(profile.AnyConnect.ServerNetworksTarget, newIds) },
+                // Чужой файл не решает за пользователя, что важно для безопасности: прокси шлюза не применяется,
+                // сети шлюза идут в свой туннель, правила пользователя главнее сетей шлюза, а клиентский сертификат
+                // пользователь выбирает сам — отпечаток из файла указывал бы на сертификат, выбранный не им.
+                AnyConnect = profile.AnyConnect with
+                {
+                    ServerNetworksTarget = null,
+                    ApplyServerProxy = false,
+                    UserRulesOverrideServerNetworks = true,
+                    ClientCertificateThumbprint = "",
+                },
+                Eap = profile.Eap with { ClientCertificateThumbprint = "" },
                 Name = name,
                 Role = ProfileRole.Off,
                 PrimaryAdapter = AdapterSelection.Auto,
@@ -134,8 +146,8 @@ public static class ConnectionEdits
 
     /// <summary>
     /// Готовит профили к записи в файл экспорта: новые идентификаторы, чтобы файл не нёс идентификаторов установки,
-    /// перенос цели сетей шлюза AnyConnect на новые идентификаторы (иначе при импорте ссылка на другое подключение теряется)
-    /// и без служебного раздела исходных значений.
+    /// перенос цели сетей шлюза AnyConnect на новые идентификаторы (файл остаётся согласованным; эта версия при импорте
+    /// цель всё равно сбрасывает, прежние версии её читают) и без служебного раздела исходных значений.
     /// </summary>
     public static List<ConnectionProfile> PrepareExport(IEnumerable<ConnectionProfile> profiles)
     {
@@ -226,11 +238,71 @@ public static class ConnectionEdits
             old.TryAdd(where, target);
         }
 
+        // Сети шлюза AnyConnect сравниваются по подключению, а не по названию (его могли переименовать). Включаемое
+        // подключение, сети шлюза которого направлены «Напрямую», выводит их мимо VPN впервые: до включения этих
+        // сетей не было вовсе, и сравнивать не с чем, — это тоже «пойдёт напрямую».
+        var gatewaysBefore = new Dictionary<Guid, RouteTarget>();
+        foreach (var profile in before.Profiles.Where(IsEnabledAnyConnect))
+        {
+            gatewaysBefore.TryAdd(profile.Id, AppSettings.ServerNetworksTarget(profile));
+        }
+
+        var gatewayNames = new Dictionary<string, Guid>(StringComparer.Ordinal);
+        foreach (var profile in after.Profiles.Where(IsEnabledAnyConnect))
+        {
+            gatewayNames.TryAdd($"сети шлюза «{profile.Name}»", profile.Id);
+        }
         return after.AllTargets
-            .Where(t => t.Target.Kind == TargetKind.Direct && old.TryGetValue(t.Where, out var was) && was.IsVpn)
+            .Where(t => t.Target.Kind == TargetKind.Direct && (gatewayNames.TryGetValue(t.Where, out var gateway)
+                ? !gatewaysBefore.TryGetValue(gateway, out var wasGateway) || wasGateway.IsVpn
+                : old.TryGetValue(t.Where, out var was) && was.IsVpn))
             .Select(t => t.Where)
             .Distinct(StringComparer.Ordinal)
             .ToList();
+    }
+
+    private static bool IsEnabledAnyConnect(ConnectionProfile profile) => profile.Protocol == VpnProtocol.AnyConnect && profile.Role != ProfileRole.Off;
+
+    /// <summary>
+    /// Подгоняет маршрутизацию под протокол профиля. AnyConnect не несёт «Остальной интернет», RU-базу и обход
+    /// блокировок и не входит в группы; «VPN поверх SSH» не входит в группы (см. SettingsValidator). Без этого смена
+    /// протокола у профиля, на котором всё это держится, упиралась бы в ошибку проверки, которую из формы подключения
+    /// не исправить. Запрещённые цели переходят на прямой выход (их покажет <see cref="NewlyDirect"/>), профиль
+    /// выходит из групп, опустевшие группы удаляются. <paramref name="changes"/> — выход из групп словами.
+    /// </summary>
+    public static AppSettings FitProtocol(AppSettings settings, Guid profileId, out IReadOnlyList<string> changes)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        changes = [];
+        if (settings.Profile(profileId) is not { Protocol: VpnProtocol.AnyConnect or VpnProtocol.SshVpn } profile)
+        {
+            return settings;
+        }
+
+        var notes = new List<string>();
+        foreach (var group in settings.Groups.Where(g => g.Members.Contains(profileId)))
+        {
+            notes.Add($"«{profile.Name}» выйдет из группы «{group.Name}»");
+        }
+
+        var updated = settings with
+        {
+            Groups = settings.Groups.Select(g => g.Members.Contains(profileId) ? g with { Members = g.Members.Where(m => m != profileId).ToList() } : g).ToList(),
+        };
+        if (profile.Protocol == VpnProtocol.AnyConnect)
+        {
+            var tunnel = RouteTarget.Tunnel(profileId);
+            updated = updated with
+            {
+                DefaultTarget = updated.DefaultTarget == tunnel ? RouteTarget.Direct : updated.DefaultTarget,
+                GeoTarget = updated.GeoTarget == tunnel ? RouteTarget.Direct : updated.GeoTarget,
+                BypassTarget = updated.BypassTarget == tunnel ? RouteTarget.Direct : updated.BypassTarget,
+                Profiles = updated.Profiles.Select(p => p.Id == profileId && p.Role == ProfileRole.Primary ? p with { Role = ProfileRole.Secondary } : p).ToList(),
+            };
+        }
+
+        changes = notes;
+        return Retarget(updated);
     }
 
     /// <summary>

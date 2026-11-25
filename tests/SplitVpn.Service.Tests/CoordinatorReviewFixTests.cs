@@ -160,7 +160,10 @@ public sealed partial class CoordinatorTests
         var request = coordinator.SubmitAsync(new SaveSettingsRequest(changed), CancellationToken.None);
         await coordinator.DrainAsync();
 
-        Assert.False((await request).Ok);
+        // Настройки записаны: ответ — успех с предупреждением, а переподключение повторит сверка.
+        var response = await request;
+        Assert.True(response.Ok);
+        Assert.Contains(response.ResultAs<List<string>>()!, w => w.StartsWith(Coordinator.ReconnectDeferredNotice, StringComparison.Ordinal));
         Assert.NotNull(coordinator.Facts.PartialError);
         Assert.True(coordinator.Facts.ForceProtection);
         Assert.True(coordinator.Facts.PartialErrorRetryAt <= _world.Time.GetUtcNow());

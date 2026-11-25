@@ -409,7 +409,7 @@ public sealed partial class Coordinator
                     // Пробный дозвон длится до минуты: очередь актора не ждёт его, ответ придёт по завершении.
                     _ = BeginProfileTest(test.ProfileId).ContinueWith(t => completion.TrySetResult(t.IsCompletedSuccessfully
                         ? t.Result
-                        : IpcResponse.Failure(IpcErrorCodes.Failed, t.Exception?.GetBaseException().Message ?? "Проверка прервана.")), TaskScheduler.Default);
+                        : Interrupted(t, "Проверка прервана")), TaskScheduler.Default);
                     return;
                 }
 
@@ -418,7 +418,7 @@ public sealed partial class Coordinator
                     // Загрузка списка длится до минуты на источник: сеть — вне очереди, иначе даже запрос состояния ждёт её.
                     _ = HandleRequestAsync(request, lifetime).ContinueWith(t => completion.TrySetResult(t.IsCompletedSuccessfully
                         ? t.Result
-                        : IpcResponse.Failure(IpcErrorCodes.Failed, t.Exception?.GetBaseException().Message ?? "Обновление списка прервано.")), TaskScheduler.Default);
+                        : Interrupted(t, "Обновление списка прервано")), TaskScheduler.Default);
                     return;
                 }
 
@@ -427,7 +427,7 @@ public sealed partial class Coordinator
                     // Разрешение имени может ждать закрепления в этой же очереди: оно идёт вне её.
                     _ = CheckAddressOutsideQueueAsync(check, cancellationToken).ContinueWith(t => completion.TrySetResult(t.IsCompletedSuccessfully
                         ? t.Result
-                        : IpcResponse.Failure(IpcErrorCodes.Failed, t.Exception?.GetBaseException().Message ?? "Проверка адреса прервана.")), TaskScheduler.Default);
+                        : Interrupted(t, "Проверка адреса прервана")), TaskScheduler.Default);
                     return;
                 }
 
@@ -438,7 +438,7 @@ public sealed partial class Coordinator
                     // если интерфейс закрыли: её ход виден в статусе.
                     _ = HandleRequestAsync(request, token).ContinueWith(t => completion.TrySetResult(t.IsCompletedSuccessfully
                         ? t.Result
-                        : IpcResponse.Failure(IpcErrorCodes.Failed, t.Exception?.GetBaseException().Message ?? "Обновление прервано.")), TaskScheduler.Default);
+                        : Interrupted(t, "Обновление прервано")), TaskScheduler.Default);
                     return;
                 }
 
@@ -448,13 +448,15 @@ public sealed partial class Coordinator
             catch (Exception ex)
             {
                 var canceledByClient = ex is OperationCanceledException && token == cancellationToken && cancellationToken.IsCancellationRequested;
+                // Текст исключения — только в журнал службы; клиенту — что случилось и что делать, с кодом строки журнала.
+                var errorId = ServiceErrorText.NewId();
                 if (canceledByClient)
                 {
                     _deps.Logger.LogInformation("Запрос {Request} отменён клиентом", request.GetType().Name);
                 }
                 else
                 {
-                    _deps.Logger.LogError(ex, "Ошибка обработки запроса {Request}", request.GetType().Name);
+                    _deps.Logger.LogError(ex, "[{ErrorId}] Ошибка обработки запроса {Request}", errorId, request.GetType().Name);
                 }
 
                 if (request is not (GetStatusRequest or GetAdaptersRequest or ExportReportRequest or GetServerNetworksRequest))
@@ -464,7 +466,7 @@ public sealed partial class Coordinator
                     MarkInterruptedApply(request.GetType().Name, ex, canceledByClient);
                 }
 
-                completion.TrySetResult(IpcResponse.Failure(IpcErrorCodes.Failed, ex.Message));
+                completion.TrySetResult(IpcResponse.Failure(IpcErrorCodes.Failed, ServiceErrorText.Format("Команда не выполнена", ex, errorId)));
             }
         });
 

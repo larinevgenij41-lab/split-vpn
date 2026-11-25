@@ -700,7 +700,65 @@ public sealed partial class RoutingViewModel : PageViewModel
         return candidate;
     }
 
-    /// <summary>Добавляет в колонку или папку сеть (если текст похож на CIDR) или домен.</summary>
+    /// <summary>
+    /// Предел подсетей из одного диапазона: дальше доска превращается в стену карточек. Любой диапазон IPv4 покрывается
+    /// не больше чем 62 подсетями, поэтому предел ниже: 16 хватает на обычные диапазоны вида «.1-.254» (14 подсетей).
+    /// </summary>
+    internal const int MaxRangeCidrs = 16;
+
+    /// <summary>Диапазон или его ошибка: null — текст не похож на диапазон IPv4 «a.b.c.d-e.f.g.h».</summary>
+    internal sealed record RangeParse(IReadOnlyList<Ipv4Cidr>? Cidrs, string? Error);
+
+    /// <summary>
+    /// «a.b.c.d-e.f.g.h» (пробелы вокруг «-» допустимы) — наименьший набор подсетей, покрывающий ровно этот диапазон.
+    /// Ошибка — конец меньше начала или подсетей больше <see cref="MaxRangeCidrs"/>.
+    /// </summary>
+    internal static RangeParse? RangeInput(string value)
+    {
+        var dash = value.IndexOf('-', StringComparison.Ordinal);
+        if (dash <= 0 || dash != value.LastIndexOf('-')
+            || !Ipv4.TryParse(value[..dash], out var start) || !Ipv4.TryParse(value[(dash + 1)..], out var end))
+        {
+            return null;
+        }
+
+        if (end < start)
+        {
+            return new RangeParse(null, $"«{value}»: конец диапазона меньше начала. Укажите диапазон вида 10.0.0.1-10.0.0.9.");
+        }
+
+        var cidrs = CidrCover.Cover(new Ipv4Range(start, end));
+        return cidrs.Count > MaxRangeCidrs
+            ? new RangeParse(null, $"«{value}»: диапазон раскладывается на {cidrs.Count} подсетей — больше {MaxRangeCidrs}. Укажите его подсетями (CIDR) или разбейте на части.")
+            : new RangeParse(cidrs, null);
+    }
+
+    private void AddRange(RouteTarget target, string value, RangeParse range, BoardColumn? column, BoardFolder? folder)
+    {
+        if (range.Error is { } error)
+        {
+            ShowMessage(error, isError: true);
+            return;
+        }
+
+        var added = new List<string>();
+        foreach (var network in range.Cidrs!)
+        {
+            if (_cards.Exists(c => c.Kind == CardKind.Network && Ipv4Cidr.TryParse(c.Title, out var existing) && existing == network))
+            {
+                continue;
+            }
+
+            AddCard(new BoardCard(this, CardKind.Network, network.ToString(), null, target), column, folder);
+            added.Add(network.ToString());
+        }
+
+        ShowMessage(added.Count == 0
+            ? $"Все подсети диапазона {value} уже есть на доске."
+            : $"Диапазон {value} добавлен подсетями: {string.Join(", ", added)}.", isError: false);
+    }
+
+    /// <summary>Добавляет в колонку или папку сеть (если текст похож на CIDR), диапазон IPv4 или домен.</summary>
     internal void Add(BoardColumn column, string text) => Add(column.Target, text, column, null);
 
     internal void Add(BoardFolder folder, string text) => Add(folder.Target, text, null, folder);
@@ -718,6 +776,20 @@ public sealed partial class RoutingViewModel : PageViewModel
         {
             ShowMessage($"«{input}»: IPv6-адреса на доску не добавляются — публичный IPv6 блокируется, пока включена защита.", isError: true);
             return;
+        }
+
+        // Диапазон «10.0.0.1-10.0.0.9» — это сети, а не домен (Uri.CheckHostName принимает его за имя DNS):
+        // он раскладывается на наименьший набор подсетей.
+        if (RangeInput(value) is { } range)
+        {
+            AddRange(target, value, range, column, folder);
+            return;
+        }
+
+        // «*.example.org» — привычная запись «домен со всеми поддоменами»: правило домена так и работает.
+        if (value.StartsWith("*.", StringComparison.Ordinal))
+        {
+            value = value[2..];
         }
 
         // Сеть - только когда до «/» стоит адрес (цифры и точки): «example.org/» - это домен, а не сеть.

@@ -54,11 +54,23 @@ public sealed partial class WizardViewModel : ObservableObject
     private bool _settingsCaptured;
 
     /// <summary>
-    /// Настройки до первого сохранения профиля мастером, если в них были другие включённые подключения; иначе null.
-    /// Мастер делает новое подключение опорным, понижает прежнее опорное и забирает «Остальной интернет»: после
-    /// неудачи «Отмена» возвращает этот снимок (новое подключение остаётся выключенным), а не рвёт все туннели.
+    /// Мастер отправил службе сохранение профиля. Ставится до отправки: служба могла записать настройки, даже если
+    /// ответ не дошёл или не записался пароль. С этого момента «Отмена» возвращает то, что мастер поменял.
+    /// </summary>
+    private bool _profileSaved;
+
+    /// <summary>Цель RU-базы, которую записал мастер: «Отмена» возвращает прежнюю, только если она такой и осталась.</summary>
+    private RouteTarget _wizardGeo = RouteTarget.Direct;
+
+    /// <summary>
+    /// Настройки до первого сохранения профиля мастером. Мастер делает новое подключение опорным, понижает прежнее
+    /// опорное и забирает «Остальной интернет» и RU-базу: после неудачи любого следующего шага «Отмена» возвращает
+    /// эти поля (новое подключение остаётся выключенным), а не рвёт все туннели.
     /// </summary>
     private AppSettings? _settingsBefore;
+
+    /// <summary>До мастера были другие включённые подключения: их работу «Отмена» должна сохранить.</summary>
+    private bool OtherProfilesWereEnabled => _settingsBefore?.Profiles.Any(p => p.Id != _profileId && p.Role != ProfileRole.Off) == true;
 
     /// <param name="main">Главная модель.</param>
     /// <param name="loadAdapters">Запросить адаптеры у службы; самопроверка разметки обходится без службы.</param>
@@ -263,11 +275,11 @@ public sealed partial class WizardViewModel : ObservableObject
     }
 
     /// <summary>
-    /// «Отмена». Если «Готово» уже отправило службе подключение, а оно не удалось, служба держит намерение
-    /// «подключено» и защиту — трафик заблокирован. Были до мастера другие включённые подключения — возвращаются
-    /// прежние настройки (роли, «Остальной интернет», RU-база), новое подключение остаётся в них выключенным, и
-    /// работающие туннели не рвутся: глобальное отключение разорвало бы и их. Других подключений не было — VPN
-    /// отключается со снятием защиты. Профиль в обоих случаях остаётся, его можно исправить в «Подключениях».
+    /// «Отмена». Профиль уже сохранён (дальше не удались RU-база, смена её цели или подключение) — возвращаются
+    /// поля, которые поменял мастер (роли, «Остальной интернет», RU-база), если их с тех пор не меняли в другом
+    /// месте; новое подключение остаётся выключенным, работающие туннели не рвутся. Если «Готово» уже отправило
+    /// подключение, а других включённых подключений до мастера не было, служба держит намерение «подключено» и
+    /// защиту — тогда VPN отключается со снятием защиты. Профиль остаётся, его можно исправить в «Подключениях».
     /// Пока возврат или отключение не прошли, мастер не закрывается.
     /// </summary>
     [RelayCommand]
@@ -275,18 +287,25 @@ public sealed partial class WizardViewModel : ObservableObject
     {
         Password = "";
         Security.ClearSecrets();
-        if (_connectSent && _settingsBefore is { } before)
+        // Профиль сохранён, а дальше что-то не удалось (RU-база, подключение): «Отмена» возвращает роли и цели,
+        // которые поменял мастер. Исключение — подключение уже отправлено, а других включённых подключений не было:
+        // тогда ниже VPN отключается со снятием защиты.
+        if (_profileSaved && _settingsBefore is { } before && (OtherProfilesWereEnabled || !_connectSent))
         {
             IsBusy = true;
             Progress = "Возврат прежних настроек подключений…";
             try
             {
                 var fresh = await _main.Service.RequestAsync<AppSettings>(new GetSettingsRequest());
-                var added = fresh.Profiles.FirstOrDefault(p => p.Id == _profileId) is { } profile
-                    && before.Profiles.All(p => p.Id != _profileId) ? new[] { profile with { Role = ProfileRole.Off } } : [];
-                // Ревизия свежих настроек: если их успели изменить в другом месте, служба откажет, и «Отмена» повторится.
-                await _main.Service.CommandAsync(new SaveSettingsRequest(before with { Profiles = [.. before.Profiles, .. added] }, SettingsSerializer.Revision(fresh)));
+                // Возвращаются только поля, которые менял мастер, и только если их с тех пор не поменяли в другом месте;
+                // ревизия свежих настроек: если их изменят и сейчас, служба откажет, и «Отмена» повторится.
+                if (Rollback(before, fresh, _profileId, _wizardGeo) is { } restored)
+                {
+                    await _main.Service.CommandAsync(new SaveSettingsRequest(restored, SettingsSerializer.Revision(fresh)));
+                }
+
                 _connectSent = false;
+                _profileSaved = false;
             }
             catch (Exception ex) when (ex is ServiceUnavailableException or Services.ServiceCommandException)
             {
@@ -305,6 +324,7 @@ public sealed partial class WizardViewModel : ObservableObject
 
         if (_connectSent)
         {
+            // Других включённых подключений не было: отключение VPN ничего работающего не рвёт.
             IsBusy = true;
             Progress = "Отключение VPN и снятие защиты…";
             try
@@ -346,8 +366,7 @@ public sealed partial class WizardViewModel : ObservableObject
     {
         0 when string.IsNullOrWhiteSpace(Name) => ("Название: введите название подключения, например «Основное».", WizardField.Name),
         0 when !VpnProtocols.TryParseServer(Server, Security.Protocol, out _) => (UiText.ServerFieldError(Security.Protocol), WizardField.Server),
-        0 when !VpnProtocols.Supports(Security.Protocol, Security.AuthMethod)
-            => ("Способ входа: прежний способ несовместим с выбранным протоколом. Выберите новый в блоке «Параметры входа и безопасности».", WizardField.Security),
+        0 when VpnProtocols.UnsupportedAuthText(Security.Protocol, Security.AuthMethod) is { } unsupported => (unsupported, WizardField.Security),
         0 when VpnProtocols.ValidateAuthentication(Security.Apply(new ConnectionProfile { UserName = UserName })) is [var error, ..]
             => (error, error.StartsWith("Имя пользователя", StringComparison.Ordinal) ? WizardField.UserName : WizardField.Security),
         0 when Security.NeedsPassword && string.IsNullOrWhiteSpace(UserName) => ("Имя пользователя: введите имя для входа в VPN.", WizardField.UserName),
@@ -475,8 +494,8 @@ public sealed partial class WizardViewModel : ObservableObject
                         _acceptedProfile = null;
                     }
                     Error = $"Подключение не завершено: {StatusText.StateName(status?.State ?? ConnectionState.Error)}. {status?.ErrorText} "
-                        + (_settingsBefore is null
-                            ? "Исправьте данные и нажмите «Далее» — или «Отмена»: VPN отключится, защита снимется, подключение останется в «Подключениях»."
+                        + (!OtherProfilesWereEnabled
+                            ?"Исправьте данные и нажмите «Далее» — или «Отмена»: VPN отключится, защита снимется, подключение останется в «Подключениях»."
                             : "Исправьте данные и нажмите «Далее» — или «Отмена»: вернутся прежние настройки подключений, работающие подключения не разорвутся, а новое останется выключенным в «Подключениях».");
                     Step = 0;
                     if (status?.State == ConnectionState.PasswordRequired || status?.ErrorCategory == ErrorCategory.Authentication)
@@ -547,18 +566,31 @@ public sealed partial class WizardViewModel : ObservableObject
             Step = 0;
             return false;
         }
-        if (!_settingsCaptured)
-        {
-            // Снимок — до первого сохранения: повторное «Готово» видит настройки уже с новым подключением опорным.
-            _settingsCaptured = true;
-            _settingsBefore = settings.Profiles.Any(p => p.Id != _profileId && p.Role != ProfileRole.Off) ? settings : null;
-        }
-
         var updated = ConnectionEdits.SaveProfile(settings, profile) with
         {
             DefaultTarget = RouteTarget.Tunnel(profile.Id),
             GeoTarget = RussiaDirect ? RouteTarget.Direct : RouteTarget.Tunnel(profile.Id),
         };
+        if (!_settingsCaptured)
+        {
+            // Мастер запущен повторно, а другие подключения уже работают: до сохранения видно, какое из них перестанет
+            // быть опорным и что перейдёт на новое подключение.
+            if (TakeoverText(settings, updated, _profileId) is { } takeover
+                && !await _main.Confirm("Новое подключение станет опорным", takeover, "Продолжить"))
+            {
+                Error = "Сохранение отменено: прежние подключения не изменены. Нажмите «Готово: подключить», чтобы продолжить, или «Отмена».";
+                Step = LastInputStep;
+                return false;
+            }
+
+            // Снимок — до первого сохранения: повторное «Готово» видит настройки уже с новым подключением опорным.
+            _settingsCaptured = true;
+            _settingsBefore = settings;
+        }
+
+        // Отметка — до отправки: служба могла записать настройки, даже если не записала пароль или не ответила.
+        _profileSaved = true;
+        _wizardGeo = updated.GeoTarget;
         // Пустое значение — «не менять»: пароль уже мог быть принят службой при прошлой попытке.
         await _main.Service.CommandAsync(new SaveConnectionRequest(updated, profile.Id,
             Security.NeedsPassword && Password.Length > 0 ? Password : null,
@@ -578,6 +610,84 @@ public sealed partial class WizardViewModel : ObservableObject
         PrimaryAdapter = PinAdapter ? AdapterSelection.Pinned : AdapterSelection.Auto,
         PinnedInterfaceGuid = PinAdapter ? PinnedAdapter?.InterfaceGuid : null,
     });
+
+    /// <summary>
+    /// Что сохранение мастера отнимет у работающих подключений: какое опорное станет дополнительным и какие места
+    /// назначения перейдут на новое подключение. null — других включённых подключений нет, спрашивать не о чем.
+    /// </summary>
+    internal static string? TakeoverText(AppSettings before, AppSettings after, Guid profileId)
+    {
+        ArgumentNullException.ThrowIfNull(before);
+        ArgumentNullException.ThrowIfNull(after);
+        if (!before.Profiles.Any(p => p.Id != profileId && p.Role != ProfileRole.Off))
+        {
+            return null;
+        }
+
+        var name = after.Profile(profileId)?.Name ?? "Новое подключение";
+        var lines = new List<string> { $"«{name}» станет опорным подключением." };
+        if (before.PrimaryProfile is { } primary && primary.Id != profileId)
+        {
+            lines.Add($"«{primary.Name}» станет дополнительным: перестанет давать DNS по умолчанию и определять обрыв.");
+        }
+
+        foreach (var (where, was, will) in new[]
+        {
+            ("«Остальной интернет»", before.DefaultTarget, after.DefaultTarget),
+            ("«Россия (RU-база)»", before.GeoTarget, after.GeoTarget),
+        })
+        {
+            if (was != will)
+            {
+                lines.Add($"{where}: сейчас {TargetText(before, was)}, будет {TargetText(after, will)}.");
+            }
+        }
+
+        lines.Add("Если дальше что-то не удастся, «Отмена» вернёт прежние роли и маршруты.");
+        return string.Join("\n", lines);
+    }
+
+    private static string TargetText(AppSettings settings, RouteTarget target) => target.Kind switch
+    {
+        TargetKind.Direct => "напрямую",
+        TargetKind.Block => "блокируется",
+        _ => settings.TargetName(target),
+    };
+
+    /// <summary>
+    /// Откат мастера поверх свежих настроек: новое подключение выключается, прежнее опорное снова опорное,
+    /// «Остальной интернет» и RU-база возвращаются к прежним целям. Каждое поле возвращается, только если оно
+    /// всё ещё такое, каким его сделал мастер: правки, сделанные в другом месте, остаются. null — возвращать нечего.
+    /// </summary>
+    /// <param name="before">Настройки до первого сохранения мастером.</param>
+    /// <param name="fresh">Настройки службы сейчас.</param>
+    /// <param name="profileId">Подключение мастера.</param>
+    /// <param name="wizardGeo">Цель RU-базы, которую поставил мастер.</param>
+    internal static AppSettings? Rollback(AppSettings before, AppSettings fresh, Guid profileId, RouteTarget wizardGeo)
+    {
+        ArgumentNullException.ThrowIfNull(before);
+        ArgumentNullException.ThrowIfNull(fresh);
+        var wizardTunnel = RouteTarget.Tunnel(profileId);
+        var restorePrimary = before.PrimaryProfile is { } oldPrimary && oldPrimary.Id != profileId
+            && fresh.Profile(oldPrimary.Id) is { Role: ProfileRole.Secondary }
+            && !fresh.Profiles.Any(p => p.Id != profileId && p.Role == ProfileRole.Primary)
+                ? oldPrimary.Id : (Guid?)null;
+        var wasNew = before.Profile(profileId) is null;
+        var profiles = fresh.Profiles.Select(p =>
+            p.Id == profileId && p.Role != ProfileRole.Off ? p with { Role = wasNew ? ProfileRole.Off : before.Profile(profileId)!.Role }
+            : p.Id == restorePrimary ? p with { Role = ProfileRole.Primary }
+            : p).ToList();
+        var restored = fresh with
+        {
+            Profiles = profiles,
+            DefaultTarget = fresh.DefaultTarget == wizardTunnel ? before.DefaultTarget : fresh.DefaultTarget,
+            // Шаг «через VPN» временно направляет RU-базу в новое подключение; «Напрямую» мастер ставит сам.
+            GeoTarget = fresh.GeoTarget == wizardTunnel || fresh.GeoTarget == wizardGeo ? before.GeoTarget : fresh.GeoTarget,
+        };
+        var changed = restored.DefaultTarget != fresh.DefaultTarget || restored.GeoTarget != fresh.GeoTarget
+            || !profiles.Select(p => p.Role).SequenceEqual(fresh.Profiles.Select(p => p.Role));
+        return changed ? ConnectionEdits.Retarget(restored) : null;
+    }
 
     private async Task ChangeGeoTargetAsync(RouteTarget expected, RouteTarget target)
     {

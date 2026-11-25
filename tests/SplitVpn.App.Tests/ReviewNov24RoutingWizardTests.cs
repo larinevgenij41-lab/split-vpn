@@ -199,8 +199,15 @@ public sealed class ReviewNov24RoutingWizardTests
 
         using var service = new ServiceConnection(Send);
         using var main = new MainViewModel(service, new UiPreferences());
+        var confirmations = new List<string>();
+        main.Confirm = (_, text, _) => { confirmations.Add(text); return Task.FromResult(true); };
         var wizard = new WizardViewModel(main, false) { Name = "Новое", Server = "vpn.example", UserName = "user", Password = "draft", RussiaDirect = true, GeoOption = GeoStartOption.ViaTunnel, Step = WizardViewModel.LastStep - 1 };
         await wizard.NextCommand.ExecuteAsync(null);
+        // До сохранения мастер назвал, что отнимет у «Работы».
+        var takeover = Assert.Single(confirmations);
+        Assert.Contains("«Работа» станет дополнительным", takeover, StringComparison.Ordinal);
+        Assert.Contains("«Остальной интернет»", takeover, StringComparison.Ordinal);
+        Assert.Contains("«Россия (RU-база)»", takeover, StringComparison.Ordinal);
         Assert.Equal(0, wizard.Step);
         Assert.Contains("прежние настройки", wizard.Error, StringComparison.Ordinal);
         var added = store.Settings.Profiles.Single(p => p.Name == "Новое");

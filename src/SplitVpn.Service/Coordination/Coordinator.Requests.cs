@@ -15,6 +15,10 @@ namespace SplitVpn.Service.Coordination;
 
 public sealed partial class Coordinator
 {
+    /// <summary>Отказ задачи вне очереди: исключение — в журнал с кодом, клиенту — понятный текст с тем же кодом.</summary>
+    private IpcResponse Interrupted(Task task, string what) => IpcResponse.Failure(IpcErrorCodes.Failed,
+        task.Exception?.GetBaseException() is { } ex ? ServiceErrorText.Report(_deps.Logger, what, ex) : what + ".");
+
     private IpcResponse? SettingsUnavailable(IpcRequest request) =>
         _settingsReadError is { } error && request is not (GetStatusRequest or GetServerNetworksRequest or GetEventsRequest or RecoverNetworkRequest
             or DisconnectRequest { KeepProtection: false } or SetVerboseLoggingRequest or CollectDiagnosticsRequest or ReadDiagnosticsChunkRequest)
@@ -83,7 +87,7 @@ public sealed partial class Coordinator
     {
         if (Facts.Tunnels.Values.Any(t => t.Dialing) || Facts.ProfileTestRunning)
         {
-            return IpcResponse.Failure(IpcErrorCodes.Busy, "Дождитесь завершения дозвона перед изменением настроек.");
+            return IpcResponse.Failure(IpcErrorCodes.DialInProgress, "Дождитесь завершения дозвона перед изменением настроек.");
         }
 
         // Проверяется и сохраняется одна и та же нормализованная модель: «null» из канала управления не попадает в файл.
@@ -125,8 +129,9 @@ public sealed partial class Coordinator
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
                 RestoreSecrets(backups);
-                Journal("Ошибка", "Настройки не сохранены: не удалось удалить сохранённый пароль или ключ IPsec — " + ex.Message);
-                return IpcResponse.Failure(IpcErrorCodes.Failed, "Настройки не сохранены: не удалось удалить сохранённый пароль или ключ IPsec. " + ex.Message);
+                var text = ServiceErrorText.Report(_deps.Logger, "Настройки не сохранены: не удалось удалить сохранённый пароль или ключ IPsec", ex);
+                Journal("Ошибка", text);
+                return IpcResponse.Failure(IpcErrorCodes.Failed, text);
             }
 
             if (unreadable is { } locked)
@@ -147,8 +152,9 @@ public sealed partial class Coordinator
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
                 RestoreSecrets(backups);
-                Journal("Ошибка", "Настройки не сохранены: не удалось записать файл настроек - " + ex.Message);
-                return IpcResponse.Failure(IpcErrorCodes.Failed, "Настройки не сохранены: не удалось записать файл настроек (диск заполнен, файл занят или нет доступа). " + ex.Message);
+                var text = ServiceErrorText.Report(_deps.Logger, "Настройки не сохранены: не удалось записать файл настроек", ex);
+                Journal("Ошибка", text);
+                return IpcResponse.Failure(IpcErrorCodes.Failed, text);
             }
         }
         finally
@@ -172,13 +178,37 @@ public sealed partial class Coordinator
 
         RememberPersonalValues(previous);
         Journal("Сведения", "Настройки сохранены.");
-        if (reconcile)
+        if (reconcile && await ApplySavedSettingsAsync(previous, cancellationToken) is { } notice)
         {
-            await ReconnectChangedEndpointsAsync(previous, cancellationToken);
-            await ReconcileAsync(cancellationToken);
+            return IpcResponse.Success(validation.Warnings.Append(notice).ToList());
         }
 
         return IpcResponse.Success(validation.Warnings);
+    }
+
+    /// <summary>Текст, если настройки записаны, а применить их сразу не удалось: сверка повторит это сама.</summary>
+    internal const string ReconnectDeferredNotice = "Настройки сохранены. Переподключение не удалось и повторится автоматически.";
+
+    /// <summary>
+    /// Применение уже записанных настроек: разрыв туннелей со сменёнными параметрами и сверка. Сбой здесь не отменяет
+    /// сохранения — клиенту уходит успех с предупреждением (null — применено), а сверка назначается на ближайший тик.
+    /// Иначе интерфейс показал бы ошибку, хотя настройки записаны, и повтор сохранения уже не увидел бы разницы.
+    /// </summary>
+    private async Task<string?> ApplySavedSettingsAsync(AppSettings previous, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await ReconnectChangedEndpointsAsync(previous, cancellationToken);
+            await ReconcileAsync(cancellationToken);
+            return null;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException && !(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
+        {
+            var id = ServiceErrorText.NewId();
+            _deps.Logger.LogError(ex, "[{ErrorId}] Настройки сохранены, но не применены сразу", id);
+            MarkInterruptedApply("применение сохранённых настроек", ex);
+            return $"{ReconnectDeferredNotice} Код для поддержки: {id}.";
+        }
     }
 
     /// <summary>Как секрет называется в сообщениях.</summary>
@@ -509,8 +539,7 @@ public sealed partial class Coordinator
             }
             catch (Exception ex) when (IsSecretWriteFailure(ex))
             {
-                _deps.Logger.LogWarning(ex, "Ключ IPsec для {Name} не сохранён", profile.Name);
-                secretFailure ??= IpcResponse.Failure(IpcErrorCodes.Failed, $"Не удалось сохранить ключ IPsec для «{profile.Name}»: {ex.Message}");
+                secretFailure ??= IpcResponse.Failure(IpcErrorCodes.Failed, ServiceErrorText.Report(_deps.Logger, $"Не удалось сохранить ключ IPsec для «{profile.Name}»", ex));
             }
         }
 
@@ -533,8 +562,7 @@ public sealed partial class Coordinator
             }
             catch (Exception ex) when (IsSecretWriteFailure(ex))
             {
-                _deps.Logger.LogWarning(ex, "Ключ SSH для {Name} не сохранён", profile.Name);
-                secretFailure ??= IpcResponse.Failure(IpcErrorCodes.Failed, $"Не удалось сохранить ключ SSH для «{profile.Name}»: {ex.Message}");
+                secretFailure ??= IpcResponse.Failure(IpcErrorCodes.Failed, ServiceErrorText.Report(_deps.Logger, $"Не удалось сохранить ключ SSH для «{profile.Name}»", ex));
             }
         }
 
@@ -563,9 +591,14 @@ public sealed partial class Coordinator
             RetryFromScratch(tunnel);
         }
 
-        await ReconnectChangedEndpointsAsync(previous, cancellationToken);
-        await ReconcileAsync(cancellationToken);
-        return secretFailure ?? result;
+        // Настройки записаны: сбой переподключения или сверки — предупреждение к успеху, а не отказ (повторит сверка).
+        var notice = await ApplySavedSettingsAsync(previous, cancellationToken);
+        if (secretFailure is not null)
+        {
+            return notice is null ? secretFailure : secretFailure with { ErrorMessage = secretFailure.ErrorMessage + " " + notice };
+        }
+
+        return notice is null ? result : IpcResponse.Success((result.ResultAs<List<string>>() ?? []).Append(notice).ToList());
     }
 
     /// <summary>Переподключает туннели, у которых изменились адрес сервера или учётные данные.</summary>
@@ -685,8 +718,7 @@ public sealed partial class Coordinator
             }
             catch (Exception ex) when (IsSecretWriteFailure(ex))
             {
-                _deps.Logger.LogWarning(ex, "Пароль для {Name} не сохранён", profile.Name);
-                return IpcResponse.Failure(IpcErrorCodes.Failed, $"Не удалось сохранить пароль для «{profile.Name}»: {ex.Message}");
+                return IpcResponse.Failure(IpcErrorCodes.Failed, ServiceErrorText.Report(_deps.Logger, $"Не удалось сохранить пароль для «{profile.Name}»", ex));
             }
 
             ForgetMemoryPassword(profileId);
@@ -710,7 +742,7 @@ public sealed partial class Coordinator
     {
         if (Facts.Tunnels.Values.Any(t => t.Dialing) || Facts.ProfileTestRunning)
         {
-            return IpcResponse.Failure(IpcErrorCodes.Busy, "Дождитесь завершения дозвона перед изменением ключа.");
+            return IpcResponse.Failure(IpcErrorCodes.DialInProgress, "Дождитесь завершения дозвона перед изменением ключа.");
         }
 
         if (_settings.Profile(request.ProfileId) is not { } profile)
@@ -739,8 +771,7 @@ public sealed partial class Coordinator
         }
         catch (Exception ex) when (IsSecretWriteFailure(ex))
         {
-            _deps.Logger.LogWarning(ex, "Ключ IPsec для {Name} не сохранён", profile.Name);
-            return IpcResponse.Failure(IpcErrorCodes.Failed, $"Не удалось сохранить ключ IPsec для «{profile.Name}»: {ex.Message}");
+            return IpcResponse.Failure(IpcErrorCodes.Failed, ServiceErrorText.Report(_deps.Logger, $"Не удалось сохранить ключ IPsec для «{profile.Name}»", ex));
         }
 
         SecretReplaced(profile.Id, SecretKind.PreSharedKey);
@@ -971,7 +1002,7 @@ public sealed partial class Coordinator
     {
         if (Facts.Tunnels.Values.Any(t => t.Dialing) || Facts.ProfileTestRunning)
         {
-            return IpcResponse.Failure(IpcErrorCodes.Busy, "Дождитесь завершения дозвона перед сменой роли подключения.");
+            return IpcResponse.Failure(IpcErrorCodes.DialInProgress, "Дождитесь завершения дозвона перед сменой роли подключения.");
         }
 
         if (_settings.Profile(profileId) is null)
@@ -1023,8 +1054,9 @@ public sealed partial class Coordinator
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            Journal("Ошибка", $"{what}: не удалось записать файл настроек — {ex.Message}");
-            return IpcResponse.Failure(IpcErrorCodes.Failed, $"{what}: не удалось записать файл настроек (диск заполнен, файл занят или нет доступа). {ex.Message}");
+            var text = ServiceErrorText.Report(_deps.Logger, $"{what}: не удалось записать файл настроек", ex);
+            Journal("Ошибка", text);
+            return IpcResponse.Failure(IpcErrorCodes.Failed, text);
         }
     }
 
@@ -1074,9 +1106,9 @@ public sealed partial class Coordinator
         {
             // Обычная команда не записана: сеть и намерение остаются прежними, сверка не прерывалась — понятный
             // отказ, а не «неполное применение» с внеочередной сверкой.
-            Journal("Ошибка", $"Команда не выполнена: не удалось записать файл состояния — {ex.Message}");
-            return IpcResponse.Failure(IpcErrorCodes.Failed,
-                $"Команда не выполнена: не удалось записать файл состояния (диск заполнен, файл занят или нет доступа). {ex.Message}");
+            var text = ServiceErrorText.Report(_deps.Logger, "Команда не выполнена: не удалось записать файл состояния", ex);
+            Journal("Ошибка", text);
+            return IpcResponse.Failure(IpcErrorCodes.Failed, text);
         }
 
         if (forceProtection)

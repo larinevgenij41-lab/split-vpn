@@ -320,6 +320,18 @@ public sealed partial class SettingsSaveTests
         }
     }
 
+    /// <summary>Ключ сервера SSH нужного вида (ssh-ed25519) с произвольным содержимым.</summary>
+    private static string Ed25519HostKey()
+    {
+        var name = "ssh-ed25519"u8.ToArray();
+        var blob = new byte[4 + name.Length + 4 + 32];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(blob, (uint)name.Length);
+        name.CopyTo(blob, 4);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(blob.AsSpan(4 + name.Length), 32);
+        blob.AsSpan(8 + name.Length).Fill(7);
+        return "ssh-ed25519 " + Convert.ToBase64String(blob);
+    }
+
     private static Task RunStaAsync(Func<Task> action)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -344,7 +356,9 @@ public sealed partial class SettingsSaveTests
     [InlineData(true)]
     public Task ConcurrentProfileChangePreservesRemoteServerOrDeletion(bool deleted) => RunStaAsync(async () =>
     {
-        var profile = new ConnectionProfile { Name = "SSH", Protocol = VpnProtocol.SshVpn, Server = "old.example", UserName = "admin", Role = ProfileRole.Primary };
+        // Ключ сервера задан: форма проверяет профиль SSH так же, как служба, и без ключа не отправила бы его.
+        var profile = new ConnectionProfile { Name = "SSH", Protocol = VpnProtocol.SshVpn, AuthMethod = AuthMethod.SshKey, Server = "old.example", UserName = "admin", Role = ProfileRole.Primary,
+            SshVpn = new SshVpnSettings { HostKey = Ed25519HostKey() } };
         var store = new MemoryService { Settings = new AppSettings { Profiles = [profile], DefaultTarget = RouteTarget.Tunnel(profile.Id) } };
         using var service = new ServiceConnection(store.SendAsync);
         using var main = new MainViewModel(service, new UiPreferences());

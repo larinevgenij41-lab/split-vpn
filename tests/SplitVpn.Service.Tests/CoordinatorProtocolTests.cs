@@ -106,7 +106,7 @@ public sealed partial class CoordinatorTests
         coordinator.Facts.Tunnels.Values.First().Dialing = true;
         var response = await coordinator.HandleRequestAsync(new SaveSettingsRequest(new AppSettings()), CancellationToken.None);
         Assert.False(response.Ok);
-        Assert.Equal(IpcErrorCodes.Busy, response.ErrorCode);
+        Assert.Equal(IpcErrorCodes.DialInProgress, response.ErrorCode);
     }
 
     [Fact]

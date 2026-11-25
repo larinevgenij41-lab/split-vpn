@@ -66,7 +66,8 @@ public sealed partial class Coordinator
         catch (Exception ex) when (ex is InvalidOperationException or Windows.Native.NativeCallException or IOException or UnauthorizedAccessException)
         {
             Array.Clear(password);
-            return Task.FromResult(IpcResponse.Failure(IpcErrorCodes.InvalidSettings, ex.Message));
+            return Task.FromResult(IpcResponse.Failure(IpcErrorCodes.InvalidSettings,
+                ServiceErrorText.Report(_deps.Logger, $"Пробное подключение «{profile.Name}» не подготовлено", ex)));
         }
 
         Facts.ProfileTestRunning = true;

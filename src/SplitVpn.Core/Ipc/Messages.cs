@@ -300,6 +300,13 @@ public static class IpcErrorCodes
     public const string RecoveryIncomplete = "recovery-incomplete";
 
     /// <summary>
+    /// Идёт дозвон или пробное подключение: изменение настроек отложено, ничего не записано. Приложение повторяет
+    /// команду само, пока дозвон не завершится. Добавлено без смены версии контракта: прежнее приложение видит
+    /// незнакомый код и показывает текст отказа, как раньше показывало «busy».
+    /// </summary>
+    public const string DialInProgress = "dial-in-progress";
+
+    /// <summary>
     /// Программа экстренно отключена (StatusDto.EmergencyOff): служба отказывает в командах, которые меняли бы сеть,
     /// подключались или ходили в интернет, с текстом <see cref="EmergencyOffMessage"/>.
     /// </summary>

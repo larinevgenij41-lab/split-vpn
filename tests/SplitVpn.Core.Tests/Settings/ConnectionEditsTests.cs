@@ -22,13 +22,14 @@ public class ConnectionEditsTests
     }
 
     [Fact]
-    public void ImportDuplicateId_PreservesEachSelfReference()
+    public void ImportDuplicateId_GetsOwnIds_AndDefaultGatewayTarget()
     {
         var id = Guid.NewGuid();
         var input = new ConnectionProfile { Id = id, AnyConnect = new() { ServerNetworksTarget = RouteTarget.Tunnel(id) } };
         var imported = ConnectionEdits.PrepareImport([], [input, input]);
         Assert.NotEqual(imported[0].Id, imported[1].Id);
-        Assert.All(imported, p => Assert.Equal(RouteTarget.Tunnel(p.Id), p.AnyConnect.ServerNetworksTarget));
+        // Сети шлюза импортированного подключения идут в свой туннель (значение по умолчанию), что бы ни было в файле.
+        Assert.All(imported, p => Assert.Null(p.AnyConnect.ServerNetworksTarget));
     }
 
     /// <summary>Служебный раздел исходных значений из файла импорта и в файл экспорта не переносится; прочие неизвестные поля остаются.</summary>
@@ -247,7 +248,7 @@ public class ConnectionEditsTests
     }
 
     [Fact]
-    public void ExportThenImport_KeepsServerNetworksTargetOnImportedProfile()
+    public void Export_RemapsServerNetworksTarget_ImportResetsItToDefault()
     {
         var other = new ConnectionProfile { Name = "Второе", Server = "vpn2.example.org", UserName = "u", Role = ProfileRole.Secondary };
         var gateway = new ConnectionProfile
@@ -268,11 +269,11 @@ public class ConnectionEditsTests
         var importedOther = imported.Single(p => p.Name == "Второе");
         var importedGateway = imported.Single(p => p.Name == "Шлюз");
         Assert.NotEqual(exportedOther.Id, importedOther.Id);
-        Assert.Equal(RouteTarget.Tunnel(importedOther.Id), importedGateway.AnyConnect.ServerNetworksTarget);
+        Assert.Null(importedGateway.AnyConnect.ServerNetworksTarget);
     }
 
     [Fact]
-    public void PrepareImport_DropsServerNetworksTargetThatPointsOutsideTheFile()
+    public void PrepareImport_ResetsEveryServerNetworksTarget()
     {
         var gateway = new ConnectionProfile
         {
@@ -286,7 +287,8 @@ public class ConnectionEditsTests
         var imported = ConnectionEdits.PrepareImport([], [gateway, direct]);
 
         Assert.Null(imported.Single(p => p.Name == "Шлюз").AnyConnect.ServerNetworksTarget);
-        Assert.Equal(RouteTarget.Direct, imported.Single(p => p.Name == "Напрямую").AnyConnect.ServerNetworksTarget);
+        // «Напрямую» из чужого файла вывело бы сети шлюза мимо VPN без ведома пользователя.
+        Assert.Null(imported.Single(p => p.Name == "Напрямую").AnyConnect.ServerNetworksTarget);
     }
 
     private static readonly Guid VanishedAdapter = Guid.NewGuid();

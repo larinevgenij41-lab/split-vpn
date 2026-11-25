@@ -125,13 +125,32 @@ public static class VpnProtocols
 
     public static IReadOnlyList<string> ValidateAuthentication(ConnectionProfile profile) => ValidateAuthentication(profile, true, true);
 
+    /// <summary>Поле «Домен» RAS: короткое имя NetBIOS, не полное DNS-имя.</summary>
+    public const int MaxDomainLength = 15;
+
+    public const string DomainTooLong = "Домен — короткое имя (NetBIOS), до 15 знаков, например CORP, а не corp.example.com.";
+
+    /// <summary>
+    /// Почему способ входа не подходит протоколу — понятной фразой; null — подходит. IKEv2 с MS-CHAPv2 — частая
+    /// ошибка: тот же пароль IKEv2 принимает только внутри EAP.
+    /// </summary>
+    public static string? UnsupportedAuthText(VpnProtocol protocol, AuthMethod method) =>
+        Supports(protocol, method) ? null
+        : protocol == VpnProtocol.Ikev2 && method == AuthMethod.MsChapV2
+            ? "Способ входа: IKEv2 не принимает MS-CHAPv2 без EAP. Выберите «EAP-MSCHAPv2» — это тот же логин и пароль."
+            : "Способ входа: прежний способ несовместим с выбранным протоколом. Выберите новый в блоке «Параметры входа и безопасности».";
+
     /// <param name="profile">Подключение.</param>
     /// <param name="protocolKnown">
     /// false - протокол подставлен вместо неизвестного этой версии: разделы AnyConnect и SSH и проверки способа входа
     /// не выполняются, остаются общие ограничения имени пользователя и домена.
     /// </param>
     /// <param name="authKnown">false - способ входа подставлен: раздел EAP не проверяется.</param>
-    public static IReadOnlyList<string> ValidateAuthentication(ConnectionProfile profile, bool protocolKnown, bool authKnown)
+    /// <param name="requireClientCertificate">
+    /// false - отпечаток клиентского сертификата EAP-TLS может быть пуст: так выглядит выключенный импортированный
+    /// профиль, сертификат для которого пользователь выберет сам. Включить такой профиль проверка не даст.
+    /// </param>
+    public static IReadOnlyList<string> ValidateAuthentication(ConnectionProfile profile, bool protocolKnown, bool authKnown, bool requireClientCertificate = true)
     {
         ArgumentNullException.ThrowIfNull(profile);
         authKnown &= protocolKnown;
@@ -140,9 +159,15 @@ public static class VpnProtocols
         // не должен ронять проверку — сначала нормализация, потом разбор.
         profile = SettingsSerializer.NormalizeProfile(profile);
         var errors = new List<string>();
-        if (profile.UserName.Length > 256 || (profile.Domain?.Length ?? 0) > 15 || profile.UserName.Contains('\0') || profile.Domain?.Contains('\0') == true)
+        // Каждое поле — своим текстом: «Имя пользователя…» переводит курсор в поле имени, «Домен…» — в блок безопасности.
+        if (profile.UserName.Length > 256 || profile.UserName.Contains('\0'))
         {
-            errors.Add("Имя пользователя/домен не помещаются в поля RAS или содержат нулевой символ.");
+            errors.Add("Имя пользователя: не длиннее 256 знаков; нулевой символ недопустим.");
+        }
+
+        if ((profile.Domain?.Length ?? 0) > MaxDomainLength || profile.Domain?.Contains('\0') == true)
+        {
+            errors.Add(DomainTooLong);
         }
 
         if (authKnown && NeedsServerValidation(profile.AuthMethod))
@@ -159,7 +184,8 @@ public static class VpnProtocols
             }
         }
 
-        if (authKnown && profile.AuthMethod == AuthMethod.EapTls && !IsThumbprint(profile.Eap.ClientCertificateThumbprint))
+        if (authKnown && profile.AuthMethod == AuthMethod.EapTls && !IsThumbprint(profile.Eap.ClientCertificateThumbprint)
+            && (requireClientCertificate || profile.Eap.ClientCertificateThumbprint.Length > 0))
         {
             errors.Add("Укажите SHA-1 отпечаток клиентского сертификата EAP-TLS.");
         }

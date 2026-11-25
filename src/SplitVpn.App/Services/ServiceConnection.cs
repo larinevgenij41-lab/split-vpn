@@ -60,15 +60,60 @@ public sealed class ServiceConnection : IDisposable
     /// </summary>
     public event Action? EmergencyOffRefused;
 
+    /// <summary>
+    /// Изменение настроек отложено службой, пока идёт дозвон (<see cref="IpcErrorCodes.DialInProgress"/>): true — команда
+    /// ждёт и будет повторена сама («Сохраняю после завершения дозвона…»), false — ожидание закончилось.
+    /// Вызывается в потоке, где выполняется запрос.
+    /// </summary>
+    public event Action<bool>? WaitingForDial;
+
+    /// <summary>Пауза между повторами команды, отложенной из-за дозвона.</summary>
+    internal TimeSpan DialRetryDelay { get; set; } = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Сколько раз команда повторяется после отказа «идёт дозвон». Дозвон RAS не прерывается и длится до минуты-полутора
+    /// (AnyConnect — до 90 с), поэтому служба не ждёт его внутри запроса, а приложение повторяет команду: 30 × 3 с.
+    /// Дольше — отказ показывается как есть.
+    /// </summary>
+    internal int DialRetryLimit { get; set; } = 30;
+
     public async Task<IpcResponse> SendAsync(IpcRequest request, CancellationToken cancellationToken = default)
     {
         var response = await SendTracedAsync(request, cancellationToken);
+        if (!response.Ok && response.ErrorCode == IpcErrorCodes.DialInProgress)
+        {
+            response = await RetryAfterDialAsync(request, response, cancellationToken);
+        }
+
         if (!response.Ok && response.ErrorCode == IpcErrorCodes.EmergencyOff)
         {
             EmergencyOffRefused?.Invoke();
         }
 
         return response;
+    }
+
+    /// <summary>
+    /// Повторяет команду, отложенную из-за дозвона: служба при таком отказе ничего не записала, поэтому повтор
+    /// безопасен. Пока идёт ожидание, интерфейс показывает «Сохраняю после завершения дозвона…».
+    /// </summary>
+    private async Task<IpcResponse> RetryAfterDialAsync(IpcRequest request, IpcResponse response, CancellationToken cancellationToken)
+    {
+        WaitingForDial?.Invoke(true);
+        try
+        {
+            for (var attempt = 0; attempt < DialRetryLimit && !response.Ok && response.ErrorCode == IpcErrorCodes.DialInProgress; attempt++)
+            {
+                await Task.Delay(DialRetryDelay, cancellationToken);
+                response = await SendTracedAsync(request, cancellationToken);
+            }
+
+            return response;
+        }
+        finally
+        {
+            WaitingForDial?.Invoke(false);
+        }
     }
 
     private async Task<IpcResponse> SendTracedAsync(IpcRequest request, CancellationToken cancellationToken)
@@ -199,7 +244,7 @@ public sealed class ServiceConnection : IDisposable
     public async Task<IpcResponse> CommandAsync(IpcRequest request, CancellationToken cancellationToken = default)
     {
         var response = await SendAsync(request, cancellationToken);
-        return response.Ok ? response : throw new ServiceCommandException(ViewModels.UiText.ServiceRejected(response));
+        return response.Ok ? response : throw new ServiceCommandException(ViewModels.UiText.ServiceRejected(response), response.ErrorCode);
     }
 
     public void Dispose()

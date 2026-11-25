@@ -91,7 +91,7 @@ public sealed partial class CoordinatorTests
 
         var request = coordinator.SubmitAsync(new SaveSettingsRequest(changed), CancellationToken.None);
         await coordinator.DrainAsync();
-        Assert.False((await request).Ok);
+        Assert.True((await request).Ok);
         var tunnel = coordinator.Facts.Tunnels[_profile.Id];
         Assert.True(tunnel.ReconnectRequired);
 

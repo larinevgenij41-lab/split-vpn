@@ -529,7 +529,7 @@ public sealed partial class Coordinator
     private static bool RevocationRetryDue(TunnelFacts tunnel, RasDialResult result) =>
         !tunnel.RevocationRetryUsed
         && tunnel.RevocationHosts.Count > 0
-        && (int)result.ErrorCode == ConnectionErrorGuide.RevocationOffline;
+        && (int)result.ErrorCode is ConnectionErrorGuide.RevocationOffline or ConnectionErrorGuide.NoRevocationCheck;
 
     private const int MinRetryDelaySeconds = 5;
     private const int MaxRetryDelaySeconds = 3600;

@@ -33,6 +33,10 @@ public sealed partial class SettingsSaveTests
             // Пароль набран, затем вход сменён на сертификат.
             page.Password = "draft";
             item.Security.AuthMethod = AuthMethod.EapTls;
+            // Проверка сервера и сертификат заданы: форма проверяет EAP-TLS так же, как служба.
+            item.Security.ServerNames = "vpn.example";
+            item.Security.TrustedRoots = new string('A', 40);
+            item.Security.ClientCertificateThumbprint = new string('B', 40);
         }
 
         await page.SaveCommand.ExecuteAsync(null);
@@ -146,6 +150,8 @@ public sealed partial class SettingsSaveTests
         page.AddCommand.Execute(null);
         var item = page.Selected!;
         item.Server = "new.example";
+        // Без имени пользователя форма не отправила бы профиль с паролем (та же проверка, что у службы).
+        item.UserName = "user";
         page.Password = "new-password";
         store.AfterSave = async () => { await Task.Yield(); throw new IOException("пароль не сохранён"); };
 

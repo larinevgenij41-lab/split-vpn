@@ -92,6 +92,10 @@ public sealed partial class ConnectionsViewModel : PageViewModel
     [ObservableProperty]
     private int _serverFocusToken;
 
+    /// <summary>Запрос фокуса на поле «Имя пользователя»: ошибка в имени переводит туда курсор.</summary>
+    [ObservableProperty]
+    private int _userNameFocusToken;
+
     public ObservableCollection<AdapterDto> Adapters { get; } = [];
 
     /// <summary>Роли подключения: опорное даёт DNS по умолчанию и определяет обрыв.</summary>
@@ -501,11 +505,28 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         // Профиль собирается из формы после ожидания ответа службы: если за это время изменили сервер, имя
         // пользователя или пароль, взятый выше пароль ушёл бы с новым сервером. Тогда сохранение не идёт.
         var startEdits = item.Edits;
-        if (!VpnProtocols.TryParseServer(item.Server, item.Security.Protocol, out _))
+        // Адрес проверяется так, как его сохранит профиль: без пробелов по краям (разбор адреса шлюза их не принимает).
+        if (!VpnProtocols.TryParseServer(item.Server.Trim(), item.Security.Protocol, out _))
         {
             // Ошибка называет поле, а курсор переходит в него: баннер в шапке далеко от формы.
             ShowMessage(UiText.ServerFieldError(item.Security.Protocol), isError: true);
             ServerFocusToken++;
+            return null;
+        }
+
+        // Те же проверки входа, что у мастера: ошибка видна до запроса к службе, а курсор — в поле с ошибкой.
+        if (EditorProblem(item) is ({ } problem, var field))
+        {
+            ShowMessage(problem, isError: true);
+            if (field == WizardField.UserName)
+            {
+                UserNameFocusToken++;
+            }
+            else
+            {
+                item.Security.DetailsExpanded = true;
+            }
+
             return null;
         }
 
@@ -517,12 +538,11 @@ public sealed partial class ConnectionsViewModel : PageViewModel
             return null;
         }
 
-        var updated = PrepareSave(item, fresh);
+        var (updated, regrouped) = PrepareSave(item, fresh);
 
-        if (ConnectionEdits.NewlyDirect(fresh, updated) is { Count: > 0 } direct)
+        if (ConnectionEdits.NewlyDirect(fresh, updated) is var direct && (direct.Count > 0 || regrouped.Count > 0))
         {
-            if (!await Main.Confirm("Трафик пойдёт мимо VPN",
-                    $"После сохранения напрямую, без VPN, пойдут: {string.Join(", ", direct)}. Сохранить?", "Сохранить"))
+            if (!await Main.Confirm("Трафик пойдёт мимо VPN", RoutingChangeText(direct, regrouped), "Сохранить"))
             {
                 return null;
             }
@@ -536,9 +556,9 @@ public sealed partial class ConnectionsViewModel : PageViewModel
                 return null;
             }
 
-            var current = PrepareSave(item, fresh);
+            var (current, currentRegrouped) = PrepareSave(item, fresh);
 
-            if (ConnectionEdits.NewlyDirect(fresh, current).Except(direct).Any())
+            if (ConnectionEdits.NewlyDirect(fresh, current).Except(direct).Any() || currentRegrouped.Except(regrouped).Any())
             {
                 ShowMessage("Настройки изменились, пока было открыто подтверждение: сохраните подключение ещё раз.", isError: true);
                 return null;
@@ -582,8 +602,8 @@ public sealed partial class ConnectionsViewModel : PageViewModel
             fresh = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
             if (item.Edits != startEdits || fresh.Profile(item.Id) is not { } current || ConnectionEdits.PasswordBindingChanged(saved, current))
             { ShowMessage(EditedDuringSave, isError: true); return null; }
-            updated = PrepareSave(item, fresh);
-            if (ConnectionEdits.NewlyDirect(fresh, updated).Except(confirmedDirect).Any())
+            (updated, var reusedRegrouped) = PrepareSave(item, fresh);
+            if (ConnectionEdits.NewlyDirect(fresh, updated).Except(confirmedDirect).Any() || reusedRegrouped.Except(regrouped).Any())
             { ShowMessage("Маршрутизация изменилась: проверьте поля и сохраните ещё раз.", isError: true); return null; }
             // Служба сверяет эту привязку с актуальной: чужие изменения не перенесут другой пароль.
             reuseCredentialsFrom = saved;
@@ -595,24 +615,33 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         var clearPreSharedKey = security.ClearPreSharedKey;
         var sshKey = security.IsSsh ? security.PendingSshKey : null;
         List<string> warnings;
+        var sentPassword = security.NeedsPassword && password.Length > 0 ? password : null;
+        var sentKey = security.NeedsPsk ? clearPreSharedKey ? "" : preSharedKey.Length > 0 ? preSharedKey : null : null;
         try
         {
             item.SaveAttempted = true;
             var response = await Service.CommandAsync(new SaveConnectionRequest(
                 updated,
                 item.Id,
-                security.NeedsPassword && password.Length > 0 ? password : null,
-                security.NeedsPsk ? clearPreSharedKey ? "" : preSharedKey.Length > 0 ? preSharedKey : null : null,
+                sentPassword,
+                sentKey,
                 reuseCredentialsFrom,
                 sshKey, SettingsSerializer.Revision(fresh)));
             warnings = response.ResultAs<List<string>>() ?? [];
         }
-        catch (Exception) when (item.IsNew)
+        catch (Exception ex)
         {
-            // Новый профиль служба записывает раньше секрета: отказ при записи пароля или ключа и таймаут ответа
-            // не значат, что профиля в службе нет. Без этой проверки "Удалить" убрал бы только строку, а профиль
-            // и его трафик остались бы в службе. Черновики остаются в форме.
-            await RefreshIsNewAsync(item);
+            // Служба записывает настройки раньше секрета: отказ при записи пароля или ключа и таймаут ответа не
+            // значат, что профиля в службе нет. Без перечитывания «Удалить» убрал бы только строку нового профиля,
+            // а повтор «Сохранить» упёрся бы в ложное «Параметры входа изменились в другом окне». Черновики
+            // (пароль, ключи) остаются в форме.
+            var withCredentials = sentPassword is not null || sentKey is not null || sshKey is not null;
+            if (await RebaseAfterFailedSaveAsync(item, updated.Profile(item.Id)!) && withCredentials
+                && ex is ServiceCommandException or ServiceUnavailableException)
+            {
+                throw new ServiceCommandException(ex.Message.TrimEnd() + " " + SettingsSavedCredentialsNot, (ex as ServiceCommandException)?.ErrorCode);
+            }
+
             throw;
         }
 
@@ -648,24 +677,82 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         return warnings.Count == 0 ? "Подключение сохранено." : "Подключение сохранено. " + string.Join(" ", warnings);
     });
 
+    internal const string SettingsSavedCredentialsNot = "Настройки сохранены, данные входа — нет: нажмите «Сохранить» ещё раз.";
+
     /// <summary>
-    /// Новый профиль после неудачного сохранения: перечитывает службу и снимает отметку "новый", если профиль
-    /// в ней уже есть. Без связи со службой отметка остаётся: проверит удаление.
+    /// После неудачного сохранения перечитывает службу. Профиль в ней есть — отметка «новый» снимается. Если его
+    /// параметры входа (<see cref="VpnProtocols.ConnectionKey"/>) уже те, что отправлены, настройки записаны, а не
+    /// записался только секрет: основа формы переносится на сохранённый профиль, черновики пароля и ключей остаются.
+    /// Возвращает true в этом случае. Без связи со службой — false: отметку «новый» проверит удаление.
     /// </summary>
-    private async Task RefreshIsNewAsync(ProfileItem item)
+    private async Task<bool> RebaseAfterFailedSaveAsync(ProfileItem item, ConnectionProfile sent)
     {
         try
         {
             var fresh = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
-            if (fresh.Profile(item.Id) is not null)
+            if (fresh.Profile(item.Id) is not { } saved)
             {
-                item.IsNew = false;
+                return false;
             }
+
+            item.IsNew = false;
+            if (VpnProtocols.ConnectionKey(saved) != VpnProtocols.ConnectionKey(sent))
+            {
+                return false;
+            }
+
+            item.Rebase(saved);
+            return true;
         }
         catch (Exception ex) when (ex is ServiceUnavailableException or ServiceCommandException)
         {
             // Пользователь увидит исходную ошибку сохранения, а не ошибку перечитывания.
+            return false;
         }
+    }
+
+    /// <summary>Текст подтверждения: что уйдёт мимо VPN и из каких групп выйдет подключение.</summary>
+    internal static string RoutingChangeText(IReadOnlyList<string> direct, IReadOnlyList<string> regrouped)
+    {
+        ArgumentNullException.ThrowIfNull(direct);
+        ArgumentNullException.ThrowIfNull(regrouped);
+        var parts = new List<string>();
+        if (direct.Count > 0)
+        {
+            parts.Add($"После сохранения напрямую, без VPN, пойдут: {string.Join(", ", direct)}.");
+        }
+
+        if (regrouped.Count > 0)
+        {
+            parts.Add((direct.Count > 0 ? "Кроме того: " : "После сохранения: ") + string.Join("; ", regrouped) + ".");
+        }
+
+        parts.Add("Сохранить?");
+        return string.Join(" ", parts);
+    }
+
+    /// <summary>
+    /// Проверка формы перед отправкой — та же, что у мастера: способ входа подходит протоколу, имя пользователя,
+    /// домен и параметры EAP заданы. Поле — куда перевести курсор: имя пользователя или блок безопасности.
+    /// </summary>
+    internal static (string? Error, WizardField Field) EditorProblem(ProfileItem item)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        var security = item.Security;
+        if (VpnProtocols.UnsupportedAuthText(security.Protocol, security.AuthMethod) is { } unsupported)
+        {
+            return (unsupported, WizardField.Security);
+        }
+
+        var profile = item.ToProfile();
+        if (VpnProtocols.ValidateAuthentication(profile, true, true, requireClientCertificate: profile.Role != ProfileRole.Off) is [var error, ..])
+        {
+            return (error, error.StartsWith("Имя пользователя", StringComparison.Ordinal) ? WizardField.UserName : WizardField.Security);
+        }
+
+        return security.NeedsPassword && string.IsNullOrWhiteSpace(item.UserName)
+            ? ("Имя пользователя: введите имя для входа в VPN.", WizardField.UserName)
+            : (null, WizardField.None);
     }
 
     private const string EditedDuringSave ="Подключение изменено, пока шло сохранение: проверьте поля и сохраните ещё раз.";
@@ -674,7 +761,7 @@ public sealed partial class ConnectionsViewModel : PageViewModel
     /// Настройки с профилем из формы поверх <paramref name="fresh"/>.
     /// Основа профиля - свежий профиль службы: изменённая форма хранит снимок, сделанный до правок в других местах.
     /// </summary>
-    private static AppSettings PrepareSave(ProfileItem item, AppSettings fresh)
+    private static (AppSettings Settings, IReadOnlyList<string> Regrouped) PrepareSave(ProfileItem item, AppSettings fresh)
     {
         if (!item.IsNew && fresh.Profile(item.Id) is null)
         {
@@ -685,7 +772,10 @@ public sealed partial class ConnectionsViewModel : PageViewModel
             throw new ServiceCommandException("Параметры входа изменились в другом окне. Перечитайте подключение перед отправкой новых данных входа.");
         }
         var profile = item.ToProfile(fresh.Profile(item.Id));
-        return ConnectionEdits.SaveProfile(fresh, profile);
+        // Профиль стал AnyConnect или «VPN поверх SSH»: то, что такой профиль нести не может, уходит с него (на прямой
+        // выход, из групп), и подтверждение «Трафик пойдёт мимо VPN» перечисляет это до сохранения.
+        var updated = ConnectionEdits.FitProtocol(ConnectionEdits.SaveProfile(fresh, profile), profile.Id, out var regrouped);
+        return (updated, regrouped);
     }
 
     /// <summary>Проверка профиля: при снятой защите — пробный дозвон (до минуты), при подключении — отчёт по сеансу.</summary>
@@ -791,11 +881,7 @@ public sealed partial class ConnectionsViewModel : PageViewModel
             return null;
         }
 
-        var trust = added.Any(p => p.Eap.TrustedRootThumbprints.Count > 0)
-            ? " Файл задаёт доверенные корневые сертификаты для проверки сервера — импортируйте только файл из надёжного источника."
-            : "";
-        if (!await Main.Confirm("Импортировать подключения?",
-                $"Будут добавлены выключенными: {string.Join(", ", added.Select(p => "«" + p.Name + "»"))}. Пароли и ключи нужно ввести заново.{trust}", "Импортировать"))
+        if (!await Main.Confirm("Импортировать подключения?", ImportConfirmation(added), "Импортировать"))
         {
             return null;
         }
@@ -815,6 +901,31 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         return "Подключения импортированы выключенными. Введите пароли и включите нужные.";
     });
 
+    /// <summary>
+    /// Подтверждение импорта: что добавится и чему из файла придётся доверять — имена сервера EAP и доверенные
+    /// корневые CA. Клиентские сертификаты из файла не переносятся: их выбирают в «Подключениях».
+    /// </summary>
+    internal static string ImportConfirmation(IReadOnlyList<ConnectionProfile> added)
+    {
+        ArgumentNullException.ThrowIfNull(added);
+        var text = $"Будут добавлены выключенными: {string.Join(", ", added.Select(p => "«" + p.Name + "»"))}. Пароли и ключи нужно ввести заново, "
+            + "клиентский сертификат — выбрать в «Подключениях».";
+        var trust = added
+            .Where(p => p.Eap.TrustedRootThumbprints.Count > 0 || p.Eap.ServerNames.Trim().Length > 0)
+            .Select(p => $"«{p.Name}»: имена сервера EAP — {(p.Eap.ServerNames.Trim() is { Length: > 0 } names ? names : "не заданы")}; доверенные корневые CA — "
+                + (p.Eap.TrustedRootThumbprints.Count > 0 ? string.Join(", ", p.Eap.TrustedRootThumbprints.Select(ShortThumbprint)) : "не заданы"))
+            .ToList();
+        return trust.Count == 0
+            ? text
+            : text + "\nФайл задаёт, каким серверам доверять, — импортируйте только файл из надёжного источника.\n" + string.Join("\n", trust);
+    }
+
+    private static string ShortThumbprint(string thumbprint)
+    {
+        var clean = VpnProtocols.NormalizeThumbprint(thumbprint ?? "");
+        return clean.Length > 8 ? clean[..8] + "…" : clean;
+    }
+
     private string UniqueName(string name) =>
         ConnectionEdits.UniqueName(Profiles.Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase), name);
 }
@@ -829,6 +940,12 @@ public sealed partial class ProfileItem : ObservableObject
     internal bool SaveAttempted { get; set; }
     internal bool HasDraftCredentials => PasswordDraft.Length > 0 || Security.PreSharedKey.Length > 0 || Security.PendingSshKey is not null || Security.ClearPreSharedKey;
     internal bool BindingChanged(ConnectionProfile current) => VpnProtocols.ConnectionKey(_source) != VpnProtocols.ConnectionKey(current);
+
+    /// <summary>
+    /// Основа формы — сохранённый профиль: настройки записались, а секрет нет. Поля и черновики (пароль, ключи)
+    /// не трогаются, иначе повтор «Сохранить» потерял бы набранное.
+    /// </summary>
+    internal void Rebase(ConnectionProfile saved) => _source = saved ?? throw new ArgumentNullException(nameof(saved));
 
     /// <summary>Профиль ещё не сохранён в службе.</summary>
     [ObservableProperty]
