@@ -847,9 +847,22 @@ public sealed partial class DiagnosticsViewModel(MainViewModel main) : PageViewM
         }
 
         var report = await Service.RequestAsync<string>(new ExportReportRequest(MaskReport));
-        await WriteUserFileAsync(dialog.FileName, report);
+        await WriteUserFileAsync(dialog.FileName, IndentReport(report));
         return "Отчёт сохранён.";
     });
+
+    /// <summary>Служба присылает отчёт компактным, чтобы он поместился в кадр канала; в файл он пишется с отступами.</summary>
+    internal static string IndentReport(string report)
+    {
+        try
+        {
+            return System.Text.Json.Nodes.JsonNode.Parse(report)?.ToJsonString(Core.Settings.JsonDefaults.Options) ?? report;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return report;
+        }
+    }
 
     /// <summary>
     /// «Экстренно выключить» в «Диагностике» — та же команда, что в меню трея и на ярлыке: одно подтверждение и окно UAC,
@@ -1170,7 +1183,7 @@ public sealed record GatewaySessionRow(string Title, string Description, string?
         var parts = new List<string>
         {
             n.DtlsActive ? "быстрый канал (UDP)" : "обычный канал (TCP)",
-            Format.Count(n.Networks.Count, "сеть", "сети", "сетей"),
+            Format.Count(n.TotalNetworks, "сеть", "сети", "сетей"),
         };
         var details = new List<string>
         {

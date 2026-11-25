@@ -488,7 +488,7 @@ public sealed partial class RoutingViewModel : PageViewModel
 
     private static string GatewaySummary(ServerNetworksDto? networks) => networks is null
         ? "Шлюз назначит сети при входе"
-        : Format.Count(networks.Networks.Count, "сеть", "сети", "сетей") + (networks.Dns.Count > 0 ? ", DNS " + string.Join(", ", networks.Dns) : "");
+        : Format.Count(networks.TotalNetworks, "сеть", "сети", "сетей") + (networks.Dns.Count > 0 ? ", DNS " + string.Join(", ", networks.Dns) : "");
 
     /// <summary>
     /// Куда нельзя перенести карточку: «Остальной интернет» и RU-базу — в AnyConnect (он поднимается только после

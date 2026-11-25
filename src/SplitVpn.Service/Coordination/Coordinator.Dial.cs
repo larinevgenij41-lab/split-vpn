@@ -335,7 +335,9 @@ public sealed partial class Coordinator
     /// <summary>
     /// Коды временных сбоев подготовки записи: 621-624 - телефонная книга не открывается, не загружается, запись
     /// не находится или не пишется; 5, 32, 33 - файл недоступен, занят или заблокирован другим процессом
-    /// (антивирус, служба RAS); 8, 14, 1450 - не хватает памяти или системных ресурсов.
+    /// (антивирус, служба RAS); 8, 14, 1450 - не хватает памяти или системных ресурсов. Служба RAS недоступна или
+    /// перезапускается (<see cref="Windows.Ras.RasClient.RasUnavailable"/>, <see cref="Windows.Ras.RasClient.RpcUnavailable"/>) —
+    /// тоже временно.
     /// </summary>
     private static readonly HashSet<uint> TransientPrepareCodes = [5, 8, 14, 32, 33, 621, 622, 623, 624, 1450];
 
@@ -343,10 +345,11 @@ public sealed partial class Coordinator
     /// Сбой подготовки записи проходит сам: это не ошибка сертификата или входа, и останавливать повторы до
     /// действия пользователя нельзя - за kill switch он остался бы без связи.
     /// </summary>
-    private static bool IsTransientPrepareError(Exception ex) => ex switch
+    internal static bool IsTransientPrepareError(Exception ex) => ex switch
     {
         IOException or UnauthorizedAccessException => true,
-        Windows.Native.NativeCallException native => TransientPrepareCodes.Contains(native.Code),
+        Windows.Native.NativeCallException native => TransientPrepareCodes.Contains(native.Code)
+            || Windows.Ras.RasClient.RasUnavailable(native.Code) || Windows.Ras.RasClient.RpcUnavailable(native.Code),
         _ => false,
     };
 

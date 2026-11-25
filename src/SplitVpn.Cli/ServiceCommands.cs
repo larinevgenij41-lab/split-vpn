@@ -485,12 +485,48 @@ internal static class ServiceCommands
 
             if (tunnel.ServerNetworks is { } gateway)
             {
-                Console.WriteLine($"	шлюз: сетей {gateway.Networks.Count}, DNS {string.Join(", ", gateway.Dns)}, MTU {gateway.Mtu}, {(gateway.DtlsActive ? "DTLS" : "TLS")}{(gateway.SessionExpiresUtc is { } until ? ", сеанс до " + until.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture) : "")}");
+                Console.WriteLine($"	шлюз: сетей {gateway.TotalNetworks}, DNS {string.Join(", ", gateway.Dns)}, MTU {gateway.Mtu}, {(gateway.DtlsActive ? "DTLS" : "TLS")}{(gateway.SessionExpiresUtc is { } until ? ", сеанс до " + until.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture) : "")}");
+                if (args.Flag("--networks"))
+                {
+                    foreach (var network in await GatewayNetworksAsync(client, tunnel.ProfileId, gateway))
+                    {
+                        Console.WriteLine("		" + network);
+                    }
+                }
             }
         }
 
         return status.Tunnels.Count == 0 ? 1 : 0;
     });
+
+    /// <summary>
+    /// Все сети шлюза: в состоянии их только первые, остальные — постранично. Служба прежней версии постраничного
+    /// запроса не знает, зато присылает в состоянии полный список.
+    /// </summary>
+    private static async Task<IReadOnlyList<string>> GatewayNetworksAsync(IpcClient client, Guid profileId, ServerNetworksDto gateway)
+    {
+        if (!gateway.NetworksTruncated)
+        {
+            return gateway.Networks;
+        }
+
+        var networks = new List<string>(gateway.TotalNetworks);
+        while (true)
+        {
+            var response = await SendAsync(client, new GetServerNetworksRequest(profileId, networks.Count));
+            if (!response.Ok || response.ResultAs<ServerNetworksPageDto>() is not { } page)
+            {
+                Console.WriteLine($"		(список не получен целиком: {response.ErrorMessage})");
+                return networks.Count > 0 ? networks : gateway.Networks;
+            }
+
+            networks.AddRange(page.Networks);
+            if (page.Networks.Count == 0 || networks.Count >= page.Total)
+            {
+                return networks;
+            }
+        }
+    }
 
     /// <summary>Положить или поднять один туннель, не трогая настройки: то же, что выключатель в строке.</summary>
     public static Task<int> TunnelPauseAsync(CliArgs args) => SetPausedAsync(args, paused: true);

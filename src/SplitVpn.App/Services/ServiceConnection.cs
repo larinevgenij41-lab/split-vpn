@@ -131,7 +131,7 @@ public sealed class ServiceConnection : IDisposable
         var lane = request switch
         {
             GetStatusRequest or GetEventsRequest => _poll,
-            GetSettingsRequest or GetAdaptersRequest or ExportReportRequest or ReadDiagnosticsChunkRequest => _reads,
+            GetSettingsRequest or GetAdaptersRequest or ExportReportRequest or ReadDiagnosticsChunkRequest or GetServerNetworksRequest => _reads,
             CheckAddressRequest => _address,
             BeginSignInRequest or SsoNavigationRequest or SubmitAuthFormRequest or CancelSignInRequest => _signIn,
             _ => _commands,
@@ -192,7 +192,7 @@ public sealed class ServiceConnection : IDisposable
         var response = await SendAsync(request, cancellationToken);
         return response.Ok
             ? response.ResultAs<T>()!
-            : throw new ServiceCommandException(ViewModels.UiText.ServiceRejected(response));
+            : throw new ServiceCommandException(ViewModels.UiText.ServiceRejected(response), response.ErrorCode);
     }
 
     /// <summary>Команда без результата; отказ службы — исключение с её текстом (код без текста — только в журнал).</summary>
@@ -360,4 +360,8 @@ public sealed class ServiceConnection : IDisposable
     }
 }
 
-public sealed class ServiceCommandException(string message) : Exception(message);
+public sealed class ServiceCommandException(string message, string? errorCode = null) : Exception(message)
+{
+    /// <summary>Код отказа службы (<see cref="IpcErrorCodes"/>); null — отказ не от службы или код неизвестен.</summary>
+    public string? ErrorCode { get; } = errorCode;
+}

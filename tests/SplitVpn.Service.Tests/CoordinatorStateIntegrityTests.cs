@@ -44,7 +44,10 @@ public sealed partial class CoordinatorTests
 
         using (new FileStream(_world.Paths.State, FileMode.Open, FileAccess.Read, FileShare.None))
         {
-            await Assert.ThrowsAnyAsync<Exception>(() => coordinator.HandleRequestAsync(new ConnectRequest(null, null), CancellationToken.None));
+            // Отказ записи — понятный ответ Failed, а не исключение, которое очередь сочла бы прерванным применением.
+            var response = await coordinator.HandleRequestAsync(new ConnectRequest(null, null), CancellationToken.None);
+            Assert.False(response.Ok);
+            Assert.Equal(IpcErrorCodes.Failed, response.ErrorCode);
         }
 
         Assert.Equal(Intent.Off, coordinator.State.Intent);

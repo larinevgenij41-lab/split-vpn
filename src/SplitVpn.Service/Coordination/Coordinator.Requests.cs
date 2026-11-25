@@ -16,7 +16,7 @@ namespace SplitVpn.Service.Coordination;
 public sealed partial class Coordinator
 {
     private IpcResponse? SettingsUnavailable(IpcRequest request) =>
-        _settingsReadError is { } error && request is not (GetStatusRequest or GetEventsRequest or RecoverNetworkRequest
+        _settingsReadError is { } error && request is not (GetStatusRequest or GetServerNetworksRequest or GetEventsRequest or RecoverNetworkRequest
             or DisconnectRequest { KeepProtection: false } or SetVerboseLoggingRequest or CollectDiagnosticsRequest or ReadDiagnosticsChunkRequest)
             ? IpcResponse.Failure(IpcErrorCodes.Busy, error + " Служба повторит чтение автоматически.")
             : null;
@@ -28,6 +28,7 @@ public sealed partial class Coordinator
         RecoverNetworkRequest when _emergency is not null => RecoverWhileEmergencyOff(),
         _ when SettingsUnavailable(request) is { } unavailable => unavailable,
         GetStatusRequest => IpcResponse.Success(BuildStatus()),
+        GetServerNetworksRequest networks => ServerNetworksPage(networks),
         GetEventsRequest events => IpcResponse.Success(_deps.Journal.Since(events.SinceId)),
         GetAdaptersRequest => IpcResponse.Success(Adapters()),
         GetSettingsRequest => IpcResponse.Success(_settings),
@@ -55,7 +56,7 @@ public sealed partial class Coordinator
         InstallUpdateRequest install => await _update.BeginInstallAsync(this, install.Version, cancellationToken),
         UpdateStartedRequest started => _update.InstallStarted(this, started.ProcessId, started.AttemptId),
         SkipUpdateRequest skip => _update.SkipVersion(this, skip.Version),
-        ExportReportRequest report => IpcResponse.Success(ExportReport(report.MaskPersonalData)),
+        ExportReportRequest report => ExportReport(report.MaskPersonalData),
         SetVerboseLoggingRequest verbose => SetVerboseLogging(verbose.Minutes),
         CollectDiagnosticsRequest diagnostics => CollectDiagnostics(cancellationToken, diagnostics.ServiceDirectoryPrefix),
         ReadDiagnosticsChunkRequest chunk => ReadDiagnosticsChunk(chunk),
@@ -944,7 +945,11 @@ public sealed partial class Coordinator
         }
 
         var settings = ConnectionEdits.Reorder(_settings, order);
-        _deps.Stores.SaveSettings(settings);
+        if (TrySaveSettings(settings, "Порядок подключений не сохранён") is { } failed)
+        {
+            return failed;
+        }
+
         _settings = settings;
         await ReconcileAsync(cancellationToken);
         return IpcResponse.Success(BuildStatus());
@@ -993,12 +998,34 @@ public sealed partial class Coordinator
         }
 
         var previous = _settings;
-        _deps.Stores.SaveSettings(settings);
+        if (TrySaveSettings(settings, "Роль подключения не изменена") is { } failed)
+        {
+            return failed;
+        }
+
         _settings = settings;
         Journal("Сведения", $"«{settings.Profile(profileId)!.Name}»: роль — {RoleName(role)}.");
         await ReconnectChangedEndpointsAsync(previous, cancellationToken);
         await ReconcileAsync(cancellationToken);
         return IpcResponse.Success(BuildStatus());
+    }
+
+    /// <summary>
+    /// Запись настроек для команды, которая меняет только их: сбой записи (диск заполнен, файл занят, нет доступа) —
+    /// понятный отказ клиенту. Ничего ещё не изменено, поэтому «неполное применение» и внеочередная сверка были бы ложью.
+    /// </summary>
+    private IpcResponse? TrySaveSettings(AppSettings settings, string what)
+    {
+        try
+        {
+            _deps.Stores.SaveSettings(settings);
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Journal("Ошибка", $"{what}: не удалось записать файл настроек — {ex.Message}");
+            return IpcResponse.Failure(IpcErrorCodes.Failed, $"{what}: не удалось записать файл настроек (диск заполнен, файл занят или нет доступа). {ex.Message}");
+        }
     }
 
     private static string RoleName(ProfileRole role) => role switch
@@ -1025,10 +1052,11 @@ public sealed partial class Coordinator
         // Сначала запись, потом состояние в памяти: не сохранённая команда (файл занят, диск полон) возвращает
         // ошибку и не должна менять сеть — иначе клиент видит отказ, а после перезапуска действует прежнее намерение.
         var next = _state with { Intent = intent, ProtectionSuspended = false };
+        var forceProtection = false;
         if (intent == Intent.Off && _settingsReadError is not null)
         {
             next = next with { AutoConnectBootUtc = BootTime() };
-            Facts.ForceProtection = true;
+            forceProtection = true;
         }
         string? saveFailure = null;
         try
@@ -1041,6 +1069,19 @@ public sealed partial class Coordinator
             _recoveryWritePending = true;
             saveFailure = $"Состояние восстановления не записано: {ex.Message}";
             Journal("Ошибка", saveFailure);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Обычная команда не записана: сеть и намерение остаются прежними, сверка не прерывалась — понятный
+            // отказ, а не «неполное применение» с внеочередной сверкой.
+            Journal("Ошибка", $"Команда не выполнена: не удалось записать файл состояния — {ex.Message}");
+            return IpcResponse.Failure(IpcErrorCodes.Failed,
+                $"Команда не выполнена: не удалось записать файл состояния (диск заполнен, файл занят или нет доступа). {ex.Message}");
+        }
+
+        if (forceProtection)
+        {
+            Facts.ForceProtection = true;
         }
 
         foreach (var tunnel in Facts.Tunnels.Values.Where(t => profileId is null || t.ProfileId == profileId))
@@ -1225,22 +1266,50 @@ public sealed partial class Coordinator
         };
     }
 
-    private string ExportReport(bool mask) => ExportReport(mask, BuildStatus(), Adapters());
+    private IpcResponse ExportReport(bool mask) => ExportReport(mask, BuildStatus(), Adapters());
+
+    /// <summary>Сколько последних событий журнала остаётся в отчёте, если полный не помещается в кадр канала.</summary>
+    internal const int ReportFallbackEvents = 100;
 
     /// <summary>
     /// Отчёт по готовым состоянию и адаптерам: вне очереди актора он собирается из последнего снимка — журнал
-    /// событий потокобезопасен, настройки заменяются целиком.
+    /// событий потокобезопасен, настройки заменяются целиком. Отчёт — компактный JSON строкой в ответе (её разбирает
+    /// и форматирует для файла клиент); сети шлюзов в состоянии уже сокращены до числа и первых
+    /// <see cref="ServerNetworksDto.MaxStatusNetworks"/>. Не помещается в кадр — остаются последние
+    /// <see cref="ReportFallbackEvents"/> событий, не помещается и так — понятный отказ с советом собрать архив.
     /// </summary>
-    private string ExportReport(bool mask, StatusDto status, IReadOnlyList<AdapterDto> adapters)
+    private IpcResponse ExportReport(bool mask, StatusDto status, IReadOnlyList<AdapterDto> adapters)
+    {
+        var events = _deps.Journal.Since(0);
+        var report = BuildReport(mask, status, adapters, events, null);
+        if (FitsFrame(report))
+        {
+            return IpcResponse.Success(report);
+        }
+
+        var recent = events.Skip(Math.Max(0, events.Count - ReportFallbackEvents)).ToList();
+        report = BuildReport(mask, status, adapters, recent, string.Create(CultureInfo.InvariantCulture,
+            $"Отчёт сокращён: из {events.Count} событий журнала в него вошли последние {recent.Count}. Полный журнал — в архиве для разбора («Диагностика»)."));
+        return FitsFrame(report)
+            ? IpcResponse.Success(report)
+            : IpcResponse.Failure(IpcErrorCodes.Failed, string.Create(CultureInfo.InvariantCulture,
+                $"Отчёт больше {FrameCodec.MaxFrameMegabytes} МБ и не может быть передан. Соберите архив для разбора в «Диагностике»: в нём полное состояние и журнал."));
+    }
+
+    private static bool FitsFrame(string report) =>
+        IpcSerializer.SerializeResponse(IpcResponse.Success(report)).Length <= FrameCodec.MaxFrameBytes;
+
+    private string BuildReport(bool mask, StatusDto status, IReadOnlyList<AdapterDto> adapters, IReadOnlyList<ServiceEvent> events, string? note)
     {
         var settings = _settings;
         var report = JsonSerializer.Serialize(new
         {
             generatedUtc = _deps.Time.GetUtcNow(),
+            note,
             status = WithoutUrlSecrets(status),
             adapters,
-            events = _deps.Journal.Since(0),
-        }, JsonDefaults.Options);
+            events,
+        }, JsonDefaults.Compact);
         // Маскирование идёт по строковым значениям разобранного JSON, а не по тексту: кавычка или косая черта
         // в названии профиля не ломают структуру. Названия профилей, групп и адаптеров тоже личные. Журнал
         // событий помнит и прежние названия и серверы — они маскируются по настройкам, бывшим с запуска службы.
@@ -1254,7 +1323,7 @@ public sealed partial class Coordinator
             .OfType<string>()
             .Where(s => s.Length > 0)
             .ToList();
-        return Redactor.RedactJson(report, personal);
+        return Redactor.RedactJson(report, personal, JsonDefaults.Compact);
     }
 
     /// <summary>

@@ -364,7 +364,7 @@ public sealed partial class Coordinator
     {
         cancellationToken.ThrowIfCancellationRequested();
         var token = request is GetStatusRequest or GetAdaptersRequest or ExportReportRequest or GetEventsRequest or GetSettingsRequest
-            or CheckAddressRequest or InstallUpdateRequest ? cancellationToken : lifetime;
+            or CheckAddressRequest or InstallUpdateRequest or GetServerNetworksRequest ? cancellationToken : lifetime;
         var compatible = request.ContractVersion == IpcNames.ContractVersion;
         if (!compatible)
         {
@@ -457,7 +457,7 @@ public sealed partial class Coordinator
                     _deps.Logger.LogError(ex, "Ошибка обработки запроса {Request}", request.GetType().Name);
                 }
 
-                if (request is not (GetStatusRequest or GetAdaptersRequest or ExportReportRequest))
+                if (request is not (GetStatusRequest or GetAdaptersRequest or ExportReportRequest or GetServerNetworksRequest))
                 {
                     // Команда могла прерваться посреди применения (разрыв, маршруты, WFP): состояние
                     // уже изменено, а сверка не выполнена — она назначается на ближайший тик.
@@ -509,7 +509,7 @@ public sealed partial class Coordinator
     private IpcResponse FromSnapshot(IpcRequest request, ReadSnapshot snapshot) => request switch
     {
         GetAdaptersRequest => IpcResponse.Success(snapshot.Adapters),
-        ExportReportRequest report => IpcResponse.Success(ExportReport(report.MaskPersonalData, snapshot.Status, snapshot.Adapters)),
+        ExportReportRequest report => ExportReport(report.MaskPersonalData, snapshot.Status, snapshot.Adapters),
         // Срок подробного журнала меняется вне очереди: в ответе из снимка — текущий.
         _ => IpcResponse.Success(snapshot.Status with { VerboseUntilUtc = _deps.Verbose?.UntilUtc, Progress = CurrentProgress(snapshot.Status.Progress) }),
     };

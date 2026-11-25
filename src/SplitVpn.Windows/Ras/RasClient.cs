@@ -246,7 +246,13 @@ public static class RasClient
     /// Коды, которыми RAS сообщает, что его служба не работает и не может быть запущена: ERROR_RASMAN_CANNOT_INITIALIZE,
     /// ERROR_SERVICE_DISABLED, ERROR_SERVICE_NOT_ACTIVE, ERROR_SERVICE_DEPENDENCY_FAIL.
     /// </summary>
-    internal static bool RasUnavailable(uint code) => code is 711 or 1058 or 1062 or 1068;
+    public static bool RasUnavailable(uint code) => code is 711 or 1058 or 1062 or 1068;
+
+    /// <summary>
+    /// Коды, которыми вызов RAS обрывается, пока служба RasMan перезапускается: RPC_S_SERVER_UNAVAILABLE,
+    /// RPC_S_CALL_FAILED, RPC_S_CALL_FAILED_DNE. Как и <see cref="RasUnavailable"/>, они проходят сами.
+    /// </summary>
+    public static bool RpcUnavailable(uint code) => code is 1722 or 1726 or 1727;
 
     public static unsafe IReadOnlyList<RasActiveConnection> EnumerateConnections()
     {

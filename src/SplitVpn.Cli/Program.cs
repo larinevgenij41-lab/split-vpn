@@ -79,7 +79,7 @@ if (args.Length == 0 || !commands.TryGetValue(args[0], out var command))
     Console.WriteLine("  password --password-file <файл> [--profile <id>]");
     Console.WriteLine("  connect | disconnect [--keep-protection] | recover-network");
     Console.WriteLine("  check <IP или домен> | test-profile [--profile <id>]");
-    Console.WriteLine("  tunnels | tunnel-pause --profile <id> | tunnel-resume --profile <id>");
+    Console.WriteLine("  tunnels [--networks] | tunnel-pause --profile <id> | tunnel-resume --profile <id>");
     Console.WriteLine("  profile-order --ids <id1,id2,...>     порядок подключений и очерёдность подъёма");
     Console.WriteLine("  geo update|rollback|accept|reject|clear-skipped|import --file <ru.txt> [--list geo|bypass]");
     Console.WriteLine("  update [status]|check|download|install|skip [--version <версия>]");

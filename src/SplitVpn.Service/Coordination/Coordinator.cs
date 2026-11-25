@@ -566,7 +566,7 @@ public sealed partial class Coordinator
             ErrorText = tunnel.LastErrorText,
             ErrorCode = tunnel.LastErrorCode,
             ErrorHelp = ErrorHelp(profile, tunnel),
-            ServerCertificate = tunnel.ServerCertificate,
+            ServerCertificate = BoundCertificate(tunnel.ServerCertificate),
             SignIn = SignInPromptOf(tunnel),
             ServerNetworks = ServerNetworksOf(tunnel),
         };
@@ -688,8 +688,59 @@ public sealed partial class Coordinator
         {
             warnings.Add(new StatusWarning("ipv6-restricted", "IPv6 ограничен: публичный IPv6 блокируется, пока включена защита.", null));
         }
-        return warnings;
+        return BoundWarnings(warnings);
     }
+
+    /// <summary>Сколько предупреждений одного вида попадает в состояние; о прочих — одна строка.</summary>
+    internal const int MaxWarningsPerCode = 20;
+
+    /// <summary>Длина текста предупреждения в состоянии: в него попадают имена чужих подключений, адаптеров и правил.</summary>
+    internal const int MaxWarningText = 2000;
+
+    /// <summary>
+    /// Предупреждения в пределах: часть их растёт от внешних данных (чужие подключения телефонной книги, сети адаптеров,
+    /// правила на сети адаптеров), а состояние передаётся каждые полторы секунды одним кадром канала. Порядок сохраняется.
+    /// </summary>
+    internal static List<StatusWarning> BoundWarnings(List<StatusWarning> warnings)
+    {
+        var perCode = new Dictionary<string, int>(StringComparer.Ordinal);
+        var bounded = new List<StatusWarning>(warnings.Count);
+        var dropped = 0;
+        foreach (var warning in warnings)
+        {
+            var seen = perCode[warning.Code] = perCode.GetValueOrDefault(warning.Code) + 1;
+            if (seen > MaxWarningsPerCode)
+            {
+                dropped++;
+                continue;
+            }
+
+            bounded.Add(warning.Text.Length > MaxWarningText ? warning with { Text = warning.Text[..MaxWarningText] + "…" } : warning);
+        }
+
+        if (dropped > 0)
+        {
+            bounded.Add(new StatusWarning("warnings-truncated", string.Create(CultureInfo.InvariantCulture,
+                $"Ещё предупреждений: {dropped} — они повторяют показанные. Подробности — в журнале службы."), null));
+        }
+
+        return bounded;
+    }
+
+    /// <summary>Сколько имён и адресов сертификата сервера попадает в состояние: их число задаёт сервер.</summary>
+    internal const int MaxCertificateItems = 64;
+
+    private static ServerCertificateFacts? BoundCertificate(ServerCertificateFacts? certificate) =>
+        certificate is null || (certificate.Names.Count <= MaxCertificateItems && certificate.RevocationUrls.Count <= MaxCertificateItems
+            && certificate.RevocationHosts.Count <= MaxCertificateItems && certificate.IssuerHosts.Count <= MaxCertificateItems)
+            ? certificate
+            : certificate with
+            {
+                Names = [.. certificate.Names.Take(MaxCertificateItems)],
+                RevocationUrls = [.. certificate.RevocationUrls.Take(MaxCertificateItems)],
+                RevocationHosts = [.. certificate.RevocationHosts.Take(MaxCertificateItems)],
+                IssuerHosts = [.. certificate.IssuerHosts.Take(MaxCertificateItems)],
+            };
 
     /// <summary>
     /// Правило на сеть своего адаптера молча не действует: её адреса остаются в локальной сети. Так бывает,

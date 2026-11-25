@@ -541,9 +541,21 @@ public sealed class IpcServer(Coordinator coordinator, ILogger<IpcServer> logger
     internal Task<IpcResponse> SubmitAsync(IpcRequest request, CancellationToken clientWait) =>
         coordinator.SubmitAsync(request, clientWait, coordinator.ServiceLifetime);
 
-    private static Task WriteAsync(Stream pipe, IpcResponse response, CancellationToken cancellationToken)
+    private static Task WriteAsync(Stream pipe, IpcResponse response, CancellationToken cancellationToken) =>
+        FrameCodec.WriteAsync(pipe, FramePayload(response), cancellationToken);
+
+    /// <summary>
+    /// Ответ, который помещается в кадр. Состояние сверх предела теряет списки сетей шлюзов (их число остаётся):
+    /// отказ на запрос состояния отрезал бы от службы всех клиентов, а интерфейс счёл бы службу другой версии.
+    /// </summary>
+    internal static byte[] FramePayload(IpcResponse response)
     {
         var payload = IpcSerializer.SerializeResponse(response);
+        if (payload.Length > FrameCodec.MaxFrameBytes && ResponseTrimming.WithoutNetworkLists(response) is { } trimmed)
+        {
+            payload = IpcSerializer.SerializeResponse(trimmed);
+        }
+
         if (payload.Length > FrameCodec.MaxFrameBytes)
         {
             // Слишком большой ответ (огромный журнал, тысячи правил) не рвёт канал: клиент получает понятную
@@ -553,6 +565,6 @@ public sealed class IpcServer(Coordinator coordinator, ILogger<IpcServer> logger
                 $"Ответ службы больше {FrameCodec.MaxFrameMegabytes} МБ и не может быть передан.")));
         }
 
-        return FrameCodec.WriteAsync(pipe, payload, cancellationToken);
+        return payload;
     }
 }

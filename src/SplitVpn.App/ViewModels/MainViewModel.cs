@@ -526,10 +526,11 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         }
         catch (ServiceCommandException ex)
         {
-            // Отказ на запрос состояния возможен только от службы другой версии.
+            // Неверный запрос — служба другой версии; иной отказ (ответ не передан, сбой) — ошибка службы той же версии.
             if (generation == _statusGeneration)
             {
-                ApplyUnavailable(new ServiceUnavailableException(ex.Message, ex, ServiceUnavailableReason.VersionMismatch));
+                ApplyUnavailable(new ServiceUnavailableException(ex.Message, ex,
+                    ex.ErrorCode == IpcErrorCodes.BadRequest ? ServiceUnavailableReason.VersionMismatch : ServiceUnavailableReason.Faulted));
             }
         }
         finally
@@ -637,7 +638,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         ServiceAvailable = false;
         UnavailableReason = error.Reason;
         ServiceErrorTitle = title;
-        ServiceError = $"{text} {advice}";
+        ServiceError = error.Reason == ServiceUnavailableReason.Faulted ? $"{text} {error.Message} {advice}" : $"{text} {advice}";
         Status = null;
         ApplyProgress(null);
         StateText = title;
@@ -672,6 +673,10 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             "Канал управления подменён",
             "Имя канала службы занято посторонним процессом; команды ему не отправляются.",
             "Проверьте компьютер на вредоносные программы. Защиту не снимайте."),
+        ServiceUnavailableReason.Faulted => (
+            "Служба ответила ошибкой",
+            "Служба работает, но не передала состояние; защита работает как прежде.",
+            "Если ошибка повторяется, соберите архив в «Диагностике» и перезапустите службу."),
         _ => (
             "Служба недоступна",
             "Команды не выполняются; защита, если была включена, сохраняется.",

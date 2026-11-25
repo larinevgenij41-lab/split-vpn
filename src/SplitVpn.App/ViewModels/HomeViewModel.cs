@@ -908,7 +908,7 @@ public sealed partial class TunnelRow(Guid profileId) : ObservableObject
         {
             // Названия протоколов шифрования неспециалисту ничего не говорят: важно, быстрый канал или запасной.
             parts.Add(gateway.DtlsActive ? "быстрый канал (UDP)" : "обычный канал (TCP)");
-            parts.Add(Format.Count(gateway.Networks.Count, "сеть", "сети", "сетей") + " шлюза");
+            parts.Add(Format.Count(gateway.TotalNetworks, "сеть", "сети", "сетей") + " шлюза");
             if (gateway.SessionExpiresUtc is { } expires)
             {
                 parts.Add("сеанс до " + Format.Time(expires));

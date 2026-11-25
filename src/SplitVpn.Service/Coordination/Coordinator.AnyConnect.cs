@@ -632,7 +632,7 @@ public sealed partial class Coordinator
         tunnel.SignIn = null;
         tunnel.PasswordRequired = false;
         // Счётчики повторов и текст ошибки снимает проверка готовности (она идёт сразу после этой сверки).
-        var networks = up.Session.IncludeCidrs().Count;
+        var networks = FormattedNetworks(up.Session).Count;
         Journal("Сведения", string.Create(CultureInfo.InvariantCulture,
             $"«{tunnel.Name}» подключён (AnyConnect): адрес {up.Session.Address}, сетей шлюза {networks}, {(up.Session.DtlsActive ? "DTLS" : "TLS")}."));
         // Отклонённый слой тоже даёт пустой список сетей: «шлюз не прислал сетей» тогда было бы неправдой.
@@ -1145,6 +1145,33 @@ public sealed partial class Coordinator
             : null;
     }
 
+    /// <summary>
+    /// Сети шлюза строками — по сеансу один раз: разбор, проверка пределов и запись тысяч сетей иначе шли бы при каждом
+    /// построении состояния, а оно строится после каждой работы очереди, в том числе после статистики каждые 2 с.
+    /// </summary>
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<SessionInfo, IReadOnlyList<string>> _formattedNetworks = new();
+
+    private IReadOnlyList<string> FormattedNetworks(SessionInfo session) =>
+        _formattedNetworks.GetValue(session, s => s.IncludeCidrs().Select(c => c.ToString()).ToArray());
+
+    /// <summary>Страница сетей шлюза поднятого туннеля: в состоянии их только первые <see cref="ServerNetworksDto.MaxStatusNetworks"/>.</summary>
+    private IpcResponse ServerNetworksPage(GetServerNetworksRequest request)
+    {
+        if (request.Offset < 0)
+        {
+            return IpcResponse.Failure(IpcErrorCodes.BadRequest, "Неверная позиция в списке сетей шлюза.");
+        }
+
+        if (Facts.Tunnels.GetValueOrDefault(request.ProfileId) is not { IsUp: true, Session: { } session })
+        {
+            return IpcResponse.Failure(IpcErrorCodes.NotFound, "Сеанса шлюза нет: подключение не поднято.");
+        }
+
+        var networks = FormattedNetworks(session);
+        var page = networks.Skip(request.Offset).Take(ServerNetworksPageDto.MaxPage).ToArray();
+        return IpcResponse.Success(new ServerNetworksPageDto(Math.Min(request.Offset, networks.Count), networks.Count, page));
+    }
+
     private ServerNetworksDto? ServerNetworksOf(TunnelFacts tunnel)
     {
         if (tunnel is not { IsUp: true, Session: { } session })
@@ -1152,9 +1179,12 @@ public sealed partial class Coordinator
             return null;
         }
 
+        var networks = FormattedNetworks(session);
         return new ServerNetworksDto
         {
-            Networks = session.IncludeCidrs().Select(c => c.ToString()).ToList(),
+            Networks = networks.Count > ServerNetworksDto.MaxStatusNetworks ? networks.Take(ServerNetworksDto.MaxStatusNetworks).ToArray() : networks,
+            NetworkCount = networks.Count,
+            NetworksTruncated = networks.Count > ServerNetworksDto.MaxStatusNetworks,
             Dns = session.Dns,
             DnsSuffixes = session.DnsSuffixes(),
             ProxyPac = session.ProxyPac,

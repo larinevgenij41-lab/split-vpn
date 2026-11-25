@@ -93,6 +93,7 @@ public static class IpcNames
 [JsonDerivedType(typeof(CancelSignInRequest), "cancelSignIn")]
 [JsonDerivedType(typeof(SsoNavigationRequest), "ssoNavigation")]
 [JsonDerivedType(typeof(SubmitAuthFormRequest), "submitAuthForm")]
+[JsonDerivedType(typeof(GetServerNetworksRequest), "getServerNetworks")]
 public abstract record IpcRequest
 {
     public int ContractVersion { get; init; } = IpcNames.ContractVersion;
@@ -102,6 +103,19 @@ public abstract record IpcRequest
 }
 
 public sealed record GetStatusRequest : IpcRequest;
+
+/// <summary>
+/// Страница сетей шлюза AnyConnect с позиции <paramref name="Offset"/>: в состоянии туннеля их только первые
+/// <see cref="ServerNetworksDto.MaxStatusNetworks"/>. Ответ — <see cref="ServerNetworksPageDto"/>. Запрос добавлен без смены
+/// версии договора: служба прежних версий отвечает «неизвестный запрос», а её состояние и так несёт полный список.
+/// </summary>
+public sealed record GetServerNetworksRequest(Guid ProfileId, int Offset) : IpcRequest;
+
+/// <summary>Страница сетей шлюза: не больше <see cref="MaxPage"/> записей и общее число сетей сеанса.</summary>
+public sealed record ServerNetworksPageDto(int Offset, int Total, IReadOnlyList<string> Networks)
+{
+    public const int MaxPage = 1024;
+}
 
 /// <summary>Пользователь готов войти в шлюз AnyConnect: служба запускает помощник и присылает запрос входа.</summary>
 public sealed record BeginSignInRequest(Guid ProfileId) : IpcRequest;
@@ -595,7 +609,24 @@ public sealed record SignInPromptDto
 
 public sealed record ServerNetworksDto
 {
+    /// <summary>
+    /// Сколько сетей шлюза отдаётся в состоянии: шлюз может прислать тысячи, а состояние идёт каждые полторы секунды
+    /// одним кадром канала. Остальные — постранично (<see cref="GetServerNetworksRequest"/>).
+    /// </summary>
+    public const int MaxStatusNetworks = 256;
+
+    /// <summary>Первые сети шлюза (не больше <see cref="MaxStatusNetworks"/>); сколько их всего — <see cref="TotalNetworks"/>.</summary>
     public IReadOnlyList<string> Networks { get; init; } = [];
+
+    /// <summary>Сколько сетей в сеансе. Служба прежних версий поле не присылает (0) — тогда в списке все сети.</summary>
+    public int NetworkCount { get; init; }
+
+    /// <summary>В <see cref="Networks"/> не все сети сеанса.</summary>
+    public bool NetworksTruncated { get; init; }
+
+    /// <summary>Число сетей сеанса и для новой службы (счётчик), и для прежней (полный список).</summary>
+    [JsonIgnore]
+    public int TotalNetworks => Math.Max(NetworkCount, Networks.Count);
 
     public IReadOnlyList<string> Dns { get; init; } = [];
 

@@ -23,6 +23,9 @@ public enum ServiceUnavailableReason
 
     /// <summary>Имя канала занято не службой: команды отправлять нельзя.</summary>
     Untrusted,
+
+    /// <summary>Служба той же версии отвечает, но на запрос состояния вернула ошибку (её текст — в сообщении).</summary>
+    Faulted,
 }
 
 public sealed class ServiceUnavailableException(string message, Exception? inner = null, ServiceUnavailableReason reason = ServiceUnavailableReason.NotRunning)
@@ -53,7 +56,7 @@ public static class RequestTimeouts
 
     public static TimeSpan For(IpcRequest request) => request switch
     {
-        GetStatusRequest or GetEventsRequest or GetAdaptersRequest or GetSettingsRequest or ExportReportRequest => Query,
+        GetStatusRequest or GetEventsRequest or GetAdaptersRequest or GetSettingsRequest or ExportReportRequest or GetServerNetworksRequest => Query,
         CheckAddressRequest or SsoNavigationRequest or SubmitAuthFormRequest or CancelSignInRequest or BeginSignInRequest or ReadDiagnosticsChunkRequest => Lookup,
         CollectDiagnosticsRequest => Collect,
         RecoverNetworkRequest => Recover,
@@ -117,15 +120,13 @@ public sealed partial class IpcClient : IAsyncDisposable
             await pipe.ConnectAsync(connectTimeout, cancellationToken);
             VerifyServer(pipe, serviceName);
             var client = new IpcClient(pipe);
-            var response = await client.SendAsync(new GetStatusRequest(), verifyTimeout, cancellationToken);
-            if (!response.Ok && response.ErrorCode == IpcErrorCodes.Denied)
+            var response = await client.SendAsync(new GetAdaptersRequest(), verifyTimeout, cancellationToken);
+            switch (HandshakeProblem(response))
             {
-                throw new ServiceUnavailableException("Управлять службой может только администратор компьютера.", null, ServiceUnavailableReason.Denied);
-            }
-
-            if (!response.Ok || !ContractMatches(response))
-            {
-                throw new ServiceUnavailableException("Версия приложения несовместима со службой. Обновите приложение и службу вместе.", null, ServiceUnavailableReason.VersionMismatch);
+                case ServiceUnavailableReason.Denied:
+                    throw new ServiceUnavailableException("Управлять службой может только администратор компьютера.", null, ServiceUnavailableReason.Denied);
+                case ServiceUnavailableReason.VersionMismatch:
+                    throw new ServiceUnavailableException("Версия приложения несовместима со службой. Обновите приложение и службу вместе.", null, ServiceUnavailableReason.VersionMismatch);
             }
 
             return client;
@@ -157,18 +158,21 @@ public sealed partial class IpcClient : IAsyncDisposable
         }
     }
 
-    /// <summary>Ответ чужой версии может и не разбираться в StatusDto — это тоже несовпадение версий.</summary>
-    private static bool ContractMatches(IpcResponse response)
+    /// <summary>
+    /// Итог проверки при подключении; null — служба приняла версию договора. Проверка идёт маленьким запросом списка
+    /// адаптеров, а не состоянием: состояние с тысячами сетей шлюзов могло не поместиться в кадр, и отказ на него
+    /// отрезал бы клиента от службы под видом несовместимости версий. Версию сверяет служба: запрос с чужой
+    /// <see cref="IpcRequest.ContractVersion"/> она первым делом отклоняет с <see cref="IpcErrorCodes.BadRequest"/>
+    /// (так поступают все её версии, а список адаптеров есть в договоре с первой). Любой другой отказ — занятость,
+    /// непрочитанные настройки — значит, что версия принята, и подключение состоялось.
+    /// </summary>
+    internal static ServiceUnavailableReason? HandshakeProblem(IpcResponse response) => response switch
     {
-        try
-        {
-            return response.ResultAs<StatusDto>()?.ContractVersion == IpcNames.ContractVersion;
-        }
-        catch (System.Text.Json.JsonException)
-        {
-            return false;
-        }
-    }
+        { Ok: true } => null,
+        { ErrorCode: IpcErrorCodes.Denied } => ServiceUnavailableReason.Denied,
+        { ErrorCode: IpcErrorCodes.BadRequest } => ServiceUnavailableReason.VersionMismatch,
+        _ => null,
+    };
 
     /// <summary>
     /// Канал с минимальными правами. PipeDirection.InOut запрашивает GENERIC_WRITE, куда входят создание

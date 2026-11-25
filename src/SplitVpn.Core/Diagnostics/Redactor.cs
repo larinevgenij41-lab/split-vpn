@@ -28,11 +28,11 @@ public static partial class Redactor
     /// То же для JSON: маскируются только строковые значения, структура (кавычки, имена полей) не затрагивается.
     /// Обратную косую черту и кавычки в секретах экранировать не нужно — значения уже разобраны.
     /// </summary>
-    public static string RedactJson(string json, IEnumerable<string?>? secrets = null)
+    public static string RedactJson(string json, IEnumerable<string?>? secrets = null, System.Text.Json.JsonSerializerOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(json);
         var list = (secrets ?? []).ToList();
-        return RedactNode(JsonNode.Parse(json), list)?.ToJsonString(JsonDefaults.Options) ?? "null";
+        return RedactNode(JsonNode.Parse(json), list)?.ToJsonString(options ?? JsonDefaults.Options) ?? "null";
     }
 
     private static JsonNode? RedactNode(JsonNode? node, List<string?> secrets)

@@ -232,8 +232,20 @@ public sealed class EventJournal(TimeProvider time, int capacity = 500)
     private readonly long _epoch = Random.Shared.NextInt64(1, int.MaxValue) << 32;
     private long _sequence;
 
+    /// <summary>
+    /// Длина текста события: в текст попадают данные извне (ответы шлюзов, имена чужих подключений), а журнал целиком
+    /// уходит одним кадром канала (GetEventsRequest(0), отчёт). 500 событий по этому пределу помещаются в кадр.
+    /// </summary>
+    public const int MaxTextLength = 1800;
+
     public void Add(string level, string text)
     {
+        ArgumentNullException.ThrowIfNull(text);
+        if (text.Length > MaxTextLength)
+        {
+            text = text[..MaxTextLength] + "…";
+        }
+
         lock (_lock)
         {
             _events.AddLast(new ServiceEvent(_epoch + ++_sequence, time.GetUtcNow(), level, text));
