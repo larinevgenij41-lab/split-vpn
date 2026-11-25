@@ -8,24 +8,82 @@ namespace SplitVpn.App.Views;
 /// <summary>
 /// Передача колёсика мыши наружу. ScrollViewer забирает колёсико всегда, даже когда прокручивать ему
 /// некуда: список правил в папке не отдавал бы прокрутку колонке, а колонка - странице, и указатель над
-/// коротким списком «запирал» бы прокрутку. Список, который не сдвинулся, передаёт событие родителю.
+/// коротким списком «запирал» бы прокрутку.
+/// Решение принимается в PreviewMouseWheel по состоянию до прокрутки (VerticalOffset после прокрутки
+/// обновляется только раскладкой): список, который может сдвинуться в эту сторону, прокручивается сам и
+/// наружу событие не отдаёт; список на краю помечает событие обработанным и передаёт щелчок ближайшему
+/// внешнему списку, которому есть куда прокручиваться. Один щелчок двигает ровно один список.
 /// </summary>
 public static class WheelChain
 {
     public static readonly DependencyProperty IsEnabledProperty = DependencyProperty.RegisterAttached(
         "IsEnabled", typeof(bool), typeof(WheelChain), new PropertyMetadata(false, OnIsEnabledChanged));
 
-    private static readonly DependencyProperty OffsetBeforeProperty = DependencyProperty.RegisterAttached(
-        "OffsetBefore", typeof(double), typeof(WheelChain), new PropertyMetadata(0d));
-
     /// <summary>
-    /// Один щелчок колёсика доходит до внешнего списка дважды: пересланной копией и исходным событием.
-    /// Каждый список решает о щелчке один раз, а после того как кто-то из них сдвинулся, щелчок исчерпан.
-    /// Все события одного щелчка несут одну отметку времени. Обращения - только из потока интерфейса.
+    /// То же для списка с готовым шаблоном (ui:ListView): включается у первого ScrollViewer внутри шаблона,
+    /// выделение и клавиатурная навигация списка не меняются.
     /// </summary>
-    private static int _tick;
-    private static bool _consumed;
-    private static readonly List<ScrollViewer> Decided = [];
+    public static readonly DependencyProperty IsEnabledInsideProperty = DependencyProperty.RegisterAttached(
+        "IsEnabledInside", typeof(bool), typeof(WheelChain), new PropertyMetadata(false, OnIsEnabledInsideChanged));
+
+    public static bool GetIsEnabledInside(DependencyObject element)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        return (bool)element.GetValue(IsEnabledInsideProperty);
+    }
+
+    public static void SetIsEnabledInside(DependencyObject element, bool value)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        element.SetValue(IsEnabledInsideProperty, value);
+    }
+
+    private static void OnIsEnabledInsideChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is not FrameworkElement element)
+        {
+            return;
+        }
+
+        element.Loaded -= OnHostLoaded;
+        if ((bool)e.NewValue)
+        {
+            element.Loaded += OnHostLoaded;
+            if (element.IsLoaded)
+            {
+                OnHostLoaded(element, null!);
+            }
+        }
+    }
+
+    private static void OnHostLoaded(object sender, RoutedEventArgs e)
+    {
+        var element = (FrameworkElement)sender;
+        element.ApplyTemplate();
+        if (FindScrollViewer(element) is { } viewer)
+        {
+            SetIsEnabled(viewer, GetIsEnabledInside(element));
+        }
+    }
+
+    private static ScrollViewer? FindScrollViewer(DependencyObject root)
+    {
+        for (var i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            if (child is ScrollViewer viewer)
+            {
+                return viewer;
+            }
+
+            if (FindScrollViewer(child) is { } nested)
+            {
+                return nested;
+            }
+        }
+
+        return null;
+    }
 
     public static bool GetIsEnabled(DependencyObject element)
     {
@@ -47,56 +105,71 @@ public static class WheelChain
         }
 
         viewer.PreviewMouseWheel -= OnPreviewMouseWheel;
-        viewer.RemoveHandler(UIElement.MouseWheelEvent, (MouseWheelEventHandler)OnMouseWheel);
         if ((bool)e.NewValue)
         {
             viewer.PreviewMouseWheel += OnPreviewMouseWheel;
-            // Свой обработчик ScrollViewer помечает событие обработанным: слушать нужно и такие.
-            viewer.AddHandler(UIElement.MouseWheelEvent, (MouseWheelEventHandler)OnMouseWheel, handledEventsToo: true);
         }
     }
 
     private static void OnPreviewMouseWheel(object sender, MouseWheelEventArgs e)
     {
-        if (sender is ScrollViewer viewer)
+        if (e.Handled || sender is not ScrollViewer viewer)
         {
-            viewer.SetValue(OffsetBeforeProperty, viewer.VerticalOffset);
+            return;
+        }
+
+        // Preview идёт сверху вниз: внешний список узнаёт о щелчке раньше вложенного. Если ближе к указателю
+        // есть другой список с WheelChain или список, которому есть куда сдвинуться, решает он.
+        var innerSwallows = false;
+        for (var node = e.OriginalSource as DependencyObject; node is not null && !ReferenceEquals(node, viewer); node = Parent(node))
+        {
+            if (node is ScrollViewer inner)
+            {
+                if (GetIsEnabled(inner) || !ShouldForward(inner.VerticalOffset, inner.ScrollableHeight, e.Delta))
+                {
+                    return;
+                }
+
+                // Вложенный список (поле ввода, список без WheelChain) прокрутиться не может, но событие заберёт.
+                innerSwallows = true;
+            }
+        }
+
+        if (!ShouldForward(viewer.VerticalOffset, viewer.ScrollableHeight, e.Delta))
+        {
+            if (innerSwallows)
+            {
+                e.Handled = true;
+                Scroll(viewer, e);
+            }
+
+            return;
+        }
+
+        e.Handled = true;
+        for (var node = Parent(viewer); node is not null; node = Parent(node))
+        {
+            if (node is ScrollViewer outer && !ShouldForward(outer.VerticalOffset, outer.ScrollableHeight, e.Delta))
+            {
+                Scroll(outer, e);
+                return;
+            }
         }
     }
 
-    private static void OnMouseWheel(object sender, MouseWheelEventArgs e)
-    {
-        if (sender is not ScrollViewer viewer)
-        {
-            return;
-        }
+    /// <summary>Щелчок колёсика доставляется списку напрямую: его собственный обработчик прокручивает его.</summary>
+    private static void Scroll(ScrollViewer target, MouseWheelEventArgs e) =>
+        target.RaiseEvent(new MouseWheelEventArgs(e.MouseDevice, e.Timestamp, e.Delta) { RoutedEvent = UIElement.MouseWheelEvent, Source = target });
 
-        if (e.Timestamp != _tick)
-        {
-            _tick = e.Timestamp;
-            _consumed = false;
-            Decided.Clear();
-        }
+    private static DependencyObject? Parent(DependencyObject node) =>
+        node is Visual or System.Windows.Media.Media3D.Visual3D ? VisualTreeHelper.GetParent(node) : LogicalTreeHelper.GetParent(node);
 
-        if (_consumed || Decided.Contains(viewer))
-        {
-            return;
-        }
-
-        Decided.Add(viewer);
-        if (!ShouldForward((double)viewer.GetValue(OffsetBeforeProperty), viewer.VerticalOffset))
-        {
-            _consumed = true;
-            return;
-        }
-
-        if (VisualTreeHelper.GetParent(viewer) is UIElement parent)
-        {
-            e.Handled = true;
-            parent.RaiseEvent(new MouseWheelEventArgs(e.MouseDevice, e.Timestamp, e.Delta) { RoutedEvent = UIElement.MouseWheelEvent, Source = viewer });
-        }
-    }
-
-    /// <summary>Список не сдвинулся: он на краю или ему нечего прокручивать.</summary>
-    internal static bool ShouldForward(double offsetBefore, double offsetAfter) => Math.Abs(offsetAfter - offsetBefore) < 0.01;
+    /// <summary>
+    /// Список не сдвинется от щелчка в эту сторону (по состоянию до прокрутки): прокручивать нечего, вверх — уже в
+    /// начале, вниз — уже в конце. Delta &gt; 0 — колёсико от себя (вверх).
+    /// </summary>
+    internal static bool ShouldForward(double verticalOffset, double scrollableHeight, int delta) =>
+        scrollableHeight <= 0
+        || (delta > 0 && verticalOffset <= 0)
+        || (delta < 0 && verticalOffset >= scrollableHeight - 0.5);
 }

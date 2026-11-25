@@ -1,5 +1,6 @@
 ﻿using System.IO;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using CommunityToolkit.Mvvm.Input;
 using H.NotifyIcon;
@@ -192,15 +193,20 @@ public sealed class TrayIcon : IDisposable
             var paused = _main.Status?.Tunnels.Where(t => t.Paused).Select(t => t.ProfileId).ToHashSet() ?? [];
             foreach (var profile in settings.Profiles)
             {
+                var suffix = profile.Role switch { ProfileRole.Primary => " (опорное)", ProfileRole.Secondary => " (дополнительное)", _ => "" }
+                    + (paused.Contains(profile.Id) ? " — сейчас отключено" : "");
                 var item = new MenuItem
                 {
                     // Пункт меняет роль, то есть выключает совсем. Временное отключение — выключатель в строке
                     // на главной и на странице «Подключения»; здесь оно и помечается, чтобы смыслы не путались.
-                    Header = UiText.MenuHeader(profile.Name) + profile.Role switch { ProfileRole.Primary => " (опорное)", ProfileRole.Secondary => " (дополнительное)", _ => "" }
-                        + (paused.Contains(profile.Id) ? " — сейчас отключено" : ""),
+                    // Длинное имя сокращается многоточием (AccessText по-прежнему понимает «__» как «_»), полное — в подсказке.
+                    Header = new AccessText { Text = UiText.MenuHeader(profile.Name) + suffix, MaxWidth = 360, TextTrimming = TextTrimming.CharacterEllipsis },
+                    ToolTip = profile.Name + suffix,
                     IsChecked = profile.Role != ProfileRole.Off,
                     IsEnabled = profile.Role != ProfileRole.Primary,
                 };
+                ToolTipService.SetShowOnDisabled(item, true);
+                AutomationProperties.SetName(item, profile.Name + suffix);
                 var id = profile.Id;
                 if (profile.Role == ProfileRole.Off)
                 {

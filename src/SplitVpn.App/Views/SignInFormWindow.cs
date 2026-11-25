@@ -48,6 +48,8 @@ public sealed class SignInFormWindow : FluentWindow, ISignInWindow
         MaxHeight = SystemParameters.WorkArea.Height;
         ResizeMode = ResizeMode.NoResize;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        // Узкий экран или крупный масштаб: ширина и высота — по рабочей области монитора, на котором откроется форма.
+        WindowFit.Apply(this);
         Icon = new System.Windows.Media.Imaging.BitmapImage(new Uri("pack://application:,,,/Assets/app.ico"));
 
         var panel = new StackPanel { Margin = new Thickness(24, 24, 24, 0) };

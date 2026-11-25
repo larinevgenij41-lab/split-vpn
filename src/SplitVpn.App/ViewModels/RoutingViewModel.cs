@@ -36,41 +36,116 @@ public sealed partial class RoutingViewModel : PageViewModel
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(ShowBoard))]
     [NotifyPropertyChangedFor(nameof(IsSearching))]
-    [NotifyPropertyChangedFor(nameof(SearchResults))]
     private string _search = "";
 
     public bool IsSearching => !ShowBoard;
 
     public bool ShowBoard => string.IsNullOrWhiteSpace(Search);
 
-    public IEnumerable<RouteSearchResult> SearchResults
-    {
-        get
-        {
-            if (ShowBoard)
-            {
-                yield break;
-            }
+    /// <summary>
+    /// Сколько найденных карточек показывается сразу. У каждой полный шаблон (меню, список приоритета), и запрос
+    /// вроде «.ru» по сотням правил строил бы тысячи карточек: окно замирало.
+    /// </summary>
+    public const int SearchLimit = 200;
 
-            var query = Search.Trim();
-            foreach (var column in Columns)
+    /// <summary>
+    /// Найденное. Коллекция одна на всё время жизни страницы и обновляется на месте: правка из результатов
+    /// (перенос, приоритет) не пересоздаёт строки, и фокус клавиатуры остаётся на месте.
+    /// </summary>
+    public ObservableCollection<RouteSearchResult> SearchResults { get; } = [];
+
+    /// <summary>Совпадений больше <see cref="SearchLimit"/>: показаны первые, запрос стоит уточнить.</summary>
+    [ObservableProperty]
+    private bool _searchHasMore;
+
+    public static string SearchLimitText => $"Показаны первые {SearchLimit} — уточните запрос";
+
+    partial void OnSearchChanged(string value) => RefreshSearch();
+
+    /// <summary>Совпадения в порядке доски: колонка, её карточки, правила в папках.</summary>
+    private IEnumerable<(object Key, BoardEntry? Entry, string Location)> FindMatches(string query)
+    {
+        foreach (var column in Columns)
+        {
+            var matchesColumn = column.Title.Contains(query, StringComparison.OrdinalIgnoreCase);
+            if (matchesColumn && column.Cards.Count == 0) { yield return (column, null, column.Title); }
+            foreach (var entry in column.Cards)
             {
-                var matchesColumn = column.Title.Contains(query, StringComparison.OrdinalIgnoreCase);
-                if (matchesColumn && column.Cards.Count == 0) { yield return new RouteSearchResult(null, column.Title); }
-                foreach (var entry in column.Cards)
+                if (matchesColumn || entry.Title.Contains(query, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (matchesColumn || entry.Title.Contains(query, StringComparison.OrdinalIgnoreCase))
+                    yield return (entry, entry, column.Title);
+                }
+                else if (entry is BoardFolder folder)
+                {
+                    foreach (var card in folder.Cards.Where(c => c.Title.Contains(query, StringComparison.OrdinalIgnoreCase)))
                     {
-                        yield return new RouteSearchResult(entry, column.Title);
-                    }
-                    else if (entry is BoardFolder folder)
-                    {
-                        foreach (var card in folder.Cards.Where(c => c.Title.Contains(query, StringComparison.OrdinalIgnoreCase)))
-                        {
-                            yield return new RouteSearchResult(card, $"{column.Title} / {folder.Name}");
-                        }
+                        yield return (card, card, $"{column.Title} / {folder.Name}");
                     }
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Сверяет коллекцию результатов с доской: оставшиеся строки сохраняются (у перенесённой меняется только
+    /// подпись), пропавшие убираются, новые вставляются на свои места.
+    /// </summary>
+    private void RefreshSearch()
+    {
+        if (ShowBoard)
+        {
+            SearchResults.Clear();
+            SearchHasMore = false;
+            return;
+        }
+
+        var found = FindMatches(Search.Trim()).Take(SearchLimit + 1).ToList();
+        SearchHasMore = found.Count > SearchLimit;
+        if (SearchHasMore)
+        {
+            found.RemoveAt(SearchLimit);
+        }
+
+        var existing = SearchResults.ToDictionary(r => r.Key);
+        var wanted = new List<RouteSearchResult>(found.Count);
+        foreach (var (key, entry, location) in found)
+        {
+            if (existing.TryGetValue(key, out var result))
+            {
+                result.Location = location;
+            }
+            else
+            {
+                result = new RouteSearchResult(key, entry, location);
+            }
+
+            wanted.Add(result);
+        }
+
+        var keep = wanted.ToHashSet();
+        for (var i = SearchResults.Count - 1; i >= 0; i--)
+        {
+            if (!keep.Contains(SearchResults[i]))
+            {
+                SearchResults.RemoveAt(i);
+            }
+        }
+
+        for (var i = 0; i < wanted.Count; i++)
+        {
+            if (i < SearchResults.Count && ReferenceEquals(SearchResults[i], wanted[i]))
+            {
+                continue;
+            }
+
+            var at = SearchResults.IndexOf(wanted[i]);
+            if (at >= 0)
+            {
+                SearchResults.Move(at, i);
+            }
+            else
+            {
+                SearchResults.Insert(i, wanted[i]);
             }
         }
     }
@@ -120,9 +195,10 @@ public sealed partial class RoutingViewModel : PageViewModel
             }
 
             SetProperty(ref _dirty, value);
+            // Правка могла перенести, добавить или убрать найденное: строки сверяются на месте, а не строятся заново.
             if (!ShowBoard)
             {
-                OnPropertyChanged(nameof(SearchResults));
+                RefreshSearch();
             }
         }
     }
@@ -356,7 +432,7 @@ public sealed partial class RoutingViewModel : PageViewModel
             Columns.Add(column);
         }
 
-        OnPropertyChanged(nameof(SearchResults));
+        RefreshSearch();
         RefreshMoveMenus();
     }
 
@@ -1296,7 +1372,17 @@ public sealed partial class GroupMember(Guid profileId, string name) : Observabl
     private bool _included;
 }
 
-public sealed record RouteSearchResult(BoardEntry? Entry, string Location);
+/// <summary>Найденная карточка, папка или пустая колонка; подпись «где» меняется при переносе.</summary>
+public sealed partial class RouteSearchResult(object key, BoardEntry? entry, string location) : ObservableObject
+{
+    /// <summary>Что найдено: карточка, папка или (для пустой колонки) сама колонка.</summary>
+    internal object Key { get; } = key;
+
+    public BoardEntry? Entry { get; } = entry;
+
+    [ObservableProperty]
+    private string _location = location;
+}
 
 public sealed record ChoiceItem<T>(T Value, string Text)
 {

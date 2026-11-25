@@ -17,6 +17,13 @@
     <views:RoleToAppearanceConverter x:Key="RoleAppearance" />
     <views:MenuHeaderConverter x:Key="MenuHeader" />
 
+    <!-- Пользовательское имя в пункте меню («Переместить в…», «В папку»): не шире 360, с многоточием. AccessText, как
+         и стандартный заголовок, читает «__» (MenuHeader) как «_», поэтому экранирование сохраняется. Полное имя —
+         в подсказке пункта (MenuItem.ToolTip). -->
+    <DataTemplate x:Key="TrimmedMenuHeader">
+        <AccessText Text="{Binding}" MaxWidth="360" TextTrimming="CharacterEllipsis" />
+    </DataTemplate>
+
     <DataTemplate x:Key="WrappingChoiceContent">
         <TextBlock Text="{Binding}" TextWrapping="Wrap" />
     </DataTemplate>
@@ -40,6 +47,8 @@
         <Setter Property="FontSize" Value="28" />
         <Setter Property="FontWeight" Value="SemiBold" />
         <Setter Property="Margin" Value="0,0,0,8" />
+        <!-- Экранный диктор переходит по заголовкам (клавиша H): заголовок страницы — первый уровень, раздела — второй. -->
+        <Setter Property="AutomationProperties.HeadingLevel" Value="Level1" />
         <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
     </Style>
     <Style x:Key="PageSubtitle" TargetType="TextBlock">
@@ -53,6 +62,7 @@
         <Setter Property="FontSize" Value="16" />
         <Setter Property="FontWeight" Value="SemiBold" />
         <Setter Property="Margin" Value="0,24,0,12" />
+        <Setter Property="AutomationProperties.HeadingLevel" Value="Level2" />
         <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
     </Style>
     <Style x:Key="Hint" TargetType="TextBlock">
@@ -78,16 +88,32 @@
         <Setter Property="Padding" Value="20" />
         <Setter Property="HorizontalContentAlignment" Value="Stretch" />
     </Style>
-    <Style x:Key="ButtonRow" TargetType="WrapPanel">
+    <!-- Группа кнопок и полей, переносимая на новую строку: интервал 8 справа и снизу у каждого элемента,
+         отрицательный отступ панели убирает его у правого и нижнего края — последняя кнопка стоит вровень с краем,
+         а перенесённая строка отделена от первой. Подходит и для элемента управления строки-карточки (CardRow). -->
+    <Style x:Key="ButtonGroup" TargetType="WrapPanel">
         <Style.Resources>
             <Style TargetType="ui:Button" BasedOn="{StaticResource {x:Type ui:Button}}">
                 <Setter Property="Margin" Value="0,0,8,8" />
+                <Setter Property="VerticalAlignment" Value="Center" />
             </Style>
             <Style TargetType="ui:Badge" BasedOn="{StaticResource {x:Type ui:Badge}}">
                 <Setter Property="Margin" Value="0,0,8,8" />
             </Style>
+            <Style TargetType="ComboBox" BasedOn="{StaticResource {x:Type ComboBox}}">
+                <Setter Property="Margin" Value="0,0,8,8" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+            </Style>
+            <Style TargetType="CheckBox" BasedOn="{StaticResource {x:Type CheckBox}}">
+                <Setter Property="ContentTemplate" Value="{StaticResource WrappingChoiceContent}" />
+                <Setter Property="Margin" Value="0,0,16,8" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+            </Style>
         </Style.Resources>
         <Setter Property="Orientation" Value="Horizontal" />
+        <Setter Property="Margin" Value="0,0,-8,-8" />
+    </Style>
+    <Style x:Key="ButtonRow" TargetType="WrapPanel" BasedOn="{StaticResource ButtonGroup}">
         <Setter Property="Margin" Value="0,16,-8,-8" />
     </Style>
     <Style BasedOn="{StaticResource {x:Type ui:Button}}" TargetType="ui:Button">

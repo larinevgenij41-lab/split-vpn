@@ -128,6 +128,36 @@ internal static class SelfTest
         Shot(root, shots, "window-service-min-height");
         block = window.ServiceBlock.TransformToAncestor(root).TransformBounds(new Rect(window.ServiceBlock.RenderSize));
         Log($"Блок «Служба» при минимальной высоте: {block}, окно {root.ActualWidth}×{root.ActualHeight}");
+
+        // Низкое окно и все сообщения шапки сразу (ход службы, прокси, служба не отвечает, сообщение страницы):
+        // шапка над страницей не выше 40 % окна и прокручивается сама, странице остаётся место.
+        main.ApplyProgress(new Core.Ipc.ServiceProgressDto
+        {
+            Stage = "Обновление маршрутов", Percent = 60, Completed = 214, Total = 356,
+            StartedUtc = DateTimeOffset.UtcNow.AddSeconds(-30), ElapsedSeconds = 30,
+        });
+        main.ProxyError = "Не удалось вернуть прежние настройки прокси Windows: проверьте их в параметрах сети.";
+        main.UnavailableReason = Core.Ipc.ServiceUnavailableReason.Timeout;
+        main.ServiceAvailable = false;
+        (main.ServiceErrorTitle, _, main.ServiceError) = MainViewModel.Describe(main.UnavailableReason.Value);
+        main.ServiceHost.Show(Core.State.ServiceHostState.Running, "0.3.9");
+        var pageWithMessage = main.CurrentPage ?? main.Home;
+        pageWithMessage.ShowError("Проверка сообщения страницы в шапке окна.");
+        Settle(root);
+        Shot(root, shots, "window-header-min-height");
+        var headerShare = window.HeaderScroll.ActualHeight / window.ActualHeight;
+        Log($"Шапка при минимальной высоте: {window.HeaderScroll.ActualHeight:0} из {window.ActualHeight:0}, прокрутка {window.HeaderScroll.ScrollableHeight:0}");
+        if (headerShare > 0.41)
+        {
+            errors.AppendLine(System.Globalization.CultureInfo.InvariantCulture, $"Шапка окна при минимальной высоте занимает {headerShare:P0} высоты окна.");
+        }
+
+        pageWithMessage.Message = null;
+        main.ApplyProgress(null);
+        main.ProxyError = null;
+        main.UnavailableReason = null;
+        main.ServiceAvailable = true;
+        main.ServiceHost.Show(Core.State.ServiceHostState.StopPending, "0.3.9");
         window.Height = height;
         window.Width = 760;
         Settle(root);
@@ -155,6 +185,8 @@ internal static class SelfTest
             host.UpdateLayout();
             Log("Страница отрисована: " + page.Title);
         }
+
+        CheckHomeSetup(main, host, shots, errors);
 
         // Шаблоны, которые применяются только с данными: строки туннелей и предупреждения главной, редактор подключения, мастер.
         main.Home.Tunnels.Add(TunnelRow.From(
@@ -220,7 +252,22 @@ internal static class SelfTest
         host.Content = main.Home;
         host.UpdateLayout();
         Shot(host, shots, "home");
-        var details = Descendants(host).OfType<Expander>().Single(e => Equals(e.Header, "Технические подробности"));
+        // Строки туннелей ниже края снимка страницы: снимаются отдельно, в широком и в узком окне
+        // (примечание «ничего не направлено» с кнопкой переносится, строка состояния — одна, с многоточием).
+        var tunnels = Descendants(host).OfType<ItemsControl>().First(c => ReferenceEquals(c.ItemsSource, main.Home.Tunnels));
+        Shot(tunnels, shots, "home-tunnels");
+        host.Width = 640;
+        Settle(host);
+        Shot(tunnels, shots, "home-tunnels-narrow");
+        if (Descendants(tunnels).OfType<FrameworkElement>().Any(e => e.IsVisible && e is TextBlock or Button
+            && e.TransformToAncestor(tunnels).TransformBounds(new Rect(e.RenderSize)).Right > tunnels.ActualWidth + 1))
+        {
+            errors.AppendLine("В узком окне текст или кнопка строки туннеля выходит за край.");
+        }
+
+        host.Width = 1180;
+        Settle(host);
+        var details =Descendants(host).OfType<Expander>().Single(e => Equals(e.Header, "Технические подробности"));
         details.IsExpanded = true;
         Settle(host);
         Shot(host, shots, "home-error-details");
@@ -250,6 +297,19 @@ internal static class SelfTest
             errors.AppendLine("Список доверенных адаптеров пометил страницу защиты изменённой без правок пользователя.");
         }
 
+        // Самый длинный вариант свёртки списка обхода виден в поле целиком (поле не фиксированной ширины).
+        main.Settings.BypassAggregatePrefix = 18;
+        host.Content = main.Settings;
+        Settle(host);
+        var aggregate = Descendants(host).OfType<CardRow>().First(r => r.Title == "Объединять адреса в подсети");
+        Shot(aggregate, shots, "settings-aggregate");
+        if (FindComboBox(aggregate, "Свёртка списка обхода блокировок") is { } aggregateBox
+            && Descendants(aggregateBox).OfType<TextBlock>().FirstOrDefault(t => t.IsVisible && t.Text.Contains("рекомендуется", StringComparison.Ordinal)) is { } chosen
+            && aggregateBox.ActualWidth < chosen.DesiredSize.Width + 24)
+        {
+            errors.AppendLine("Выбранный вариант свёртки списка обхода обрезан.");
+        }
+
         // Пустой список: до ответа службы - загрузка, после - подсказка, как добавить подключение.
         host.Content = main.Connections;
         host.UpdateLayout();
@@ -264,6 +324,18 @@ internal static class SelfTest
         if (!HasVisibleText(host, "Подключений пока нет"))
         {
             errors.AppendLine("Пустой список подключений не подсказывает, как добавить подключение.");
+        }
+
+        // Пустой список места не занимает, а кнопкам без выбранного подключения работать не с чем.
+        if (Descendants(host).OfType<Wpf.Ui.Controls.ListView>().Any(l => ReferenceEquals(l.ItemsSource, main.Connections.Profiles) && l.IsVisible))
+        {
+            errors.AppendLine("Пустой список подключений занимает место между подсказкой и кнопками.");
+        }
+
+        var enabledButtons = Descendants(host).OfType<Wpf.Ui.Controls.Button>().Where(b => b.IsVisible && b.IsEnabled).Select(b => b.Content as string).ToHashSet();
+        if (enabledButtons.Overlaps(["Выше", "Ниже", "Копировать", "Удалить", "Экспорт"]) || !enabledButtons.IsSupersetOf(["Добавить", "Импорт"]))
+        {
+            errors.AppendLine("При пустом списке подключений доступны не те кнопки: ожидаются только «Добавить» и «Импорт».");
         }
 
         main.Connections.Profiles.Add(ProfileItem.From(new Core.Settings.ConnectionProfile { Name = "Проверка", Server = "vpn.example.org", PrimaryAdapter = Core.Settings.AdapterSelection.Pinned, PinnedInterfaceGuid = Guid.NewGuid(), AuthMethod = Core.Settings.AuthMethod.PeapMsChapV2, Role = Core.Settings.ProfileRole.Primary }));
@@ -386,10 +458,9 @@ internal static class SelfTest
             new Core.Ipc.ServiceEvent(2, DateTimeOffset.UtcNow.AddMinutes(-1), "Предупреждение", "Проверка строки предупреждения"),
             new Core.Ipc.ServiceEvent(1, DateTimeOffset.UtcNow.AddMinutes(-2), "Сведения", "Проверка строки сведений"),
         ]);
-        // Ход пробного подключения у кнопки «Проверить» и пояснение главной кнопки, когда подключать нечего.
+        // Ход пробного подключения у кнопки «Проверить».
         pinnedProfile.TestRunning = true;
         pinnedProfile.TestText = "Пробное подключение к «Проверка»… Может занять до минуты.";
-        main.Home.SetupHint = "Подключений пока нет: добавьте данные VPN-сервера.";
         host.Content = null;
         host.Content = main.Diagnostics;
         host.UpdateLayout();
@@ -425,6 +496,21 @@ internal static class SelfTest
             host.UpdateLayout();
         }
 
+        // Последний шаг в узком окне мастера: длинная строка «Готово. …» переносится, а не уходит за край.
+        wizard.Progress = "Готово. Подключено «Основное»: российские адреса идут напрямую, остальной интернет — через VPN; защита при обрыве включена.";
+        wizard.Finished = true;
+        host.Width = 640;
+        host.Content = null;
+        host.Content = wizard;
+        Settle(host);
+        Shot(host, shots, "wizard-done-narrow");
+        var done = Descendants(host).OfType<TextBlock>().FirstOrDefault(t => t.IsVisible && t.Text == wizard.Progress);
+        if (done is null || done.ActualWidth > host.ActualWidth)
+        {
+            errors.AppendLine("Строка «Готово. …» последнего шага мастера не видна или шире окна мастера.");
+        }
+
+        host.Width = 1180;
         Log("Мастер отрисован: шагов " + (WizardViewModel.LastStep + 1));
 
         // Доска с отдельными карточками и папкой: проверяются обе разметки и сокращение списка.
@@ -533,6 +619,7 @@ internal static class SelfTest
 
         large.IsExpanded = false;
         Settle(host);
+        CheckLargeSearch(main.Routing, host, shots, manyRules, errors);
         main.Routing.RemoveFolder(large);
         foreach (var rule in largeRules)
         {
@@ -585,6 +672,91 @@ internal static class SelfTest
         Log("Ошибки самопроверки:");
         Log(errors.ToString());
         return 1;
+    }
+
+    /// <summary>
+    /// Главная кнопка, когда подключать нечего: подсказка «Подключений пока нет» и надпись «Добавить подключение»
+    /// появляются только вместе и только по списку, полученному от службы. Пока служба недоступна — обычная
+    /// кнопка «Подключить» без подсказки. Опрос не запускается: имя подключения в состоянии не меняется.
+    /// </summary>
+    private static void CheckHomeSetup(MainViewModel main, ContentControl host, string? shots, StringBuilder errors)
+    {
+        var home = main.Home;
+        host.Content = null;
+        host.Content = home;
+
+        // Список был получен, а служба затем пропала: подсказки нет.
+        home.SetProfileCounts(new Core.Settings.AppSettings());
+        home.OnStatus(null);
+        Settle(host);
+        if (home.ButtonText != "Подключить" || home.SetupHint is not null || HasVisibleText(host, "Подключений пока нет"))
+        {
+            errors.AppendLine("При недоступной службе главная кнопка подсказывает добавить подключение.");
+        }
+
+        // Список получен, подключений нет: надпись кнопки и подсказка согласованы.
+        home.SetProfileCounts(new Core.Settings.AppSettings());
+        home.OnStatus(new Core.Ipc.StatusDto { Intent = Core.State.Intent.Off });
+        Settle(host);
+        Shot(host, shots, "home-no-connections");
+        if (home.ButtonText != "Добавить подключение" || !HasVisibleText(host, "Подключений пока нет"))
+        {
+            errors.AppendLine("Без подключений главная кнопка не называется «Добавить подключение» или подсказка не видна.");
+        }
+
+        // Обратно к состоянию «служба не ответила»: так страница выглядит в остальных снимках.
+        home.OnStatus(null);
+        home.Tone = StateTone.Neutral;
+        home.StateSymbol = Wpf.Ui.Controls.SymbolRegular.PlugDisconnected24;
+        host.Content = null;
+    }
+
+    /// <summary>
+    /// Поиск по доске с сотнями правил: запрос, которому подходят все правила большой папки, показывает не больше
+    /// 200 карточек, строит только видимые и не пересоздаёт строки при отметке правки (фокус не теряется).
+    /// </summary>
+    private static void CheckLargeSearch(RoutingViewModel routing, FrameworkElement host, string? shots, int rules, StringBuilder errors)
+    {
+        var timer = Stopwatch.StartNew();
+        routing.Search = "example.org";
+        Settle(host);
+        timer.Stop();
+        var list = Descendants(host).OfType<ItemsControl>().FirstOrDefault(c => System.Windows.Automation.AutomationProperties.GetName(c) == "Найденные маршруты" && c.IsVisible);
+        var realized = list is null ? 0 : Descendants(list).OfType<Wpf.Ui.Controls.Card>().Count(c => c.DataContext is BoardCard);
+        Shot(host, shots, "routing-search-large");
+        Log($"Поиск по {rules} правилам: найдено показано {routing.SearchResults.Count}, есть ещё {routing.SearchHasMore}, построено карточек {realized}, {timer.ElapsedMilliseconds} мс");
+        if (routing.SearchResults.Count != RoutingViewModel.SearchLimit || !routing.SearchHasMore)
+        {
+            errors.AppendLine("Поиск по большой папке показал " + routing.SearchResults.Count + " результатов без отметки «есть ещё»: ожидается " + RoutingViewModel.SearchLimit + ".");
+        }
+
+        if (list is null || realized == 0 || realized > 60)
+        {
+            errors.AppendLine("Результаты поиска построили " + realized + " карточек: ожидаются только видимые.");
+        }
+
+        if (timer.Elapsed > TimeSpan.FromSeconds(5))
+        {
+            errors.AppendLine("Поиск по " + rules + " правилам занял " + timer.ElapsedMilliseconds + " мс.");
+        }
+
+        if (!HasVisibleText(host, "Показаны первые " + RoutingViewModel.SearchLimit))
+        {
+            errors.AppendLine("Нет строки «Показаны первые 200 — уточните запрос».");
+        }
+
+        // Отметка правки при открытом поиске не пересоздаёт строки: тот же объект и та же разметка строки.
+        var first = routing.SearchResults[0];
+        var container = list?.ItemContainerGenerator.ContainerFromItem(first);
+        routing.MarkDirty();
+        Settle(host);
+        if (!ReferenceEquals(routing.SearchResults[0], first) || (container is not null && !ReferenceEquals(list!.ItemContainerGenerator.ContainerFromItem(first), container)))
+        {
+            errors.AppendLine("Отметка правки пересоздала результаты поиска: фокус клавиатуры терялся бы.");
+        }
+
+        routing.Search = "";
+        Settle(host);
     }
 
     private static void CheckColumns(DependencyObject root, StringBuilder errors)
@@ -689,6 +861,15 @@ internal static class SelfTest
             || window.ServiceIcon.Visibility != Visibility.Visible)
         {
             errors.AppendLine("Окно, открытое из трея: в свёрнутом меню видны карточки развёрнутого.");
+        }
+
+        // В свёрнутом меню состояние службы — значок с цветной точкой: диктор должен прочитать его словами.
+        var peer = System.Windows.Automation.Peers.UIElementAutomationPeer.CreatePeerForElement(window.ServiceIcon);
+        var spoken = peer?.GetName() ?? "";
+        Log("Значок службы в свёрнутом меню для диктора: " + (spoken.Length > 0 ? spoken : "(нет имени)"));
+        if (!spoken.StartsWith("Служба «Раздельный VPN»", StringComparison.Ordinal))
+        {
+            errors.AppendLine("Значок службы в свёрнутом меню не озвучивает состояние службы.");
         }
 
         window.AllowClose = true;
@@ -808,7 +989,24 @@ internal static class SelfTest
         background.Measure(new Size(width, height));
         background.Arrange(new Rect(0, 0, width, height));
         bitmap.Render(background);
-        bitmap.Render(element);
+        // Через VisualBrush: элемент рисуется от своего левого верхнего угла, а не со сдвигом внутри родителя
+        // (узкий элемент по центру широкого окна иначе выходил на снимке обрезанным справа).
+        var content = new System.Windows.Media.DrawingVisual();
+        using (var context = content.RenderOpen())
+        {
+            context.DrawRectangle(new System.Windows.Media.VisualBrush(element)
+            {
+                Stretch = System.Windows.Media.Stretch.None,
+                ViewboxUnits = System.Windows.Media.BrushMappingMode.Absolute,
+                // VisualBrush учитывает сдвиг элемента внутри родителя: окно снимка начинается с этого сдвига.
+                Viewbox = new Rect((Point)System.Windows.Media.VisualTreeHelper.GetOffset(element), new Size(width, height)),
+                ViewportUnits = System.Windows.Media.BrushMappingMode.Absolute,
+                Viewport = new Rect(0, 0, width, height),
+            },
+                null, new Rect(0, 0, width, height));
+        }
+
+        bitmap.Render(content);
         var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
         encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap));
         using var file = File.Create(Path.Combine(folder, name + ".png"));

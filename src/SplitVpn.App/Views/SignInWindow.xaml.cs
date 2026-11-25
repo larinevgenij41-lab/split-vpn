@@ -36,6 +36,7 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
     {
         ArgumentNullException.ThrowIfNull(prompt);
         InitializeComponent();
+        WindowFit.Apply(this);
         _service = service;
         _profileId = profileId;
         _prompt = prompt;

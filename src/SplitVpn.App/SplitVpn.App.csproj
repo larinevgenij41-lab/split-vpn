@@ -10,6 +10,8 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>SplitVpn</AssemblyName>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <!-- Масштаб PerMonitorV2 и запуск без повышения прав (asInvoker). -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
 
   <ItemGroup>

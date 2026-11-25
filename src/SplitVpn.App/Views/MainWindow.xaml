@@ -66,6 +66,7 @@
                                        views:LiveRegion.Value="{Binding StateText}" />
                         </Grid>
                         <TextBlock Margin="18,2,0,0" FontSize="12" Text="{Binding Status.ProfileName, TargetNullValue=подключение не выбрано}"
+                                   ToolTip="{Binding Status.ProfileName, TargetNullValue=подключение не выбрано}"
                                    TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
                         <!-- Подробный журнал включён: видно всегда, чтобы режим не забылся (он и сам выключится по сроку). -->
                         <ui:Badge Margin="16,6,0,0" HorizontalAlignment="Left" Appearance="Caution" Content="{Binding VerboseBadge}"
@@ -94,7 +95,7 @@
                             <!-- Подпись и версия — строкой выше: состояние («Останавливается…») не делит строку и не обрезается. -->
                             <StackPanel ToolTip="{Binding Description}" Background="Transparent">
                                 <TextBlock FontSize="12" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextFillColorSecondaryBrush}">
-                                    <Run Text="Служба" /> <Run Text="{Binding Version, Mode=OneWay}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                                    <Run Text="Служба" /> <Run Text="{Binding Version, Mode=OneWay}" />
                                 </TextBlock>
                                 <Grid Margin="0,2,0,0">
                                     <Grid.ColumnDefinitions>
@@ -116,15 +117,24 @@
                             </UniformGrid>
                         </StackPanel>
                     </Border>
-                    <!-- Свёрнутое меню: значок службы с цветом состояния; управление — в раскрытом меню. -->
-                    <Grid x:Name="ServiceIcon" Width="40" Height="32" Margin="4,8,4,4" HorizontalAlignment="Left" Background="Transparent" ToolTip="{Binding Description}"
-                          AutomationProperties.Name="{Binding Description}">
-                        <ui:SymbolIcon Symbol="Server24" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
-                        <Ellipse Width="8" Height="8" Margin="0,0,9,6" HorizontalAlignment="Right" VerticalAlignment="Bottom" views:Tone.Fill="{Binding Tone}" />
-                    </Grid>
+                    <!-- Свёрнутое меню: значок службы с цветом состояния; управление — в раскрытом меню.
+                         Label, а не Grid: у панели нет элемента автоматизации, и диктор не прочёл бы состояние —
+                         только цвет точки. Подсказка и имя для диктора — состояние словами. -->
+                    <Label x:Name="ServiceIcon" Width="40" Height="32" Margin="4,8,4,4" Padding="0" HorizontalAlignment="Left" Focusable="False"
+                           HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch" Background="Transparent"
+                           ToolTip="{Binding Description}" AutomationProperties.Name="{Binding Description}">
+                        <Grid>
+                            <ui:SymbolIcon Symbol="Server24" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                            <Ellipse Width="8" Height="8" Margin="0,0,9,6" HorizontalAlignment="Right" VerticalAlignment="Bottom" views:Tone.Fill="{Binding Tone}" />
+                        </Grid>
+                    </Label>
                 </Grid>
             </ui:NavigationView.PaneFooter>
             <ui:NavigationView.Header>
+                <!-- Шапка над страницей не выше 40 % высоты окна (задаётся в MainWindow при смене размера): при низком окне и нескольких
+                     сообщениях она прокручивается сама, а странице остаётся место. -->
+                <ScrollViewer x:Name="HeaderScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False"
+                              views:WheelChain.IsEnabled="True">
                 <StackPanel MaxWidth="1040" Margin="28,8,28,0">
                     <StackPanel Margin="0,0,0,12"
                                 Visibility="{Binding ShowServiceProgress, Converter={StaticResource VisibleWhen}}">
@@ -145,7 +155,7 @@
                                  Visibility="{Binding ShowCommandProgress, Converter={StaticResource VisibleWhen}}"
                                  AutomationProperties.Name="Идёт выполнение" AutomationProperties.LiveSetting="Polite"
                                  views:LiveRegion.Value="{Binding IsWorking}" />
-                    <ui:InfoBar IsOpen="{Binding ProxyError, Converter={StaticResource HasValue}, Mode=OneWay}" Severity="Warning"
+                    <ui:InfoBar Margin="0,0,0,8" IsOpen="{Binding ProxyError, Converter={StaticResource HasValue}, Mode=OneWay}" Severity="Warning"
                                 IsClosable="False" Message="{Binding ProxyError}" views:LiveRegion.Value="{Binding ProxyError}" />
                     <ui:InfoBar
                         Margin="0,0,0,8"
@@ -176,6 +186,7 @@
                         AutomationProperties.LiveSetting="Assertive"
                         views:LiveRegion.Value="{Binding CurrentPage.Message}" />
                 </StackPanel>
+                </ScrollViewer>
             </ui:NavigationView.Header>
         </ui:NavigationView>
 

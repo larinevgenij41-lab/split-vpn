@@ -36,8 +36,29 @@ public sealed partial class ConnectionsViewModel : PageViewModel
             }
 
             RefreshUnsaved();
+            // Перестановка, добавление и удаление меняют края списка и наличие строк: кнопки под списком пересчитываются.
+            RefreshListCommands();
         };
     }
+
+    /// <summary>Доступность кнопок под списком: им нужна выбранная строка, а «Выше» и «Ниже» — ещё и сосед.</summary>
+    private void RefreshListCommands()
+    {
+        MoveUpCommand.NotifyCanExecuteChanged();
+        MoveDownCommand.NotifyCanExecuteChanged();
+        CopyCommand.NotifyCanExecuteChanged();
+        DeleteCommand.NotifyCanExecuteChanged();
+        ExportCommand.NotifyCanExecuteChanged();
+    }
+
+    private bool CanMoveUp(ProfileItem? item) => item is not null && Profiles.IndexOf(item) > 0;
+
+    private bool CanMoveDown(ProfileItem? item) => item is not null && Profiles.IndexOf(item) is var at && at >= 0 && at < Profiles.Count - 1;
+
+    private bool CanEditSelected => Selected is not null;
+
+    /// <summary>Экспортировать есть что, только когда список не пуст.</summary>
+    private bool CanExport => Profiles.Count > 0;
 
     public ObservableCollection<ProfileItem> Profiles { get; } = [];
 
@@ -115,6 +136,7 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         // Редактор один на все профили: блок параметров безопасности раскрывается по нуждам открытого профиля.
         newValue?.Security.ResetDetailsExpanded();
         OnPropertyChanged(nameof(Password));
+        RefreshListCommands();
     }
 
     public override Task OnOpenedAsync() => RunAsync(LoadAsync);
@@ -210,11 +232,11 @@ public sealed partial class ConnectionsViewModel : PageViewModel
     }
 
     /// <summary>Поднимать раньше: порядок списка задаёт и вид на экране, и очерёдность подъёма.</summary>
-    [RelayCommand]
-    private Task MoveUpAsync(ProfileItem item) => MoveAsync(item, -1);
+    [RelayCommand(CanExecute = nameof(CanMoveUp))]
+    private Task MoveUpAsync(ProfileItem? item) => MoveAsync(item, -1);
 
-    [RelayCommand]
-    private Task MoveDownAsync(ProfileItem item) => MoveAsync(item, +1);
+    [RelayCommand(CanExecute = nameof(CanMoveDown))]
+    private Task MoveDownAsync(ProfileItem? item) => MoveAsync(item, +1);
 
     /// <summary>
     /// Переставляет строку и сразу сохраняет порядок. Перестановка идёт через <see cref="ObservableCollection{T}.Move"/>:
@@ -300,7 +322,7 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         EditorFocusToken++;
     }
 
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanEditSelected))]
     private void Copy()
     {
         if (Selected is null)
@@ -339,7 +361,7 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         return "Несохранённые изменения отменены.";
     });
 
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanEditSelected))]
     private Task DeleteAsync() => RunAsync(async () =>
     {
         if (Selected is not { } item)
@@ -691,7 +713,7 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         return null;
     });
 
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanExport))]
     private Task ExportAsync() => RunAsync(async () =>
     {
         var dialog = new SaveFileDialog { FileName = "подключения.json", Filter = "JSON|*.json" };

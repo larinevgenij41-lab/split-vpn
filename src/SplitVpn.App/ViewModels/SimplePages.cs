@@ -264,6 +264,9 @@ public sealed partial class TrustedAdapterItem(AdapterDto adapter, bool isTruste
 
     public string Description { get; } = adapter.Description;
 
+    /// <summary>Подпись флажка: щелчок по имени тоже переключает доверие.</summary>
+    public string Caption => string.IsNullOrWhiteSpace(Description) || Description == Name ? Name : $"{Name} — {Description}";
+
     /// <summary>Распознан как виртуальная сеть: доверен и без отметки, пока включён переключатель.</summary>
     public bool IsOverlay { get; } = adapter.IsOverlay;
 

@@ -23,6 +23,7 @@ public partial class MainWindow : FluentWindow
     public MainWindow()
     {
         InitializeComponent();
+        WindowFit.Apply(this);
         BindPaneParts();
         DataContextChanged += (_, _) => Attach();
         Loaded += (_, _) =>
@@ -35,7 +36,11 @@ public partial class MainWindow : FluentWindow
 
             NameUnlabeledButtons(this);
         };
-        SizeChanged += (_, _) => AdaptPane();
+        SizeChanged += (_, _) =>
+        {
+            AdaptPane();
+            HeaderScroll.MaxHeight = Math.Max(120, ActualHeight * 0.4);
+        };
         Navigation.Navigated += (_, e) =>
         {
             if (e.Page is VmPage page && DataContext is MainViewModel main && main.CurrentPage != page.ViewModel)

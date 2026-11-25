@@ -64,21 +64,34 @@ public sealed partial class HomeViewModel : PageViewModel
     }
 
     /// <summary>
-    /// Подключения из настроек службы: всего и включённых. null — ещё не прочитаны. Без включённых подключений
-    /// «Подключить» ведёт в тупик, поэтому главная кнопка тогда ведёт на страницу «Подключения».
+    /// Подключения из настроек службы: всего и включённых. null — список от службы не получен (служба ещё не
+    /// ответила, недоступна или отказала). Без включённых подключений «Подключить» ведёт в тупик, поэтому главная
+    /// кнопка тогда ведёт на страницу «Подключения» — но только по полученному списку: пока его нет, пустой список
+    /// значит «не загружен», а не «подключений нет».
     /// </summary>
     private (int Total, int Enabled)? _profileCounts;
+
+    /// <summary>Идёт чтение списка подключений по опросу: следующий опрос не отправляет второй запрос.</summary>
+    private bool _profileCountsLoading;
 
     /// <summary>Подключение из состояния службы на прошлом опросе: его смена — повод перечитать список подключений.</summary>
     private string? _lastProfileName;
 
     /// <summary>Что делает главная кнопка, пока подключать нечего.</summary>
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(SetupHint))]
     private HomeSetupAction _setupAction;
 
-    /// <summary>Пояснение под главной кнопкой, когда подключать нечего; null — пояснения нет.</summary>
-    [ObservableProperty]
-    private string? _setupHint;
+    /// <summary>
+    /// Пояснение под главной кнопкой, когда подключать нечего; null — пояснения нет. Выводится из
+    /// <see cref="SetupAction"/>: подсказка и надпись кнопки не могут разойтись.
+    /// </summary>
+    public string? SetupHint => SetupAction switch
+    {
+        HomeSetupAction.AddConnection => "Подключений пока нет: добавьте данные VPN-сервера, которые выдал провайдер VPN или администратор.",
+        HomeSetupAction.OpenConnections => "Все подключения выключены. Включите нужное на странице «Подключения»: роль «Опорное» или «Дополнительное».",
+        _ => null,
+    };
 
     public ObservableCollection<WarningRow> Warnings { get; } = [];
 
@@ -202,8 +215,7 @@ public sealed partial class HomeViewModel : PageViewModel
         try
         {
             var settings = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
-            _profileCounts = (settings.Profiles.Count, settings.Profiles.Count(p => p.Role != ProfileRole.Off));
-            UpdateSetupAction(Main.Status);
+            SetProfileCounts(settings);
             var targets = settings.AllTargets.Select(t => t.Target).ToHashSet();
             _routedProfiles = settings.Profiles.Where(p => targets.Contains(RouteTarget.Tunnel(p.Id))).Select(p => p.Id).ToHashSet();
             foreach (var group in settings.Groups.Where(g => targets.Contains(RouteTarget.Group(g.Id))))
@@ -232,6 +244,10 @@ public sealed partial class HomeViewModel : PageViewModel
         if (status is null)
         {
             IsConnectedIntent = false;
+            // Служба недоступна: прочитанный раньше список подключений больше не считается полученным — после
+            // возвращения службы он читается заново, а до того главная кнопка обычная, без подсказки.
+            _profileCounts = null;
+            _lastProfileName = null;
             UpdateSetupAction(null);
             UpdateButtonText();
             Warnings.Clear();
@@ -262,9 +278,10 @@ public sealed partial class HomeViewModel : PageViewModel
         }
 
         IsConnectedIntent = MainViewModel.IsConnectedIntent(status);
-        if (_profileCounts is not null && status.ProfileName != _lastProfileName)
+        if (_profileCounts is null ? !_profileCountsLoading : status.ProfileName != _lastProfileName)
         {
-            // Опорное подключение сменилось (включили, выключили, добавили): список подключений перечитывается.
+            // Список ещё не получен (служба поднялась после открытия главной) или сменилось опорное подключение
+            // (включили, выключили, добавили): список подключений читается заново.
             _ = RefreshProfileCountsAsync();
         }
 
@@ -315,8 +332,8 @@ public sealed partial class HomeViewModel : PageViewModel
     });
 
     /// <summary>
-    /// Подключать нечего: подключений нет или все выключены, а VPN не запрошен. Пока список подключений не прочитан
-    /// или служба поднимает туннели, кнопка обычная.
+    /// Подключать нечего: подключений нет или все выключены, а VPN не запрошен. Пока служба недоступна, список
+    /// подключений от неё не получен или служба поднимает туннели, кнопка обычная.
     /// </summary>
     private void UpdateSetupAction(StatusDto? status)
     {
@@ -325,27 +342,31 @@ public sealed partial class HomeViewModel : PageViewModel
             : counts.Total == 0 ? HomeSetupAction.AddConnection
             : counts.Enabled == 0 ? HomeSetupAction.OpenConnections
             : HomeSetupAction.None;
-        SetupHint = SetupAction switch
-        {
-            HomeSetupAction.AddConnection => "Подключений пока нет: добавьте данные VPN-сервера, которые выдал провайдер VPN или администратор.",
-            HomeSetupAction.OpenConnections => "Все подключения выключены. Включите нужное на странице «Подключения»: роль «Опорное» или «Дополнительное».",
-            _ => null,
-        };
         PrimaryActionCommand.NotifyCanExecuteChanged();
+    }
+
+    /// <summary>Список подключений получен от службы: главная кнопка и подсказка под ней меняются вместе.</summary>
+    internal void SetProfileCounts(AppSettings settings)
+    {
+        _profileCounts = (settings.Profiles.Count, settings.Profiles.Count(p => p.Role != ProfileRole.Off));
+        UpdateSetupAction(Main.Status);
+        UpdateButtonText();
     }
 
     private async Task RefreshProfileCountsAsync()
     {
+        _profileCountsLoading = true;
         try
         {
-            var settings = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
-            _profileCounts = (settings.Profiles.Count, settings.Profiles.Count(p => p.Role != ProfileRole.Off));
-            UpdateSetupAction(Main.Status);
-            UpdateButtonText();
+            SetProfileCounts(await Service.RequestAsync<AppSettings>(new GetSettingsRequest()));
         }
         catch (Exception ex) when (ex is ServiceUnavailableException or ServiceCommandException)
         {
-            // Список перечитается при следующем открытии главной.
+            // Список не получен: кнопка остаётся обычной, следующий опрос или открытие главной прочитают его снова.
+        }
+        finally
+        {
+            _profileCountsLoading = false;
         }
     }
 
@@ -770,13 +791,19 @@ public sealed partial class TunnelRow(Guid profileId) : ObservableObject
     private string _roleText = "";
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(StatusLine))]
     private string _protocol = "";
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(StatusLine))]
     private string _state = "";
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(StatusLine))]
     private string _detail = "";
+
+    /// <summary>Строка состояния целиком: на главной она сокращается многоточием, полный текст — в подсказке.</summary>
+    public string StatusLine => $"{State} · {Protocol} · {Detail}";
 
     [ObservableProperty]
     private string? _note;
