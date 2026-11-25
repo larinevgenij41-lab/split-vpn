@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.18.0",
+  "tag": "v0.18.0",
+  "releasedUtc": "2026-11-25T08:26:39Z",
+  "expiresUtc": "2027-01-24T08:26:39Z",
+  "package": {
+    "fileName": "SplitVpn-0.18.0.msi",
+    "size": 75268626,
+    "sha256": "c343c3a7de753833bd98a808f960d2d282100acabc136da893238361e23c5cbc",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.18.0/SplitVpn-0.18.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.18.0.msi"
+    ]
+  },
+  "notes": "Выпуск по итогам проверки безопасности и устойчивости. Посторонняя программа больше не может перехватить системный DNS, заняв порт 53 на адресе адаптера раньше службы. Служба устойчивее к сбоям удалённого доступа Windows, переводу часов и смене сети. Имена серверов в зоне .рф разрешаются, настройки от более новой версии читаются после отката. Приложение предупреждает перед потерей несохранённых изменений и перед снятием защиты, понятнее сообщает об ошибках, помещается на небольших экранах и удобнее с клавиатуры и экранным диктором.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.18.0",
+  "kid": "sv-2026-09-2"
+}

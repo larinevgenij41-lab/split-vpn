@@ -1,0 +1,508 @@
+﻿<#
+.SYNOPSIS
+    Выпуск версии: сборка, манифест обновлений с подписью, чистый снимок исходников и релиз на GitHub.
+
+.DESCRIPTION
+    Кодифицирует ручной порядок выпуска, чтобы он не терялся вместе с настройками рабочей копии.
+    Шаги: проверки → сборка и испытания → установщик → манифест update.json и подпись к нему →
+    снимок дерева в ветку publish (один коммит без истории) → тег на снимок и gh release create →
+    снимок в main → проверка выложенного. Main — последним: из него зеркала раздают манифест, и он не
+    должен указывать на релиз, которого ещё нет.
+
+    Манифест кладётся и в активы релиза, и внутрь снимка (release\update.json): из дерева репозитория
+    его раздают jsDelivr и raw.githubusercontent — запасные пути, когда github.com недоступен.
+    Рабочее дерево при этом не меняется: файл попадает только во временный индекс снимка.
+
+    Пароль ключа подписи, по порядку: -PasswordFile (открытый текст — только явно, с предупреждением),
+    переменная SPLITVPN_SIGNING_KEY_PASSWORD, файл %USERPROFILE%\.splitvpn\release-signing.password.dpapi
+    (DPAPI текущего пользователя, создаётся scripts\protect-signing-password.ps1), ввод в консоли.
+    Переменная SPLITVPN_SIGNING_KEY_PASSWORD сразу при запуске переносится в SecureString и удаляется
+    из окружения процесса (в том числе из сеанса PowerShell, откуда запущен скрипт): сборка, тесты и
+    сторонние программы её не видят. Утилите подписи пароль передаётся через переменную окружения только
+    на время её запуска.
+
+    Утилита подписи (splitvpn-cli) публикуется скриптом в чистый artifacts\release-tools и вызывается
+    только оттуда, также и при -SkipBuild; версия её файла сверяется с выпускаемой.
+
+    Рабочее дерево, доступное на запись обычным пользователям (Everyone, Authenticated Users, Users),
+    — ошибка выпуска: подменённый ими скрипт или исходник исполнился бы с правами выпускающего и попал
+    бы в подписанный выпуск. Осознанный обход — -AllowWritableTree.
+
+    Аудит уязвимостей пакетов NuGet включён; без доступа к api.nuget.org его отключает -OfflineNuGet.
+
+    Манифест получает срок годности (-ManifestLifetimeDays, по умолчанию 60 суток): просроченный манифест
+    программа не принимает и сообщает «новых версий не найдено». Срок ограничивает, сколько перехватчик
+    может отдавать старый подписанный манифест и прятать новые версии.
+
+.EXAMPLE
+    scripts\publish-release.ps1 -NotesFile docs\notes-0.8.0.md
+#>
+param(
+    [string]$Version,
+    [Parameter(Mandatory = $true)][string]$NotesFile,
+    [string]$KeyPath = (Join-Path $env:USERPROFILE '.splitvpn\release-signing.pem'),
+    [string]$PasswordFile,
+    [string]$ProtectedPasswordFile = (Join-Path $env:USERPROFILE '.splitvpn\release-signing.password.dpapi'),
+    [ValidateRange(7, 365)][int]$ManifestLifetimeDays = 60,
+    [string]$KeyId = 'sv-2026-09-2',
+    [string]$MinUpgradableVersion,
+    [switch]$SkipBuild,
+    [switch]$AllowNoWfpCheck,
+    [switch]$AllowWritableTree,
+    [switch]$OfflineNuGet,
+    [switch]$DryRun
+)
+
+$ErrorActionPreference = 'Stop'
+
+# Пароль из окружения — первым делом, до любого дочернего процесса: переменную окружения наследуют все
+# они (git, gh, dotnet build, анализаторы и пакеты NuGet, тесты, sing-box.exe). Дальше пароль живёт
+# только в SecureString и попадает в окружение лишь на время запуска утилиты подписи.
+$environmentPassword = $null
+if ($env:SPLITVPN_SIGNING_KEY_PASSWORD) {
+    $environmentPassword = ConvertTo-SecureString $env:SPLITVPN_SIGNING_KEY_PASSWORD -AsPlainText -Force
+}
+Remove-Item Env:\SPLITVPN_SIGNING_KEY_PASSWORD -ErrorAction SilentlyContinue
+
+$root = Split-Path -Parent $PSScriptRoot
+$repository = 'larinevgenij41-lab/split-vpn'
+$gh = 'C:\Program Files\GitHub CLI\gh.exe'
+if (-not (Test-Path $gh)) { $gh = 'gh' }
+
+function Step($text) { Write-Host "== $text" -ForegroundColor Cyan }
+function Run($file, $arguments) {
+    # Родные программы пишут ход работы в stderr — git делает это всегда. При $ErrorActionPreference
+    # 'Stop' и перенаправленном выводе PowerShell принимает эти строки за ошибку и прерывает выпуск
+    # после успешного шага. Судить можно только по коду завершения.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $file @arguments }
+    finally { $ErrorActionPreference = $previous }
+    if ($LASTEXITCODE -ne 0) { throw "$file $($arguments -join ' ') — код $LASTEXITCODE" }
+}
+
+# Одно значение из базы установщика. Обращение позднее связывание: у Execute параметр
+# необязательный, у Fetch параметров нет, StringData — свойство с индексом. Каждый шаг назван, иначе
+# COM сообщает только «Type mismatch» без указания, что именно не сошлось.
+function MsiValue([string]$path, [string]$query, [string]$what) {
+    $step = 'создание объекта WindowsInstaller'
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $type = $installer.GetType()
+        $step = 'открытие базы установщика'
+        $database = $type.InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @([string]$path, [int]0))
+        $step = 'запрос'
+        $view = $database.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $database, @([string]$query))
+        $step = 'выполнение запроса'
+        $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, @($null)) | Out-Null
+        $step = 'чтение строки'
+        $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, @())
+        if (-not $record) { throw "в установщике нет значения «$what»" }
+        $step = 'чтение значения'
+        return [string]$record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, @([int]1))
+    }
+    catch {
+        throw "Не удалось прочитать $what из $path ($step): $($_.Exception.Message)"
+    }
+}
+
+function MsiProductVersion([string]$path) {
+    MsiValue $path "SELECT Value FROM Property WHERE Property='ProductVersion'" 'ProductVersion'
+}
+
+# Версия файла службы в таблице File (Id ServiceExe в Package.wxs) — версия сборки, из которой взяты бинарные файлы.
+function MsiServiceFileVersion([string]$path) {
+    MsiValue $path "SELECT Version FROM File WHERE File='ServiceExe'" 'версию SplitVpn.Service.exe'
+}
+
+# Строка из SecureString: утилите подписи пароль нужен открытым текстом, но только в памяти.
+function PlainText([Security.SecureString]$secure) {
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
+# Разрешения на запись корня репозитория для широких групп: Everyone, Authenticated Users, BUILTIN\Users.
+# Сравнение по SID — имена групп в русской Windows локализованы. Учитываются и наследуемые только
+# дочерними (InheritOnly) правила: они дают запись во все файлы дерева. Та же функция есть в
+# build-installer.ps1, elevated.ps1 и install-dev-service.ps1.
+function Get-WritableTreeGrants([string]$path) {
+    $broad = @{ 'S-1-1-0' = 'Everyone'; 'S-1-5-11' = 'Authenticated Users'; 'S-1-5-32-545' = 'BUILTIN\Users' }
+    # WriteData, AppendData, DeleteSubdirectoriesAndFiles, Delete, ChangePermissions, TakeOwnership,
+    # GENERIC_ALL, GENERIC_WRITE: любое из них — это Write, Modify или FullControl.
+    $writeMask = 0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+    $rules = (Get-Acl -LiteralPath $path).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+    foreach ($rule in $rules) {
+        $sid = $rule.IdentityReference.Value
+        if ($rule.AccessControlType -ne 'Allow' -or -not $broad.ContainsKey($sid)) { continue }
+        if (([long]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
+        [pscustomobject]@{ Sid = $sid; Name = $broad[$sid]; Rights = $rule.FileSystemRights; Inherited = $rule.IsInherited }
+    }
+}
+
+# Каталоги и файлы git, из которых git исполняет код при сборке: hooks, config (core.fsmonitor, core.hooksPath),
+# каталог core.hooksPath. В git worktree общий каталог git (--git-common-dir) лежит вне рабочего дерева — в
+# основной копии, — и проверка одного корня его не видит. Абсолютные пути; без git или не в репозитории — пусто.
+# Та же функция есть в build-installer.ps1, elevated.ps1 и install-dev-service.ps1.
+function Get-GitControlPaths([string]$path) {
+    $ErrorActionPreference = 'Continue'
+    $found = [Collections.Generic.List[string]]::new()
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return @() }
+    function Resolve-GitPath([string]$value) {
+        $value = $value.Trim()
+        if (-not [IO.Path]::IsPathRooted($value)) { $value = Join-Path $path $value }
+        return [IO.Path]::GetFullPath($value)
+    }
+    foreach ($option in '--git-common-dir', '--git-dir') {
+        $dir = @(& git -C $path rev-parse $option 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $dir.Count -and $dir[0]) {
+            $full = Resolve-GitPath $dir[0]
+            $found.Add($full)
+            foreach ($inner in 'hooks', 'config', 'config.worktree') { $found.Add((Join-Path $full $inner)) }
+        }
+    }
+    $hooks = @(& git -C $path config --get core.hooksPath 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $hooks.Count -and $hooks[0]) {
+        $value = [Environment]::ExpandEnvironmentVariables($hooks[0].Trim())
+        if ($value.StartsWith('~')) { $value = Join-Path $HOME $value.Substring(1).TrimStart('/', '\') }
+        $found.Add((Resolve-GitPath $value))
+    }
+    return @($found | Where-Object { Test-Path -LiteralPath $_ } | Sort-Object -Unique)
+}
+
+# ---------------------------------------------------------------- проверки
+Step 'проверки'
+# Скрипт исполняет код из дерева (сборка, тесты, установщик) и подписывает результат ключом выпуска:
+# запись в дерево для обычных пользователей — это подмена выпуска без прав выпускающего. То же — запись
+# в каталог git: подложенный hook или core.fsmonitor исполнится при первой же команде git с вашими правами.
+$checkedPaths = @(@($root) + @(Get-GitControlPaths $root) | Select-Object -Unique)
+$writable = @(foreach ($path in $checkedPaths) {
+    $grants = @(Get-WritableTreeGrants $path)
+    if ($grants.Count) { [pscustomobject]@{ Path = $path; Grants = $grants } }
+})
+if ($writable.Count) {
+    $grantList = ($writable | ForEach-Object {
+        "  $($_.Path):"
+        $_.Grants | ForEach-Object { "    $($_.Name) ($($_.Sid)): $($_.Rights)$(if ($_.Inherited) { ', унаследовано' } else { ', задано явно' })" }
+    }) -join "`n"
+    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $fix = ($writable | ForEach-Object {
+        $target = $_.Path
+        $inherit = if (Test-Path -LiteralPath $target -PathType Container) { '(OI)(CI)' } else { '' }
+        "icacls `"$target`" /inheritance:r /grant:r `"*${userSid}:${inherit}F`" `"*S-1-5-18:${inherit}F`" `"*S-1-5-32-544:${inherit}F`""
+        foreach ($sid in @($_.Grants | Where-Object { -not $_.Inherited } | ForEach-Object Sid | Sort-Object -Unique)) { "icacls `"$target`" /remove:g *$sid" }
+    }) -join "`n"
+    if (-not $AllowWritableTree) {
+        throw "Корень репозитория или каталог git доступны на запись обычным пользователям:`n$grantList`nЛюбой из них может подменить скрипт, исходник, hook или настройку git (core.fsmonitor, core.hooksPath), которые исполнятся с вашими правами и попадут в подписанный выпуск. В git worktree каталог git лежит в основной копии репозитория. Оставьте доступ только себе, SYSTEM и Администраторам (из консоли администратора):`n$fix`nОсознанно выпустить из такого дерева: -AllowWritableTree."
+    }
+    Write-Warning "Корень репозитория или каталог git доступны на запись обычным пользователям (-AllowWritableTree):`n$grantList"
+}
+
+$declared = ([xml](Get-Content (Join-Path $root 'Directory.Build.props'))).Project.PropertyGroup.Version
+if (-not $Version) { $Version = $declared }
+if ($Version -ne $declared) { throw "Версия $Version не совпадает с Directory.Build.props ($declared)" }
+if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Версия должна быть вида «0.8.0», а не «$Version»" }
+if (-not (Test-Path $NotesFile)) { throw "Нет файла заметок: $NotesFile" }
+if (-not (Test-Path $KeyPath)) { throw "Нет ключа выпуска: $KeyPath. Создайте его командой splitvpn-cli release-keygen." }
+
+# Пароль ключа — до сборки: спрашивать его через несколько минут сборки неудобно.
+$signingPassword = $null
+if ($PasswordFile) {
+    if (-not (Test-Path $PasswordFile)) { throw "Нет файла пароля: $PasswordFile" }
+    Write-Warning "Пароль ключа подписи читается из открытого файла $PasswordFile. Переведите его в DPAPI: scripts\protect-signing-password.ps1 -RemovePlainText"
+}
+elseif ($environmentPassword) {
+    # Задан снаружи через SPLITVPN_SIGNING_KEY_PASSWORD; из окружения уже убран в начале скрипта.
+    $signingPassword = $environmentPassword
+}
+elseif (Test-Path $ProtectedPasswordFile) {
+    # Формат ConvertFrom-SecureString без ключа — DPAPI текущего пользователя: расшифровать может только он.
+    $signingPassword = (Get-Content -Raw $ProtectedPasswordFile).Trim() | ConvertTo-SecureString
+}
+else {
+    # Открытый файл прежних выпусков сам не читается (только через -PasswordFile): подсказать перевод в DPAPI.
+    $plainPasswordFile = Join-Path (Split-Path -Parent $ProtectedPasswordFile) 'release-signing.password.txt'
+    if (Test-Path $plainPasswordFile) {
+        Write-Warning "Нет $ProtectedPasswordFile, но есть открытый $plainPasswordFile. Переведите пароль в DPAPI: scripts\protect-signing-password.ps1 -RemovePlainText"
+    }
+
+    # Без консоли Read-Host ждал бы ввода вечно или падал с невнятной ошибкой.
+    if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) {
+        throw "Пароль ключа подписи не найден, а ввести его негде (неинтерактивный запуск). Создайте $ProtectedPasswordFile командой scripts\protect-signing-password.ps1 или задайте SPLITVPN_SIGNING_KEY_PASSWORD."
+    }
+
+    $signingPassword = Read-Host -AsSecureString 'Пароль ключа выпуска'
+}
+$environmentPassword = $null
+
+# Отслеживаемые правки блокируют выпуск: снимок берётся из HEAD, и выложенное не совпало бы с собранным.
+$status = git -C $root status --porcelain --untracked-files=no
+if ($status) { throw "Рабочее дерево не чистое: выпуск идёт только из зафиксированного состояния.`n$status" }
+
+# Неотслеживаемый файл среди входов сборки (лишний .cs, Directory.Build.targets, *.csproj.user, .wxs) попал бы
+# в MSI, но не в снимок исходников, — это ошибка выпуска. Игнорируемые тоже считаются: *.user и *.dll
+# скрыты .gitignore, а MSBuild их подхватывает. Не в счёт только каталоги вывода bin, obj и TestResults.
+$buildInputs = @('src', 'tests', 'installer', ':(glob)Directory.*', ':(icase)global.json', ':(icase)nuget.config')
+$strays = @(git -C $root ls-files --others --exclude-standard -- @buildInputs)
+if ($LASTEXITCODE -ne 0) { throw "git ls-files завершился с кодом $LASTEXITCODE" }
+$strays += @(git -C $root ls-files --others --ignored --exclude-standard --directory -- @buildInputs |
+    Where-Object { $_ -notmatch '(^|/)(bin|obj|TestResults)/$' })
+if ($LASTEXITCODE -ne 0) { throw "git ls-files завершился с кодом $LASTEXITCODE" }
+$strays = @($strays | Where-Object { $_ } | Sort-Object -Unique)
+if ($strays.Count) { throw "Среди входов сборки есть файлы вне git — уберите их или зафиксируйте:`n$($strays -join "`n")" }
+$untracked = git -C $root status --porcelain --untracked-files=all | Where-Object { $_.StartsWith('??') }
+if ($untracked) { Write-Warning "В дереве есть неотслеживаемые файлы (в снимок не войдут):`n$($untracked -join "`n")" }
+
+$tag = "v$Version"
+if (git -C $root tag --list $tag) { throw "Тег $tag уже существует локально" }
+Run $gh @('auth', 'status')
+
+# ---------------------------------------------------------------- сборка
+$env:DOTNET_NOLOGO = '1'
+# Аудит уязвимостей пакетов по умолчанию включён: выпуск с известной уязвимостью в зависимости должен
+# остановиться на NU1901–NU1904. Без доступа к api.nuget.org аудит падает на NU1900 — тогда, и только
+# явно, -OfflineNuGet (MSBuild читает переменную окружения как свойство; её наследует и build-installer.ps1).
+if ($OfflineNuGet) {
+    $env:NuGetAudit = 'false'
+    Write-Warning 'Аудит уязвимостей пакетов NuGet пропущен (-OfflineNuGet): выпуск собирается без проверки зависимостей на известные уязвимости.'
+}
+else {
+    # Унаследованное из сеанса NuGetAudit=false молча отключило бы аудит.
+    Remove-Item Env:\NuGetAudit -ErrorAction SilentlyContinue
+}
+
+if (-not $SkipBuild) {
+    Step 'сборка и испытания'
+    # Испытания WfpRealEngineTests работают с настоящими фильтрами Windows и без прав администратора
+    # пропускаются. Версия 0.17.2 вышла с неработающим перечислением фильтров именно потому, что такой
+    # проверки не было: выпуск из обычной консоли нужно разрешить явно.
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $elevated) {
+        if (-not $AllowNoWfpCheck) { throw 'Консоль без прав администратора: проверка настоящих фильтров Windows будет пропущена. Запустите выпуск из консоли администратора или передайте -AllowNoWfpCheck.' }
+        Write-Warning 'Проверка настоящих фильтров Windows пропущена (-AllowNoWfpCheck).'
+    }
+    Run 'dotnet' @('build', (Join-Path $root 'SplitVpn.slnx'), '-c', 'Release', '--nologo', '-v', 'q')
+    Run 'dotnet' @('test', (Join-Path $root 'SplitVpn.slnx'), '-c', 'Release', '--no-build')
+
+    & (Join-Path $root 'scripts\test-recovery-regressions.ps1')
+
+    Step 'установщик'
+    & (Join-Path $root 'scripts\build-installer.ps1') -Version $Version
+    if ($LASTEXITCODE -ne 0) { throw "Сборка установщика завершилась с кодом $LASTEXITCODE" }
+}
+
+# Утилита подписи получает путь к ключу и пароль, поэтому берётся не «первая найденная» в bin\Release
+# (порядок обхода не определён, там может лежать старая или подложенная сборка), а публикуется из
+# текущего дерева в чистый каталог и вызывается ровно оттуда. При -SkipBuild тоже: без неё не подписать.
+Step 'утилита подписи'
+$releaseTools = Join-Path $root 'artifacts\release-tools'
+if (Test-Path $releaseTools) { [IO.Directory]::Delete($releaseTools, $true) }
+Run 'dotnet' @('publish', (Join-Path $root 'src\SplitVpn.Cli\SplitVpn.Cli.csproj'), '-c', 'Release', '-o', $releaseTools, '--nologo', '-v', 'q')
+$cli = Join-Path $releaseTools 'splitvpn-cli.exe'
+if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) { throw "Публикация не создала $cli" }
+# Команды версии у splitvpn-cli нет: сверяется версия файла, которую задаёт Directory.Build.props.
+$cliFileVersion = (Get-Item -LiteralPath $cli).VersionInfo.FileVersion
+if ($cliFileVersion -ne $Version -and -not "$cliFileVersion".StartsWith("$Version.")) {
+    throw "splitvpn-cli.exe в $releaseTools версии $cliFileVersion, а выпускается $Version"
+}
+
+$msi = Join-Path $root "artifacts\installer\SplitVpn-$Version.msi"
+if (-not (Test-Path $msi)) { throw "Нет установщика $msi" }
+
+# Версия внутри пакета: ловит случай «выложили MSI от прошлой сборки».
+$productVersion = MsiProductVersion $msi
+if ($productVersion -ne $Version) { throw "ProductVersion установщика — $productVersion, а выпускается $Version" }
+
+# ProductVersion задаёт параметр сборки WiX, а не сами файлы: MSI, собранный с -Version поверх старой
+# публикации (например, при -SkipBuild), нёс бы прежние бинарные файлы под новой версией.
+$serviceFileVersion = MsiServiceFileVersion $msi
+if (-not $serviceFileVersion.StartsWith("$Version.") -and $serviceFileVersion -ne $Version) {
+    throw "SplitVpn.Service.exe в установщике версии $serviceFileVersion, а выпускается ${Version}: пересоберите установщик без -SkipBuild"
+}
+
+# ---------------------------------------------------------------- манифест
+Step 'манифест и подпись'
+$releaseDir = Join-Path $root 'artifacts\release'
+New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+$manifestPath = Join-Path $releaseDir 'update.json'
+$signaturePath = "$manifestPath.sig"
+
+$hash = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLowerInvariant()
+$size = (Get-Item $msi).Length
+# Читать строго как UTF-8: Get-Content в Windows PowerShell берёт файл без BOM за ANSI,
+# и кириллица заметок превратилась бы в «кракозябру» и в манифесте, и на странице выпуска.
+$notes = [IO.File]::ReadAllText($NotesFile, [Text.Encoding]::UTF8).Trim()
+
+# В манифест идёт только первый абзац: его показывает карточка «О программе», где весь текст
+# заметок не нужен и не помещается. Полные заметки уходят на страницу выпуска.
+$summary = ($notes -split "(`r?`n){2,}")[0].Trim()
+if ($summary.Length -gt 600) { $summary = $summary.Substring(0, 597).TrimEnd() + '…' }
+$releasedUtc = [DateTimeOffset]::UtcNow
+$minimum = ''
+if ($MinUpgradableVersion) { $minimum = "`n  ""minUpgradableVersion"": ""$MinUpgradableVersion""," }
+
+# Манифест собирается строкой, а не ConvertTo-Json: подпись считается по точным байтам, поэтому
+# порядок полей, отступы и перевод строки должны быть предсказуемы. Файл — UTF-8 без BOM с LF.
+$json = @"
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "$Version",
+  "tag": "$tag",
+  "releasedUtc": "$($releasedUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'))",
+  "expiresUtc": "$($releasedUtc.AddDays($ManifestLifetimeDays).ToString('yyyy-MM-ddTHH:mm:ssZ'))",$minimum
+  "package": {
+    "fileName": "SplitVpn-$Version.msi",
+    "size": $size,
+    "sha256": "$hash",
+    "urls": [
+      "https://github.com/$repository/releases/download/$tag/SplitVpn-$Version.msi",
+      "https://github.com/$repository/releases/latest/download/SplitVpn-$Version.msi"
+    ]
+  },
+  "notes": $($summary | ConvertTo-Json),
+  "notesUrl": "https://github.com/$repository/releases/tag/$tag",
+  "kid": "$KeyId"
+}
+"@
+[IO.File]::WriteAllBytes($manifestPath, [Text.UTF8Encoding]::new($false).GetBytes(($json -replace "`r`n", "`n")))
+
+$signArguments = @('release-sign', '--manifest', $manifestPath, '--key', $KeyPath)
+if ($PasswordFile) { $signArguments += @('--password-file', $PasswordFile) }
+# В окружении пароль только на время запуска утилиты подписи; убирается при любом исходе.
+try {
+    if ($signingPassword) { $env:SPLITVPN_SIGNING_KEY_PASSWORD = PlainText $signingPassword }
+    Run $cli $signArguments
+}
+finally {
+    Remove-Item Env:\SPLITVPN_SIGNING_KEY_PASSWORD -ErrorAction SilentlyContinue
+    if ($signingPassword) { $signingPassword.Dispose() }
+    $signingPassword = $null
+}
+# Самопроверка тем же кодом, что и в службе: с неработающей подписью релиз не выкладывается.
+Run $cli @('release-verify', '--manifest', $manifestPath, '--signature', $signaturePath, '--package', $msi)
+
+# ---------------------------------------------------------------- заметки
+$notesForRelease = Join-Path $releaseDir "notes-$Version.md"
+$releaseText = @"
+$notes
+
+---
+
+SHA-256 установщика ``SplitVpn-$Version.msi``:
+
+``````
+$hash
+``````
+
+Проверить: ``Get-FileHash SplitVpn-$Version.msi -Algorithm SHA256``
+
+Установщик не подписан Authenticode — Windows покажет «Неизвестный издатель». Сверьте контрольную сумму.
+Установка поверх: закройте «Раздельный VPN», затем ``msiexec /i SplitVpn-$Version.msi``.
+Начиная с 0.8.0 программа проверяет обновления сама: «О программе» → «Обновление».
+"@
+# Без BOM: gh показал бы его первым символом заметок.
+[IO.File]::WriteAllText($notesForRelease, $releaseText, [Text.UTF8Encoding]::new($false))
+
+# ---------------------------------------------------------------- снимок
+Step 'снимок исходников в ветку publish'
+# Манифест добавляется только во временный индекс: рабочее дерево и история main не меняются.
+$env:GIT_INDEX_FILE = Join-Path $env:TEMP "splitvpn-publish-$Version.index"
+try {
+    Run 'git' @('-C', $root, 'read-tree', 'HEAD')
+    # --no-filters обязателен: подпись считается по точным байтам манифеста, а git привёл бы
+    # переводы строк к CRLF (core.autocrlf) и подпись перестала бы сходиться у тех, кто берёт
+    # манифест с зеркал raw.githubusercontent и jsDelivr.
+    $manifestBlob = (git -C $root hash-object -w --no-filters $manifestPath).Trim()
+    $signatureBlob = (git -C $root hash-object -w --no-filters $signaturePath).Trim()
+    Run 'git' @('-C', $root, 'update-index', '--add', '--cacheinfo', "100644,$manifestBlob,release/update.json")
+    Run 'git' @('-C', $root, 'update-index', '--add', '--cacheinfo', "100644,$signatureBlob,release/update.json.sig")
+    $tree = (git -C $root write-tree).Trim()
+}
+finally {
+    Remove-Item $env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
+    Remove-Item Env:\GIT_INDEX_FILE -ErrorAction SilentlyContinue
+}
+
+# Авторство берётся из локальной настройки репозитория: в глобальной — корпоративная почта.
+$env:GIT_AUTHOR_NAME = git -C $root config user.name
+$env:GIT_AUTHOR_EMAIL = git -C $root config user.email
+$env:GIT_COMMITTER_NAME = $env:GIT_AUTHOR_NAME
+$env:GIT_COMMITTER_EMAIL = $env:GIT_AUTHOR_EMAIL
+if (-not $env:GIT_AUTHOR_EMAIL) { throw 'В репозитории не задано user.email: снимок ушёл бы с чужим авторством.' }
+
+$message = @"
+Раздельный VPN $Version
+
+Разделение трафика для Windows: российские адреса напрямую, остальные через VPN.
+Служба, интерфейс WPF, SSTP/L2TP/IKEv2/PPTP и Cisco AnyConnect, kill switch на WFP,
+DNS-посредник, автообновляемые списки адресов, обновление программы через GitHub Releases.
+"@
+$commit = (git -C $root commit-tree $tree -m $message).Trim()
+Run 'git' @('-C', $root, 'branch', '-f', 'publish', $commit)
+Write-Host "Снимок: $commit"
+
+$singBoxManifest = Get-Content (Join-Path $root 'third_party\sing-box\manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+$singBoxSource = Join-Path $root "third_party\sing-box\work\$($singBoxManifest.source.name)"
+if (-not (Test-Path $singBoxSource) -or -not $singBoxManifest.source.sha256 -or
+    (Get-FileHash $singBoxSource -Algorithm SHA256).Hash.ToLowerInvariant() -ne $singBoxManifest.source.sha256.ToLowerInvariant()) {
+    throw "Нет архива исходников sing-box или его SHA-256 не совпадает с манифестом ($singBoxSource): запустите scripts\fetch-sing-box.ps1"
+}
+
+if ($DryRun) {
+    Write-Host "Пробный прогон: снимок не отправлен, релиз не создан. Манифест: $manifestPath" -ForegroundColor Yellow
+    return
+}
+
+# ---------------------------------------------------------------- релиз
+# Порядок важен: зеркала jsDelivr и raw.githubusercontent раздают манифест из main, а он ссылается на
+# установщик в активах релиза. Поэтому сначала тег на снимок и релиз с активами, и только потом main.
+# Сбой релиза убирает тег и не трогает main: зеркала продолжают отдавать прежний манифест, чей установщик
+# на месте. Сбой отправки main после релиза безопасен: зеркала просто ещё указывают на прошлый выпуск.
+Step 'релиз на GitHub'
+Run 'git' @('-C', $root, 'push', 'origin', "${commit}:refs/tags/$tag")
+try {
+    # Архив исходников sing-box той версии, что лежит в установщике, выкладывается тем же выпуском (GPL-3.0, 6d).
+    Run $gh @('release', 'create', $tag, $msi, $manifestPath, $signaturePath, $singBoxSource, '--verify-tag',
+        '--repo', $repository, '--title', "Раздельный VPN $Version", '--notes-file', $notesForRelease)
+}
+catch {
+    Write-Warning "Релиз не создан: убираю тег $tag и черновик релиза, main не менялся."
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        # Релиз мог остаться черновиком без части активов (gh загружает их до публикации).
+        & $gh release delete $tag --repo $repository --yes 2>$null | Out-Null
+        & git -C $root push origin ":refs/tags/$tag" 2>$null | Out-Null
+    }
+    finally { $ErrorActionPreference = $previous }
+    throw
+}
+
+Step 'снимок в main (зеркала манифеста)'
+try { Run 'git' @('-C', $root, 'push', '--force-with-lease', 'origin', 'publish:refs/heads/main') }
+catch {
+    throw "Релиз $tag выложен, но снимок в main не отправлен ($($_.Exception.Message)). Зеркала пока отдают прежний манифест; повторите: git push --force-with-lease origin publish:refs/heads/main"
+}
+
+# ---------------------------------------------------------------- проверка выложенного
+Step 'проверка выложенного'
+$checkDir = Join-Path $releaseDir 'published'
+New-Item -ItemType Directory -Force -Path $checkDir | Out-Null
+$published = Join-Path $checkDir 'update.json'
+# Адрес latest первые секунды после выпуска может отдавать файлы прошлого выпуска вперемешку с новыми
+# (кеш CDN): пара «манифест + подпись» перечитывается, пока не сойдётся с только что подписанной.
+$expectedSignature = (Get-FileHash (Join-Path $releaseDir 'update.json.sig')).Hash
+for ($attempt = 1; ; $attempt++) {
+    Invoke-WebRequest "https://github.com/$repository/releases/latest/download/update.json" -OutFile $published -UseBasicParsing
+    Invoke-WebRequest "https://github.com/$repository/releases/latest/download/update.json.sig" -OutFile "$published.sig" -UseBasicParsing
+    if ((Get-FileHash "$published.sig").Hash -eq $expectedSignature -or $attempt -ge 12) { break }
+    Start-Sleep -Seconds 10
+}
+Run $cli @('release-verify', '--manifest', $published, '--signature', "$published.sig")
+if (((Get-Content $published -Raw) | ConvertFrom-Json).version -ne $Version) { throw 'Выложенный манифест указывает на другую версию' }
+
+$head = Invoke-WebRequest "https://github.com/$repository/releases/download/$tag/SplitVpn-$Version.msi" -Method Head -UseBasicParsing
+if ([long](@($head.Headers['Content-Length'])[0]) -ne $size) { throw 'Размер выложенного установщика не совпал с манифестом' }
+
+Write-Host "Готово: https://github.com/$repository/releases/tag/$tag" -ForegroundColor Green
