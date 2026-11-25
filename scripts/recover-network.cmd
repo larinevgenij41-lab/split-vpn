@@ -1,4 +1,5 @@
 @echo off
-rem Аварийное восстановление сети «Раздельный VPN»: запрашивает повышение и запускает recover-network.ps1.
-rem Путь берётся в кавычки: Start-Process в Windows PowerShell 5.1 не экранирует элементы -ArgumentList, а установка лежит в «Program Files».
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell.exe -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File \"{0}\"' -f '%~dp0recover-network.ps1')"
+rem Экстренное отключение «Раздельный VPN» и возврат обычной сети: запускает recover-network.ps1. Права администратора
+rem скрипт запрашивает сам и сообщает понятным текстом, если запрос отклонён (здесь не пишем кириллицу: cmd читает
+rem файл в кодовой странице OEM).
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0recover-network.ps1"

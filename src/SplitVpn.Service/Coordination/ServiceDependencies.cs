@@ -104,6 +104,21 @@ public sealed record ServiceDependencies
     /// </summary>
     public Func<bool> DisableWifiBadStateTracking { get; init; } = () => false;
 
+    /// <summary>
+    /// Флаг экстренного отключения (HKLM\Software\SplitVpn, EmergencyOff); null — программа не отключена. Читается один
+    /// раз при создании координатора: служба с флагом работает «пустой» до перезапуска (его делает emergency-on).
+    /// </summary>
+    public Func<Core.Recovery.EmergencyFlag?> EmergencyFlag { get; init; } = () => null;
+
+    /// <summary>
+    /// «Пустая» служба возвращает себе ручной запуск, если его сбросили (установка обновления или исправление программы
+    /// ставят автозапуск). Ответ — что изменено, для журнала; null — уже был ручной.
+    /// </summary>
+    public Func<string?> EnsureManualStart { get; init; } = () => null;
+
+    /// <summary>Слушают ли UDP-порт 53 так, что туда доходят запросы к 127.0.0.1 (V4) и к [::1] (V6).</summary>
+    public Func<(bool V4, bool V6)> LoopbackResolverListeners { get; init; } = () => (false, false);
+
     /// <summary>Каталог записей подключения Wi-Fi (<c>wifi-incident-*.log</c>); null — записи остаются в памяти.</summary>
     public string? WifiIncidentDirectory { get; init; }
 

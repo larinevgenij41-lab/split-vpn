@@ -28,6 +28,14 @@ public sealed partial class Coordinator
     /// <summary>Приводит систему к намерению пользователя. Каждый шаг идемпотентен.</summary>
     internal async Task ReconcileAsync(CancellationToken cancellationToken)
     {
+        if (_emergency is not null)
+        {
+            // Экстренное отключение: «пустая» служба ничего не применяет — ни по команде, ни по сохранённой настройке.
+            Facts.ReconcilePending = false;
+            Facts.PolicyApplied = true;
+            return;
+        }
+
         CancelStaleCertificateProbes();
         var step = "подготовка";
         Facts.PolicyApplied = false;
@@ -1866,9 +1874,7 @@ public sealed partial class Coordinator
         var existing = _deps.DnsBackups.Load().GetValueOrDefault(interfaceGuid);
         if (existing is not null)
         {
-            // Исходный DNS уже сохранён: внешнее изменение — дрейф, а не новый исходный DNS.
-            Journal("Предупреждение", "DNS адаптера изменён извне: возвращён локальный посредник.");
-            existing = CompleteIpv6Backup(interfaceGuid, existing);
+            existing = RememberExternalDns(interfaceGuid, CompleteIpv6Backup(interfaceGuid, existing), current);
         }
         else
         {
@@ -1879,6 +1885,35 @@ public sealed partial class Coordinator
         _wifiRecorder?.Note($"Служба: DNS адаптера {interfaceGuid} - было «{current}», ставится «{nameServerV4}»");
         var known = InterfaceDnsOps.KnownOriginalV6(existing);
         _deps.Dns.ApplyLoopback(interfaceGuid, known, nameServerV4, ipv6Known: known is not null);
+    }
+
+    /// <summary>
+    /// DNS адаптера, на котором уже стоял посредник, кто-то сменил на не наш (<paramref name="current"/> — не
+    /// <see cref="InterfaceDnsOps.IsProxySet"/>): пользователь вручную, панель управления, другая программа. Это его последний
+    /// выбор, и отключение должно вернуть именно его, а не значение из старой копии: новое значение (IPv4, IPv6, суффиксы)
+    /// записывается в копию как исходное, и только потом адаптеру снова ставится посредник. Если снятое значение совпадает
+    /// с копией (запись посредника не удалась, и на адаптере остался исходный), копия не переписывается.
+    /// Восстановление по-прежнему возвращает копию, только если на адаптере наш DNS (иначе «изменено пользователем»):
+    /// после переписанной копии на адаптере снова посредник, и при отключении вернётся последний выбор пользователя.
+    /// </summary>
+    private InterfaceDnsBackup RememberExternalDns(Guid interfaceGuid, InterfaceDnsBackup existing, string current)
+    {
+        var fresh = _deps.Dns.Capture(interfaceGuid, existing);
+        if (InterfaceDnsOps.SameServers(fresh.NameServerV4, existing.NameServerV4)
+            && InterfaceDnsOps.SameServers(fresh.NameServerV6, existing.NameServerV6)
+            && fresh.Ipv6Unknown == existing.Ipv6Unknown
+            && string.Equals(fresh.SearchList, existing.SearchList, StringComparison.OrdinalIgnoreCase))
+        {
+            Journal("Предупреждение", "DNS адаптера изменён извне: возвращён локальный посредник.");
+            return existing;
+        }
+
+        // Снимок сам отличает свои суффиксы шлюза от правки пользователя (по отметке применённого списка в прежней копии).
+        var remembered = fresh;
+        _deps.DnsBackups.Upsert(remembered);
+        Journal("Предупреждение", $"DNS адаптера изменён извне на «{(current.Length > 0 ? current : "автоматически")}»: "
+            + "это значение запомнено как исходное и вернётся при отключении VPN, а пока возвращён локальный посредник.");
+        return remembered;
     }
 
     /// <summary>

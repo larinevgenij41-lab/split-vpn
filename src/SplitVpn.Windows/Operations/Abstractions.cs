@@ -76,6 +76,12 @@ public interface IDnsOps
     DnsRestoreOutcome Restore(Guid interfaceGuid, InterfaceDnsBackup? backup);
 
     void FlushCache();
+
+    /// <summary>IPv6-список DNS адаптера; null — IPv6-настроек нет или они не читаются.</summary>
+    string? ReadNameServerV6(Guid interfaceGuid);
+
+    /// <summary>Сбрасывает выбранные списки DNS адаптера на «автоматически» (DHCP). false — IPv6-список не записан.</summary>
+    bool ResetToAutomatic(Guid interfaceGuid, bool v4, bool v6);
 }
 
 public interface IRasOps

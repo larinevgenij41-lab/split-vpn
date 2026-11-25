@@ -17,8 +17,9 @@ using SplitVpn.Windows.Security;
 using SplitVpn.Windows.Wfp;
 
 var paths = ServicePaths.Default;
-if (args.Length > 0 && string.Equals(args[0], "recover", StringComparison.OrdinalIgnoreCase))
+if (args.Length > 0 && ServiceRecovery.IsRecoveryCommand(args[0]))
 {
+    // emergency-off (и прежнее «recover»), emergency-on, recover --uninstall-network: см. ServiceRecovery.
     return await ServiceRecovery.RunAsync(paths, ServiceRecovery.ParseMode(args));
 }
 
@@ -127,6 +128,9 @@ static ServiceDependencies CreateDependencies(ServicePaths paths, VerboseMode ve
         SubscribeWifiEvents = raise => WifiEventWatcher.Start(raise),
         WifiIncidentDirectory = paths.Logs,
         DisableWifiBadStateTracking = () => WcmBadStateTracking.Apply() == WcmBadStateTrackingResult.Disabled,
+        EmergencyFlag = SplitVpn.Core.Recovery.EmergencyRegistry.Read,
+        EnsureManualStart = () => SplitVpn.Service.Emergency.ServiceStartType.EnsureManual(ServicePaths.ServiceName) is { } previous ? "был тип запуска " + previous : null,
+        LoopbackResolverListeners = SplitVpn.Windows.Recovery.NetworkRecovery.LoopbackResolverListeners,
         IsMeteredNetwork = SystemSignals.IsMeteredNetwork,
     };
 }
@@ -201,7 +205,7 @@ internal sealed class CoordinatorHost(Coordinator coordinator, ILogger<Coordinat
         {
             // Без координатора служба бесполезна: фильтры WFP постоянные, трафик остаётся заблокированным,
             // а DNS-посредник не отвечает. Ненулевой код завершения — сигнал SCM перезапустить службу
-            // (действия восстановления 5 с / 5 с / 30 с).
+            // (действия восстановления 5 с / 5 с / 5 с, см. installer\Package.wxs).
             logger.LogCritical(ex, "Цикл координатора остановлен ошибкой: служба завершается для перезапуска");
             await Log.CloseAndFlushAsync();
             Environment.Exit(1);

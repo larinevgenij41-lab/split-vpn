@@ -314,8 +314,10 @@ public sealed partial class SystemSshTunnelOps : ISshTunnelOps, IDisposable
     /// <summary>
     /// Завершает процессы движка, запущенные из этого файла: остались от упавшей службы (если Job не сработал)
     /// или мешают восстановлению сети. Чужой sing-box - из другой папки, от другой программы - не трогается.
+    /// <paramref name="exceptProcessId"/> — процесс, который не трогается (сама команда восстановления, запущенная из
+    /// того же файла, что и служба).
     /// </summary>
-    public static int StopOwn(string enginePath)
+    public static int StopOwn(string enginePath, int? exceptProcessId = null)
     {
         var path = Path.GetFullPath(enginePath);
         var stopped = 0;
@@ -327,7 +329,8 @@ public sealed partial class SystemSshTunnelOps : ISshTunnelOps, IDisposable
                 var owned = false;
                 try
                 {
-                    if (!string.Equals(candidate.MainModule?.FileName, path, StringComparison.OrdinalIgnoreCase))
+                    if (candidate.Id == exceptProcessId
+                        || !string.Equals(Native.ProcessImage.TryGetPath(candidate), path, StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
@@ -355,6 +358,25 @@ public sealed partial class SystemSshTunnelOps : ISshTunnelOps, IDisposable
 
         if (failures.Count > 0) { throw new IOException(string.Join("; ", failures)); }
         return stopped;
+    }
+
+    /// <summary>Номера работающих процессов, запущенных из этого файла, кроме <paramref name="exceptProcessId"/>.</summary>
+    public static IReadOnlyList<int> FindOwn(string imagePath, int? exceptProcessId = null)
+    {
+        var path = Path.GetFullPath(imagePath);
+        var found = new List<int>();
+        foreach (var candidate in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(path)))
+        {
+            using (candidate)
+            {
+                if (candidate.Id != exceptProcessId && string.Equals(Native.ProcessImage.TryGetPath(candidate), path, StringComparison.OrdinalIgnoreCase))
+                {
+                    found.Add(candidate.Id);
+                }
+            }
+        }
+
+        return found;
     }
 
     public void Dispose() => _job.Dispose();

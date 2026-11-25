@@ -32,9 +32,16 @@ public sealed record RecoveryReport(
     public bool Success => Errors.Count == 0;
 }
 
+/// <summary>Итог одного шага восстановления: сколько снято, что сделано, что не получилось.</summary>
+public sealed record RecoveryStepResult(int Count, IReadOnlyList<string> Actions, IReadOnlyList<string> Errors)
+{
+    public bool Success => Errors.Count == 0;
+}
+
 /// <summary>
 /// Возвращает сеть в обычное состояние, снимая только изменения приложения. Идемпотентно:
-/// повторный запуск ничего не ломает. Работает без службы и без настроек.
+/// повторный запуск ничего не ломает. Работает без службы и без настроек. Шаги доступны и по отдельности —
+/// экстренное отключение выполняет каждый в своём потоке и со своим сроком.
 /// </summary>
 public static class NetworkRecovery
 {
@@ -46,17 +53,19 @@ public static class NetworkRecovery
         var errors = new List<string>();
         var dnsActions = new List<string>();
 
-        var closed = await Step(errors, "RAS", () => CloseConnectionsAsync(options.Phonebooks, errors, cancellationToken), 0);
-        closed += await Step(errors, "AnyConnect", () => Task.FromResult(SshTunnel.SystemSshTunnelOps.StopOwn(Path.Combine(options.ServiceDirectory, OpenConnect.SystemAnyConnectOps.HelperFileName))), 0);
-        // Движок «VPN поверх SSH» - только свой, из каталога программы: чужой sing-box другой программы не трогается.
-        closed += await Step(errors, "движок SSH", () => Task.FromResult(SshTunnel.SystemSshTunnelOps.StopOwn(
-            Path.Combine(options.ServiceDirectory, SshTunnel.SystemSshTunnelOps.EngineFileName))), 0);
-        var routes = await Step(errors, "маршруты", () => Task.FromResult(RemoveRoutes(errors)), 0);
-        await Step(errors, "DNS", () => Task.FromResult(RestoreDns(options, dnsActions, errors)), 0);
-        var filters = await Step(errors, "WFP", () => Task.FromResult(RemoveFilters(options.WfpIdentities, errors)), 0);
+        var closed = await Step(errors, "RAS", async () => Collect(await CloseConnectionsAsync(options.Phonebooks, cancellationToken), errors), 0);
+        closed += await Step(errors, "помощники", () => Task.FromResult(Collect(StopHelpers(options.ServiceDirectory), errors)), 0);
+        var routes = await Step(errors, "маршруты", () => Task.FromResult(Collect(RemoveRoutes(), errors)), 0);
+        await Step(errors, "DNS", () =>
+        {
+            var dns = RestoreDns(options, serviceStopped: false);
+            dnsActions.AddRange(dns.Actions);
+            return Task.FromResult(Collect(dns, errors));
+        }, 0);
+        var filters = await Step(errors, "WFP", () => Task.FromResult(Collect(RemoveFilters(options.WfpIdentities), errors)), 0);
         await Step(errors, "кеш DNS", () =>
         {
-            if (!InterfaceDnsOps.FlushResolverCache())
+            if (!FlushDns())
             {
                 errors.Add("кеш DNS: сброс не подтверждён — ipconfig /flushdns не завершился за 10 секунд");
             }
@@ -67,8 +76,22 @@ public static class NetworkRecovery
         return new RecoveryReport(closed, routes, filters, dnsActions, errors);
     }
 
-    private static async Task<int> CloseConnectionsAsync(IReadOnlyList<string> phonebooks, List<string> errors, CancellationToken cancellationToken)
+    private static int Collect(RecoveryStepResult result, List<string> errors)
     {
+        errors.AddRange(result.Errors);
+        return result.Count;
+    }
+
+    /// <summary>
+    /// Разрывает соединения RAS из телефонных книг программы. Свои соединения находятся перечислением всех соединений
+    /// и сравнением пути книги: саму книгу читать не нужно, поэтому шаг годится и для недоверенного каталога данных.
+    /// Записи книги не удаляются: по ним программа подключится снова после включения.
+    /// </summary>
+    public static async Task<RecoveryStepResult> CloseConnectionsAsync(IReadOnlyList<string> phonebooks, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(phonebooks);
+        var errors = new List<string>();
+        var actions = new List<string>();
         var ours = RasClient.EnumerateConnections()
             .Where(c => phonebooks.Any(p => RasClient.SamePhonebook(p, c.Phonebook)))
             .ToList();
@@ -80,6 +103,7 @@ public static class NetworkRecovery
             {
                 await RasClient.HangUpAsync(connection.Handle, cancellationToken);
                 closed++;
+                actions.Add($"разорвано «{connection.EntryName}»");
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
@@ -87,31 +111,62 @@ public static class NetworkRecovery
             }
         }
 
-        return closed;
+        return new RecoveryStepResult(closed, actions, errors);
     }
 
-    private static int RemoveRoutes(List<string> errors)
+    /// <summary>Помощники AnyConnect и движок «VPN поверх SSH» — только свои, из каталога программы.</summary>
+    public static RecoveryStepResult StopHelpers(string serviceDirectory)
     {
-        var result = RouteOps.RemoveAllMarked();
-        if (result.Failed > 0)
+        var errors = new List<string>();
+        var stopped = 0;
+        foreach (var (name, file) in new[]
         {
-            errors.Add("Не удалось удалить маршрутов: " + result.Failed + ". " + string.Join("; ", result.Errors));
+            ("AnyConnect", OpenConnect.SystemAnyConnectOps.HelperFileName),
+            ("движок SSH", SshTunnel.SystemSshTunnelOps.EngineFileName),
+        })
+        {
+            try
+            {
+                stopped += SshTunnel.SystemSshTunnelOps.StopOwn(Path.Combine(serviceDirectory, file));
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                errors.Add(name + ": " + ex.Message);
+            }
         }
 
-        return result.Removed;
+        return new RecoveryStepResult(stopped, stopped > 0 ? [$"завершено процессов: {stopped}"] : [], errors);
     }
+
+    /// <summary>Маршруты с меткой-метрикой программы.</summary>
+    public static RecoveryStepResult RemoveRoutes()
+    {
+        var result = RouteOps.RemoveAllMarked();
+        return new RecoveryStepResult(result.Removed, [],
+            result.Failed > 0 ? ["Не удалось удалить маршрутов: " + result.Failed + ". " + string.Join("; ", result.Errors)] : []);
+    }
+
+    /// <summary>Сброс системного кеша DNS; false — не подтверждён.</summary>
+    public static bool FlushDns() => InterfaceDnsOps.FlushResolverCache();
 
     /// <summary>
     /// Возвращает DNS всем адаптерам, а не только тем, у кого сейчас есть адрес: на выключенном Wi-Fi
-    /// иначе остался бы наш 127.0.0.1. Запись в копии — отметка того, что loopback поставила служба: при
-    /// исправном файле копии loopback адаптера без записи — статический DNS пользователя (свой резолвер), и он
-    /// не трогается, пока этот резолвер слушает порт 53 (<see cref="IsAbandonedLoopback"/>). Файла нет или он повреждён — отметок нет, и адаптеры, где стоит один loopback, сбрасываются
-    /// на DHCP. Записи копии, которым не нашлось адаптера, обрабатываются отдельно.
+    /// иначе остался бы наш 127.0.0.1. Запись в копии — отметка того, что loopback поставила служба. Адаптер без записи
+    /// решают правила <see cref="OrphanDns"/>: при работающей службе (<paramref name="serviceStopped"/> = false) и
+    /// исправном файле копии loopback без записи — статический DNS пользователя, пока его резолвер слушает порт 53;
+    /// при остановленной службе (экстренное отключение) или без копии — сбрасывается на DHCP всё, что выглядит нашим.
+    /// Записи копии, которым не нашлось адаптера, обрабатываются отдельно.
+    /// <para>При остановленной службе дополнительно: IPv6-список, который не вернулся из копии (на адаптере остался ::1),
+    /// сбрасывается на «автоматически», а список поиска адаптера без копии, состоящий только из наших суффиксов, очищается.</para>
     /// </summary>
-    private static int RestoreDns(RecoveryOptions options, List<string> actions, List<string> errors)
+    public static RecoveryStepResult RestoreDns(RecoveryOptions options, bool serviceStopped)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        var actions = new List<string>();
+        var errors = new List<string>();
         var marksKnown = false;
         var backups = new Dictionary<Guid, InterfaceDnsBackup>();
+        var all = new List<InterfaceDnsBackup>();
         var owners = new Dictionary<Guid, List<DnsBackupStore>>();
         foreach (var path in new[] { options.DnsBackupPath, options.AdditionalDnsBackupPath }.OfType<string>().Where(File.Exists))
         {
@@ -128,6 +183,7 @@ public static class NetworkRecovery
             marksKnown |= valid;
             foreach (var (id, backup) in entries)
             {
+                all.Add(backup);
                 if (!owners.TryGetValue(id, out var stores))
                 {
                     stores = [];
@@ -142,8 +198,9 @@ public static class NetworkRecovery
             }
         }
 
+        var ourSuffixes = OrphanDns.OurSuffixes(all);
         var handled = new HashSet<Guid>();
-        var resolverListening = new Lazy<bool>(LoopbackResolverListening);
+        var listeners = new Lazy<(bool V4, bool V6)>(LoopbackResolverListeners);
         IReadOnlyList<SplitVpn.Core.Net.AdapterCandidate> adapters;
         try
         {
@@ -158,51 +215,85 @@ public static class NetworkRecovery
         foreach (var adapter in adapters)
         {
             handled.Add(adapter.InterfaceGuid);
-            backups.TryGetValue(adapter.InterfaceGuid, out var backup);
-            if (backup is null && marksKnown && !IsAbandonedLoopback(adapter.InterfaceGuid, resolverListening, [.. adapter.Addresses.Select(SplitVpn.Core.Net.Ipv4.Format)]))
+            if (backups.TryGetValue(adapter.InterfaceGuid, out var backup))
             {
+                RestoreAdapterDns(owners.GetValueOrDefault(adapter.InterfaceGuid), adapter.InterfaceGuid, adapter.Name, backup, serviceStopped, present: true, actions, errors);
                 continue;
             }
 
-            RestoreAdapterDns(owners.GetValueOrDefault(adapter.InterfaceGuid), adapter.InterfaceGuid, adapter.Name, backup, actions, errors);
+            ResetOrphanAdapter(adapter.InterfaceGuid, adapter.Name, serviceStopped || !marksKnown, serviceStopped ? ourSuffixes : null, listeners, actions, errors);
         }
 
         foreach (var backup in backups.Values.Where(b => !handled.Contains(b.InterfaceGuid)))
         {
-            RestoreAdapterDns(owners[backup.InterfaceGuid], backup.InterfaceGuid, "интерфейс " + backup.InterfaceGuid, backup, actions, errors);
+            RestoreAdapterDns(owners[backup.InterfaceGuid], backup.InterfaceGuid, "интерфейс " + backup.InterfaceGuid, backup, serviceStopped, present: false, actions, errors);
         }
 
-        return actions.Count;
+        return new RecoveryStepResult(actions.Count, actions, errors);
     }
 
-    /// <summary>
-    /// Адаптер без записи в копии всё же сбрасывается на DHCP, если на нём ровно наш набор (IPv4 — только
-    /// 127.0.0.1, IPv6 — пусто или только ::1) и на 127.0.0.1:53 никто не слушает UDP. Запись бывает
-    /// потеряна и при исправном файле: повреждённая копия уходит в .corrupt-* и заменяется пустой, а адаптер
-    /// туннеля получает loopback вовсе без записи. Без посредника такой DNS не разрешает ни одного имени.
-    /// Работающий резолвер пользователя на 127.0.0.1 не трогается: его выдаёт слушатель порта 53. Слушатель
-    /// берётся из таблицы UDP (GetExtendedUdpTable через IPGlobalProperties), а не пробной привязкой к
-    /// порту 53: проба на мгновение заняла бы порт у резолвера, стартующего в этот момент.
-    /// </summary>
-    private static bool IsAbandonedLoopback(Guid interfaceGuid, Lazy<bool> resolverListening, IReadOnlyCollection<string> ownAddresses)
+    /// <summary>Адаптер без записи в копии: см. <see cref="OrphanDns.Decide"/>. У части интерфейсов (loopback, Teredo) DNS-настроек нет.</summary>
+    private static void ResetOrphanAdapter(Guid interfaceGuid, string name, bool serviceStopped, IReadOnlySet<string>? ourSuffixes,
+        Lazy<(bool V4, bool V6)> listeners, List<string> actions, List<string> errors)
     {
         try
         {
-            // С 0.17.9 набор посредника на основном адаптере - «адрес адаптера, 127.0.0.1».
-            var v4 = InterfaceDnsOps.Read(interfaceGuid, ipv6: false).NameServer;
-            var v6 = InterfaceDnsOps.TryReadIpv6(interfaceGuid)?.NameServer ?? "";
-            return InterfaceDnsOps.IsOnlyProxyLoopback(v4, v6, ownAddresses) && !resolverListening.Value;
+            InterfaceDnsState v4;
+            try
+            {
+                v4 = InterfaceDnsOps.Read(interfaceGuid, ipv6: false);
+            }
+            catch (NativeCallException)
+            {
+                // Нет DNS-настроек (loopback, Teredo) — сбрасывать нечего.
+                return;
+            }
+
+            var v6 = InterfaceDnsOps.TryReadIpv6(interfaceGuid, warn: false)?.NameServer;
+            var looksOurs = InterfaceDnsOps.IsProxySet(v4.NameServer) || (v6 is not null && InterfaceDnsOps.IsLoopback(v6));
+            var reset = looksOurs
+                ? OrphanDns.Decide(v4.NameServer, v6, serviceStopped, listeners.Value.V4, listeners.Value.V6)
+                : default;
+            if (reset.V4)
+            {
+                InterfaceDnsOps.SetNameServer(interfaceGuid, "", ipv6: false);
+                actions.Add($"{name}: DNS «{v4.NameServer}» без копии — сброшен, DNS по DHCP");
+            }
+
+            if (reset.V6)
+            {
+                if (InterfaceDnsOps.TrySetIpv6NameServer(interfaceGuid, ""))
+                {
+                    actions.Add($"{name}: IPv6 DNS «{v6}» без копии — сброшен на автоматический");
+                }
+                else
+                {
+                    errors.Add($"DNS «{name}»: IPv6-список «{v6}» не сброшен");
+                }
+            }
+
+            if (ourSuffixes is not null && OrphanDns.ShouldClearSearchList(v4.SearchList, ourSuffixes))
+            {
+                InterfaceDnsOps.SetSearchList(interfaceGuid, "");
+                actions.Add($"{name}: список суффиксов «{v4.SearchList}» программы очищен");
+            }
         }
-        catch (NativeCallException)
+        catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            // Нет DNS-настроек (loopback, Teredo) — сбрасывать нечего.
-            return false;
+            errors.Add($"DNS «{name}»: {ex.Message}");
         }
     }
 
-    /// <summary>Слушатель UDP на 127.0.0.1:53 или на всех адресах (он получает и запросы к 127.0.0.1).</summary>
-    private static bool LoopbackResolverListening() =>
-        IPGlobalProperties.GetIPGlobalProperties().GetActiveUdpListeners().Any(ServesLoopbackResolver);
+    /// <summary>
+    /// Слушатели UDP-порта 53, которым доходят запросы к 127.0.0.1 и к [::1]. Слушатель берётся из таблицы UDP
+    /// (GetExtendedUdpTable через IPGlobalProperties), а не пробной привязкой к порту 53: проба на мгновение заняла бы
+    /// порт у резолвера, стартующего в этот момент.
+    /// </summary>
+    public static (bool V4, bool V6) LoopbackResolverListeners()
+    {
+        var listeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveUdpListeners();
+        return (listeners.Any(ServesLoopbackResolver), listeners.Any(ServesIpv6LoopbackResolver));
+    }
 
     /// <summary>
     /// Слушатель порта 53, которому доходят запросы к 127.0.0.1: на 127.0.0.1, на 0.0.0.0 или на [::] — сокет
@@ -213,26 +304,38 @@ public static class NetworkRecovery
         listener.Port == 53 && (listener.Address.Equals(IPAddress.Loopback) || listener.Address.Equals(IPAddress.Any)
             || listener.Address.Equals(IPAddress.IPv6Any) || listener.Address.Equals(IPAddress.Loopback.MapToIPv6()));
 
-    /// <summary>Сбой на одном адаптере не должен останавливать восстановление остальных и шаг WFP.</summary>
-    private static void RestoreAdapterDns(List<DnsBackupStore>? stores, Guid interfaceGuid, string name, InterfaceDnsBackup? backup, List<string> actions, List<string> errors)
+    /// <summary>Слушатель порта 53, которому доходят запросы к [::1]: на [::1] или на [::].</summary>
+    internal static bool ServesIpv6LoopbackResolver(IPEndPoint listener) =>
+        listener.Port == 53 && (listener.Address.Equals(IPAddress.IPv6Loopback) || listener.Address.Equals(IPAddress.IPv6Any));
+
+    /// <summary>Сбой на одном адаптере не должен останавливать восстановление остальных.</summary>
+    private static void RestoreAdapterDns(List<DnsBackupStore>? stores, Guid interfaceGuid, string name, InterfaceDnsBackup backup, bool serviceStopped,
+        bool present, List<string> actions, List<string> errors)
     {
         try
         {
             var outcome = TryRestore(interfaceGuid, backup);
+            if (outcome == DnsRestoreOutcome.Incomplete && serviceStopped && InterfaceDnsOps.TrySetIpv6NameServer(interfaceGuid, ""))
+            {
+                // Служба остановлена: ::1 без посредника не отвечает. Исходный IPv6-список вернуть не удалось — лучше
+                // «автоматически», чем мёртвый ::1; IPv4 уже возвращён, и копия больше ничего не вернёт.
+                actions.Add($"{name}: IPv4 DNS восстановлен, IPv6 DNS сброшен на автоматический (исходный «{backup.NameServerV6}» вернуть не удалось)");
+                Forget(stores, interfaceGuid);
+                return;
+            }
+
             if (outcome != DnsRestoreOutcome.NothingToRestore)
             {
                 actions.Add($"{name}: {Describe(outcome, backup)}");
             }
 
-            if (outcome == DnsRestoreOutcome.Restored)
+            if (outcome == DnsRestoreOutcome.Restored
+                || (serviceStopped && present && outcome is DnsRestoreOutcome.ChangedByUser or DnsRestoreOutcome.NothingToRestore))
             {
-                if (stores is not null)
-                {
-                    foreach (var store in stores)
-                    {
-                        store.Remove(interfaceGuid);
-                    }
-                }
+                // Своё вернули — копия больше не нужна. При остановленной службе не нужна и копия адаптера, на котором
+                // уже не наш DNS: устаревшая копия вернула бы потом давно сменённые серверы. Копия адаптера, которого сейчас
+                // нет (отключённый USB-адаптер), остаётся: он может вернуться с нашим loopback.
+                Forget(stores, interfaceGuid);
             }
             else if (outcome == DnsRestoreOutcome.Incomplete)
             {
@@ -243,6 +346,14 @@ public static class NetworkRecovery
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             errors.Add($"DNS «{name}»: {ex.Message}");
+        }
+    }
+
+    private static void Forget(List<DnsBackupStore>? stores, Guid interfaceGuid)
+    {
+        foreach (var store in stores ?? [])
+        {
+            store.Remove(interfaceGuid);
         }
     }
 
@@ -276,9 +387,15 @@ public static class NetworkRecovery
         }
     }
 
-    /// <summary>Фильтры каждого провайдера снимаются, даже если у предыдущего удаление не удалось; первый сбой - в конце.</summary>
-    private static int RemoveFilters(IReadOnlyList<WfpIdentity> identities, List<string> errors)
+    /// <summary>
+    /// Фильтры каждого провайдера снимаются, даже если у предыдущего удаление не удалось. Очистка проверяет себя
+    /// перечислением, не зависящим от слоёв: «успех» при оставшихся фильтрах оставлял бы блокировку трафика без
+    /// единого сообщения (так было в 0.17.2).
+    /// </summary>
+    public static RecoveryStepResult RemoveFilters(IReadOnlyList<WfpIdentity> identities)
     {
+        ArgumentNullException.ThrowIfNull(identities);
+        var errors = new List<string>();
         using var engine = WfpEngine.Open(dynamicSession: false);
         var removed = 0;
         foreach (var identity in identities)
@@ -286,8 +403,6 @@ public static class NetworkRecovery
             try
             {
                 removed += WfpOps.DeleteAll(engine, identity);
-                // Очистка проверяет себя перечислением, не зависящим от слоёв: «успех» при оставшихся
-                // фильтрах оставлял бы блокировку трафика без единого сообщения (так было в 0.17.2).
                 var left = WfpOps.ListFiltersEverywhere(engine, identity).Count;
                 if (left > 0)
                 {
@@ -300,7 +415,7 @@ public static class NetworkRecovery
             }
         }
 
-        return removed;
+        return new RecoveryStepResult(removed, [], errors);
     }
 
     private static string Describe(DnsRestoreOutcome outcome, InterfaceDnsBackup? backup) => outcome switch

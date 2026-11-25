@@ -370,6 +370,7 @@ public sealed partial class Coordinator
         {
             return IpcResponse.Failure(IpcErrorCodes.BadRequest, "Версия приложения несовместима со службой. Обновите оба компонента.");
         }
+        if (RefuseWhileEmergencyOff(request) is { } refused) { return refused; }
         if (SettingsUnavailable(request) is { } unavailable) { return unavailable; }
         if (compatible && ServeWithoutQueue(request) is { } direct)
         {

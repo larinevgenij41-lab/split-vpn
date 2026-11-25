@@ -24,6 +24,8 @@ public sealed partial class Coordinator
     internal async Task<IpcResponse> HandleRequestAsync(IpcRequest request, CancellationToken cancellationToken) => request switch
     {
         _ when request.ContractVersion != IpcNames.ContractVersion => IpcResponse.Failure(IpcErrorCodes.BadRequest, "Версия приложения несовместима со службой. Обновите оба компонента."),
+        _ when RefuseWhileEmergencyOff(request) is { } refused => refused,
+        RecoverNetworkRequest when _emergency is not null => RecoverWhileEmergencyOff(),
         _ when SettingsUnavailable(request) is { } unavailable => unavailable,
         GetStatusRequest => IpcResponse.Success(BuildStatus()),
         GetEventsRequest events => IpcResponse.Success(_deps.Journal.Since(events.SinceId)),
@@ -1054,10 +1056,31 @@ public sealed partial class Coordinator
         _state = next;
         if (recoverNetwork) { Facts.ForceProtection = true; }
         await ReconcileAsync(cancellationToken);
-        if (recoverNetwork && Facts.PartialError is { } cleanupError)
+        var orphanProblems = new List<string>();
+        if (recoverNetwork)
         {
-            var message = saveFailure is null ? cleanupError : saveFailure + Environment.NewLine + cleanupError;
-            return IpcResponse.Failure(IpcErrorCodes.RecoveryIncomplete, message);
+            // Как у команды восстановления без службы: адаптеры, на которых наш DNS остался без копии (копия потеряна или
+            // повреждена), возвращаются на «автоматически», иначе после восстановления имена на них не разрешались бы.
+            try
+            {
+                ResetOrphanDns(serviceStopped: false, ourSuffixes: null, orphanProblems);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                orphanProblems.Add("DNS: " + ex.Message);
+            }
+
+            if (_dnsFlushPending)
+            {
+                _dnsFlushPending = false;
+                FlushDnsCacheSafely("восстановление сети");
+            }
+        }
+
+        if (recoverNetwork && (Facts.PartialError is not null || orphanProblems.Count > 0))
+        {
+            var parts = new[] { saveFailure, Facts.PartialError, orphanProblems.Count > 0 ? "DNS без копии: " + string.Join("; ", orphanProblems) : null };
+            return IpcResponse.Failure(IpcErrorCodes.RecoveryIncomplete, string.Join(Environment.NewLine, parts.OfType<string>()));
         }
         return saveFailure is null ? IpcResponse.Success(BuildStatus()) : IpcResponse.Failure(IpcErrorCodes.Failed, saveFailure);
     }

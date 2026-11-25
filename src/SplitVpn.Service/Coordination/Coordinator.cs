@@ -58,6 +58,7 @@ public sealed partial class Coordinator
         _settings = deps.Stores.LoadSettings(out var settingsError);
         if (deps.Stores.SettingsReadPending) { _settingsReadError = settingsError; }
         _state = deps.Stores.LoadState();
+        _emergency = ReadEmergencyFlag(deps);
         _geo = new GeoManager(deps);
         _bypass = new GeoManager(deps, GeoListKind.Bypass);
         _update = new UpdateManager(deps);
@@ -74,6 +75,13 @@ public sealed partial class Coordinator
         if (_deps.Stores.Migrated)
         {
             Journal("Сведения", "Настройки переведены на новую схему; прежний файл сохранён как " + Path.GetFileName(_deps.Stores.PreviousSchemaBackup) + ".");
+        }
+
+        if (_emergency is not null)
+        {
+            // Экстренное отключение: ни настройки Wi-Fi Windows, ни автоподключения, ни сверки (Coordinator.Emergency.cs).
+            StartInert();
+            return;
         }
 
         SetProgress("Загрузка настроек и списков адресов", 0);
@@ -125,6 +133,12 @@ public sealed partial class Coordinator
 
     internal async Task TickAsync(CancellationToken cancellationToken)
     {
+        if (_emergency is not null)
+        {
+            // «Пустая» служба: ни сверки, ни проверок соединений, ни загрузки списков и обновлений.
+            return;
+        }
+
         // Часы перевели назад: сроки, заданные по прежним часам, сдвигаются раньше всех проверок этого тика.
         DetectClockJumpBack();
         var now = _deps.Time.GetUtcNow();
@@ -366,6 +380,12 @@ public sealed partial class Coordinator
 
     internal ConnectionState DeriveState()
     {
+        if (_emergency is not null)
+        {
+            // «Пустая» служба после экстренного отключения ничего не держит: ни туннелей, ни защиты.
+            return ConnectionState.Disconnected;
+        }
+
         if (_state.ProtectionSuspended || _state.Intent != Intent.Connected)
         {
             if (Facts.PartialError is not null && !_state.ProtectionSuspended)
@@ -474,6 +494,8 @@ public sealed partial class Coordinator
             Intent = _state.Intent,
             ProtectionActive = Facts.AppliedFilters.TryGetValue(Core.Protection.FilterGroup.Base, out var installed) && installed.Count > 0,
             ProtectionSuspended = _state.ProtectionSuspended,
+            EmergencyOff = _emergency is not null,
+            EmergencyOffSinceUtc = _emergency?.SinceUtc,
             OutageMode = _settings.OutageMode,
             DefaultTargetName = _settings.TargetName(_settings.DefaultTarget),
             GeoTargetName = _settings.TargetName(_geo.HasBase ? _settings.GeoTarget : _settings.DefaultTarget),

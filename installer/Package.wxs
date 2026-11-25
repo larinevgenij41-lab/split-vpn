@@ -135,7 +135,10 @@
         </ServiceInstall>
         <!-- Пуск при установке, остановка при обновлении и удалении. При удалении службу останавливает
              и сама команда recover (с принудительным завершением по тайм-ауту). Recover стоит Before StopServices,
-             чтобы сбой остановки службы средствами MSI не оставил маршруты и фильтры WFP. -->
+             чтобы сбой остановки службы средствами MSI не оставил маршруты и фильтры WFP.
+             После экстренного отключения (emergency-off, отметка EmergencyOff в HKLM\Software\SplitVpn) установка
+             обновления или исправление ставят Start="auto" и запускают службу: она запускается «пустой», ничего не
+             применяет и сама возвращает себе ручной запуск (Coordinator.Emergency.cs). -->
         <ServiceControl Id="SplitVpnServiceControl" Name="SplitVpn" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
     </ComponentGroup>

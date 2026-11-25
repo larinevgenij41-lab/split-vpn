@@ -284,6 +284,16 @@ public static class IpcErrorCodes
     public const string Busy = "busy";
     public const string Failed = "failed";
     public const string RecoveryIncomplete = "recovery-incomplete";
+
+    /// <summary>
+    /// Программа экстренно отключена (StatusDto.EmergencyOff): служба отказывает в командах, которые меняли бы сеть,
+    /// подключались или ходили в интернет, с текстом <see cref="EmergencyOffMessage"/>.
+    /// </summary>
+    public const string EmergencyOff = "emergency-off";
+
+    public const string EmergencyOffMessage = "Программа экстренно отключена: служба ничего не меняет в сети и не подключается. "
+        + "Сначала включите программу снова — «Включить программу» в приложении или команда «SplitVpn.Service.exe emergency-on» "
+        + "от имени администратора, — затем нажмите «Подключить».";
 }
 
 public static class IpcSerializer
@@ -356,6 +366,16 @@ public sealed record StatusDto
     public bool ProtectionActive { get; init; }
 
     public bool ProtectionSuspended { get; init; }
+
+    /// <summary>
+    /// Программа экстренно отключена (флаг EmergencyOff в HKLM\Software\SplitVpn): служба запущена «пустой» — ничего не
+    /// применяет, не подключается и не ходит в сеть, а команды, меняющие это, отклоняет (IpcErrorCodes.EmergencyOff).
+    /// Поле добавлено без смены версии договора: прежний интерфейс его не читает, прежняя служба его не присылает (false).
+    /// </summary>
+    public bool EmergencyOff { get; init; }
+
+    /// <summary>Когда программу экстренно отключили; null — не отключена или время неизвестно.</summary>
+    public DateTimeOffset? EmergencyOffSinceUtc { get; init; }
 
     public OutageMode OutageMode { get; init; }
 

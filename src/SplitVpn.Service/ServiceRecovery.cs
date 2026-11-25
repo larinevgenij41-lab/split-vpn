@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
+using SplitVpn.Core.Recovery;
 using SplitVpn.Core.Settings;
 using SplitVpn.Windows.Diagnostics;
 using SplitVpn.Windows.Recovery;
@@ -12,7 +13,7 @@ namespace SplitVpn.Service;
 /// <summary>Что делает команда recover.</summary>
 public enum RecoveryMode
 {
-    /// <summary>«recover»: снять изменения в сети и приостановить защиту до «Подключить».</summary>
+    /// <summary>«recover» без ключей: то же, что «emergency-off» (экстренное отключение программы).</summary>
     Recover,
 
     /// <summary>
@@ -25,14 +26,21 @@ public enum RecoveryMode
     /// «recover ‐‐uninstall-network»: шаг удаления программы в установщике (до StopServices). Сеть возвращается, а
     /// данные и ключ реестра остаются: их удаляет отдельное действие установщика уже после фиксации удаления
     /// (Execute="commit"), чтобы отменённое или откаченное удаление вернуло программу с настройками и паролями.
-    /// Разрешение на это удаление — значение <see cref="PurgeMarkName"/> в ключе программы.
+    /// Разрешение на это удаление — значение <see cref="ServiceRecovery.PurgeMarkName"/> в ключе программы.
     /// </summary>
     UninstallNetwork,
+
+    /// <summary>«emergency-off»: экстренное отключение (см. <see cref="Emergency.EmergencyOrchestrator"/>).</summary>
+    EmergencyOff,
+
+    /// <summary>«emergency-on»: снять экстренное отключение и запустить службу.</summary>
+    EmergencyOn,
 }
 
 /// <summary>
-/// Команда «SplitVpn.Service.exe recover»: приостанавливает защиту, останавливает службу без её
-/// автоперезапуска и снимает все изменения приложения. Флаг приостановки снимается действием «Подключить».
+/// Команды восстановления SplitVpn.Service.exe: экстренное отключение и включение программы (emergency-off/-on, recover)
+/// и сетевой шаг удаления программы (recover ‐‐uninstall-network). Шаги и их порядок — в
+/// <see cref="Emergency.EmergencyOrchestrator"/>; здесь — разбор команды, отчёт и действия удаления с данными.
 /// </summary>
 public static class ServiceRecovery
 {
@@ -44,20 +52,37 @@ public static class ServiceRecovery
     /// </summary>
     internal const string PurgeMarkName = "PurgeData";
 
-    /// <summary>Режим по аргументам после «recover».</summary>
-    public static RecoveryMode ParseMode(IReadOnlyCollection<string> args) =>
-        args.Contains("--uninstall-network", StringComparer.OrdinalIgnoreCase) ? RecoveryMode.UninstallNetwork
-        : args.Contains("--uninstall", StringComparer.OrdinalIgnoreCase) ? RecoveryMode.Uninstall
-        : RecoveryMode.Recover;
+    /// <summary>Первый аргумент — команда восстановления.</summary>
+    public static bool IsRecoveryCommand(string argument) =>
+        string.Equals(argument, EmergencyCommands.RecoverAlias, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(argument, EmergencyCommands.Off, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(argument, EmergencyCommands.On, StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>Сторож времени: удаление программы не должно висеть на зависшем восстановлении.</summary>
+    /// <summary>Режим по аргументам (первый — сама команда).</summary>
+    public static RecoveryMode ParseMode(IReadOnlyList<string> args)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+        var command = args.Count > 0 ? args[0] : "";
+        if (string.Equals(command, EmergencyCommands.On, StringComparison.OrdinalIgnoreCase))
+        {
+            return RecoveryMode.EmergencyOn;
+        }
+
+        if (string.Equals(command, EmergencyCommands.Off, StringComparison.OrdinalIgnoreCase))
+        {
+            return RecoveryMode.EmergencyOff;
+        }
+
+        return args.Contains("--uninstall-network", StringComparer.OrdinalIgnoreCase) ? RecoveryMode.UninstallNetwork
+            : args.Contains("--uninstall", StringComparer.OrdinalIgnoreCase) ? RecoveryMode.Uninstall
+            : RecoveryMode.Recover;
+    }
+
+    /// <summary>Сторож времени удаления программы: оставшиеся шаги пропускаются, удаление не висит на восстановлении.</summary>
     private static readonly TimeSpan Watchdog = TimeSpan.FromMinutes(3);
 
     /// <summary>Запас на завершение уже начатых шагов после срабатывания сторожа.</summary>
-    private static readonly TimeSpan WatchdogGrace = TimeSpan.FromSeconds(15);
-
-    /// <summary>Код sc.exe «служба не установлена» (ERROR_SERVICE_DOES_NOT_EXIST).</summary>
-    private const int ServiceDoesNotExist = 1060;
+    private static readonly TimeSpan WatchdogGrace = TimeSpan.FromSeconds(30);
 
     /// <summary>
     /// Если срок восстановления уже истёк, отложенная работа не начинает очистку данных.
@@ -67,9 +92,13 @@ public static class ServiceRecovery
 
     public static async Task<int> RunAsync(ServicePaths paths, RecoveryMode mode)
     {
-        var uninstall = mode != RecoveryMode.Recover;
+        if (mode is RecoveryMode.Recover or RecoveryMode.EmergencyOff or RecoveryMode.EmergencyOn)
+        {
+            return await RunEmergencyAsync(paths, mode == RecoveryMode.EmergencyOn);
+        }
+
         using var deadline = new CancellationTokenSource(Watchdog);
-        var work = Task.Run(() => RunCoreAsync(paths, mode, deadline.Token), CancellationToken.None);
+        var work = Task.Run(() => RunUninstallAsync(paths, mode, deadline.Token), CancellationToken.None);
         try
         {
             return await work.WaitAsync(Watchdog + WatchdogGrace, CancellationToken.None);
@@ -82,54 +111,64 @@ public static class ServiceRecovery
             }
 
             Console.Error.WriteLine($"Восстановление сети не уложилось в {(int)Watchdog.TotalMinutes} мин и прервано.");
-            if (uninstall) WriteUninstallLog("Восстановление сети не уложилось в отведённое время и прервано.", trusted: false);
+            WriteUninstallLog("Восстановление сети не уложилось в отведённое время и прервано.", trusted: false);
             return 1;
         }
         catch (Exception ex)
         {
-            // Ни зависание, ни неожиданная ошибка не должны оставить удаление программы без ответа:
-            // выходим с ненулевым кодом, вернув службе автоперезапуск, если успели его сбросить.
+            // Ни зависание, ни неожиданная ошибка не должны оставить удаление программы без ответа.
             Console.Error.WriteLine("Восстановление сети прервано ошибкой: " + ex.Message);
-            if (uninstall) WriteUninstallLog("Восстановление сети прервано ошибкой: " + ex.Message, trusted: false);
+            WriteUninstallLog("Восстановление сети прервано ошибкой: " + ex.Message, trusted: false);
             return 1;
         }
     }
 
-    private static async Task<int> RunCoreAsync(ServicePaths paths, RecoveryMode mode, CancellationToken cancellationToken)
+    /// <summary>
+    /// Экстренное отключение или включение: отчёт — в stdout и в защищённый каталог (<see cref="EmergencyReportFiles"/>),
+    /// код завершения — <see cref="EmergencyExitCodes"/>. У каждого шага свой срок, поэтому общего сторожа нет.
+    /// </summary>
+    private static async Task<int> RunEmergencyAsync(ServicePaths paths, bool on)
+    {
+        try
+        {
+            var system = new Emergency.SystemEmergency(paths, AppContext.BaseDirectory);
+            var orchestrator = new Emergency.EmergencyOrchestrator(system, new Emergency.EmergencyOptions());
+            var report = on ? await orchestrator.OnAsync(CancellationToken.None) : await orchestrator.OffAsync(CancellationToken.None);
+            var json = JsonSerializer.Serialize(report, JsonDefaults.Options);
+            Console.WriteLine(json);
+            if (report.ExitCode is not (EmergencyExitCodes.NotElevated or EmergencyExitCodes.Busy))
+            {
+                // Без прав администратора в защищённый каталог не записать, а при занятой блокировке отчёт пишет та команда.
+                if (Emergency.EmergencyReportWriter.Write(EmergencyReportFiles.DefaultDirectory, json,
+                    Emergency.EmergencyReportWriter.SecureDirectory, HasTrustedOwner, Console.Error.WriteLine) is { } path)
+                {
+                    Console.Error.WriteLine("Отчёт: " + path);
+                }
+            }
+
+            Console.Error.WriteLine(report.Summary);
+            return report.ExitCode;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("Команда прервана непредвиденной ошибкой: " + ex.Message);
+            return EmergencyExitCodes.Unexpected;
+        }
+    }
+
+    private static async Task<int> RunUninstallAsync(ServicePaths paths, RecoveryMode mode, CancellationToken cancellationToken)
     {
         // Разрешение удалить данные даёт только этот запуск: прежнее (от отменённого удаления) снимается первым делом.
         // Не снялось - сеть всё равно возвращается (без неё удаление оставило бы человека без интернета), а сбой
         // попадает в журнал удаления.
-        var staleMarkCleared = mode == RecoveryMode.Recover || TryStep("прежняя отметка очистки данных", ClearPurgeMark);
+        var staleMarkCleared = TryStep("прежняя отметка очистки данных", ClearPurgeMark);
 
-        // Сначала останавливаем службу, а потом пишем флаг приостановки: иначе работающая служба успевает
-        // сохранить своё состояние поверх флага и после перезапуска снова применяет защиту.
-        // Остановку пропускает только ответ «службы нет»: сбой, отказ в доступе или зависание sc.exe не значат,
-        // что служба не работает, — снятые изменения она тут же применила бы снова, а при удалении у неё
-        // из-под ног удалились бы данные. Тогда восстановление не выполняется и завершается ошибкой.
-        var query = RunSc($"query {ServicePaths.ServiceName}");
-        if (query is not (0 or ServiceDoesNotExist))
-        {
-            Console.Error.WriteLine(string.Create(CultureInfo.InvariantCulture,
-                $"Состояние службы не получено (sc query: код {query}): восстановление сети не выполнено."));
-            return 1;
-        }
-
-        var serviceExists = query == 0;
-        if (serviceExists)
-        {
-            StopService(cancellationToken);
-        }
-
-        var trusted = TrySecureRecoveryRoot(paths.Root, SecretStore.SecureDataRoot);
-        var suspended = trusted && SuspendProtection(paths);
-
-        var report = await NetworkRecovery.RunAsync(new RecoveryOptions
-        {
-            Phonebooks = trusted ? [paths.Phonebook] : [],
-            WfpIdentities = [WfpIdentity.Product],
-            DnsBackupPath = trusted ? paths.DnsBackup : null,
-        }, cancellationToken);
+        // Те же шаги, что у экстренного отключения (остановка службы с запасными путями, затем сеть, начиная с WFP), но без
+        // отметки отключения и без смены типа запуска: удаление, которое отменят, вернёт программу как была. Флаг
+        // приостановки защиты в состоянии остаётся: служба после отмены ничего не применит до «Подключить».
+        var system = new Emergency.SystemEmergency(paths, AppContext.BaseDirectory);
+        var orchestrator = new Emergency.EmergencyOrchestrator(system, new Emergency.EmergencyOptions { ProceedWhenBusy = true });
+        var report = await orchestrator.UninstallNetworkAsync(cancellationToken);
 
         lock (FinishGate)
         {
@@ -142,21 +181,12 @@ public static class ServiceRecovery
 
         var json = JsonSerializer.Serialize(report, JsonDefaults.Options);
         Console.WriteLine(json);
-        if (mode == RecoveryMode.Recover)
-        {
-            return report.Success && suspended ? 0 : 1;
-        }
 
-        // Удаление программы. Флаг приостановки, записанный выше, остаётся: если удаление отменят, служба (её
-        // остановил recover, а не MSI, поэтому откат может её и не запустить — тогда она стартует при загрузке)
-        // ничего не применит до «Подключить», как после обычного восстановления; настройки и пароли при этом целы.
-        // Данные удаляются, только если сеть возвращена полностью: иначе копия исходных DNS ещё нужна
-        // повторному восстановлению. Каталог, который не удалось защитить, не удаляется рекурсивно.
-        // Настройка Wi-Fi Windows возвращается при любом исходе: она не зависит от сети и данных программы, а
-        // прежнее значение записано в ключе программы, который удаляется позже. При отмене удаления служба
-        // при следующем запуске ставит её снова.
-        var wifiRestored = TryStep("настройка Wi-Fi Windows", RestoreWifiBadStateTracking);
-        var cleanable = report.Success && trusted && wifiRestored && staleMarkCleared;
+        // Данные удаляются, только если сеть возвращена полностью (вместе с настройкой Wi-Fi Windows) и служба
+        // подтверждённо остановлена: иначе копия исходных DNS ещё нужна повторному восстановлению, а работающая служба
+        // осталась бы без данных. Каталог, который не удалось защитить, не удаляется рекурсивно.
+        var trusted = system.Trusted;
+        var cleanable = report.NetworkClean && report.ServiceConfirmed && trusted && staleMarkCleared;
         bool cleaned;
         if (mode == RecoveryMode.UninstallNetwork)
         {
@@ -217,42 +247,52 @@ public static class ServiceRecovery
     /// в службе — <see cref="SecretStore.SecureDataRoot"/>). Файл — с уникальным именем и FileMode.CreateNew:
     /// заранее созданный объект с тем же именем не открывается.
     /// </summary>
-    internal static string? WriteUninstallLog(string directory, string text, Func<string, IReadOnlyList<string>> secure, Func<DirectoryInfo, bool> trustedOwner)
+    internal static string? WriteUninstallLog(string directory, string text, Func<string, IReadOnlyList<string>> secure, Func<DirectoryInfo, bool> trustedOwner) =>
+        WriteProtectedFile(directory, string.Create(CultureInfo.InvariantCulture, $"uninstall-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.log"),
+            text, secure, trustedOwner, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true), "Журнал удаления", Console.Error.WriteLine);
+
+    /// <summary>
+    /// Новый файл <paramref name="fileName"/> в защищённом каталоге (журнал удаления, отчёт экстренного отключения); null — не
+    /// записан, причина ушла в <paramref name="warn"/>. Правила — у <see cref="WriteUninstallLog(string, string, Func{string, IReadOnlyList{string}}, Func{DirectoryInfo, bool})"/>.
+    /// </summary>
+    internal static string? WriteProtectedFile(string directory, string fileName, string text, Func<string, IReadOnlyList<string>> secure,
+        Func<DirectoryInfo, bool> trustedOwner, System.Text.Encoding encoding, string what, Action<string> warn)
     {
+        ArgumentNullException.ThrowIfNull(secure);
+        ArgumentNullException.ThrowIfNull(warn);
         try
         {
             if (ForeignLogDirectory(directory, trustedOwner) is { } before)
             {
-                Console.Error.WriteLine($"Журнал удаления не записан: каталог {directory} {before}.");
+                warn($"{what} не записан: каталог {directory} {before}.");
                 return null;
             }
 
-            foreach (var warning in secure(directory)) Console.Error.WriteLine(warning);
+            foreach (var warning in secure(directory)) warn(warning);
 
             // Каталог мог появиться между проверкой и созданием: после защиты он проверяется ещё раз.
             var after = Directory.Exists(directory) ? ForeignLogDirectory(directory, trustedOwner) : "не создан";
             if (after is not null)
             {
-                Console.Error.WriteLine($"Журнал удаления не записан: каталог {directory} {after}.");
+                warn($"{what} не записан: каталог {directory} {after}.");
                 return null;
             }
 
-            var path = Path.Combine(directory, string.Create(CultureInfo.InvariantCulture,
-                $"uninstall-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.log"));
+            var path = Path.Combine(directory, fileName);
             using var stream = new FileStream(path, new FileStreamOptions
             {
                 Mode = FileMode.CreateNew,
                 Access = FileAccess.Write,
                 Share = FileShare.None,
             });
-            using var writer = new StreamWriter(stream, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            using var writer = new StreamWriter(stream, encoding);
             writer.Write(text);
             return path;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException
             or System.ComponentModel.Win32Exception or InvalidOperationException)
         {
-            Console.Error.WriteLine("Журнал удаления не записан: " + ex.Message);
+            warn($"{what} не записан: " + ex.Message);
             return null;
         }
     }
@@ -279,7 +319,7 @@ public static class ServiceRecovery
         return trustedOwner(info) ? null : "принадлежит посторонней учётной записи";
     }
 
-    private static bool HasTrustedOwner(DirectoryInfo directory) =>
+    internal static bool HasTrustedOwner(DirectoryInfo directory) =>
         directory.GetAccessControl(System.Security.AccessControl.AccessControlSections.Owner)
                 .GetOwner(typeof(System.Security.Principal.SecurityIdentifier)) is System.Security.Principal.SecurityIdentifier owner
             && (owner.IsWellKnown(System.Security.Principal.WellKnownSidType.LocalSystemSid)
@@ -353,43 +393,6 @@ public static class ServiceRecovery
     }
 
     /// <summary>
-    /// Флаг приостановки защиты: служба после запуска ничего не применяет до действия «Подключить».
-    /// Повреждённое или недоступное состояние не отменяет восстановление — снять изменения важнее.
-    /// </summary>
-    private static bool SuspendProtection(ServicePaths paths)
-    {
-        try
-        {
-            var stores = new ServiceStores(paths) { OnCorrupt = file => Console.Error.WriteLine(file.Describe()) };
-            stores.SaveState(stores.LoadState() with { ProtectionSuspended = true });
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine("Флаг приостановки защиты не записан: " + ex.Message);
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Возвращает настройку диспетчера подключений Windows, которую служба меняет при запуске
-    /// (<see cref="Windows.Net.WcmBadStateTracking"/>). Только при удалении программы: после простого
-    /// восстановления сети служба запустится снова и поставила бы её заново.
-    /// </summary>
-    private static void RestoreWifiBadStateTracking()
-    {
-        try
-        {
-            Windows.Net.WcmBadStateTracking.Restore();
-        }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException or IOException)
-        {
-            throw new IOException("Настройка EnableBadStateTracking не возвращена: " + ex.Message, ex);
-        }
-    }
-
-    /// <summary>При удалении программы данные (настройки, секреты, база, журналы) не остаются на диске.</summary>
-    /// <summary>
     /// Ключ программы в реестре (каталог данных, имя канала, срок подробного журнала) удаляется здесь, при настоящем
     /// удалении: MSI удалял бы его и при обновлении (оно удаляет прежнюю версию целиком), и включённый подробный
     /// журнал выключался бы установкой обновления.
@@ -426,47 +429,6 @@ public static class ServiceRecovery
     /// </summary>
     internal static readonly TimeSpan StopWaitBeforeKill = CoordinatorHost.ShutdownTimeout + TimeSpan.FromSeconds(2);
 
-    private static void StopService(CancellationToken cancellationToken)
-    {
-        var (pid, _) = SystemMetrics.ServiceStatus(ServicePaths.ServiceName);
-        RunSc($"stop {ServicePaths.ServiceName}");
-        var waiting = Stopwatch.StartNew();
-        while (!cancellationToken.IsCancellationRequested && waiting.Elapsed < StopWaitBeforeKill
-            && SystemMetrics.ServiceStatus(ServicePaths.ServiceName).State != "SERVICE_STOPPED")
-        {
-            Thread.Sleep(500);
-        }
-
-        cancellationToken.ThrowIfCancellationRequested();
-        var (currentPid, state) = SystemMetrics.ServiceStatus(ServicePaths.ServiceName);
-        if (state == "SERVICE_STOPPED") return;
-        if (pid == 0 || currentPid != pid) throw new InvalidOperationException("Во время остановки изменился процесс службы.");
-        using var policy = ServiceFailurePolicy.Suspend(ServicePaths.ServiceName);
-        try
-        {
-            using var process = Process.GetProcessById((int)pid);
-            // Удерживаем дескриптор процесса и сверяем PID повторно, исключая его переиспользование.
-            _ = process.Handle;
-            if (SystemMetrics.ServiceStatus(ServicePaths.ServiceName).ProcessId != pid)
-                throw new InvalidOperationException("Во время остановки изменился процесс службы.");
-            process.Kill();
-            if (!process.WaitForExit(10_000))
-                throw new TimeoutException("Процесс службы не завершился.");
-        }
-        catch (ArgumentException)
-        {
-            // Процесс уже завершился.
-        }
-
-        for (var i = 0; i < 20; i++)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (SystemMetrics.ServiceStatus(ServicePaths.ServiceName).State == "SERVICE_STOPPED") return;
-            Thread.Sleep(250);
-        }
-        throw new TimeoutException("Диспетчер служб не подтвердил остановку службы.");
-    }
-
     /// <summary>
     /// sc.exe — полным путём из System32 и с рабочим каталогом System32: по голому имени CreateProcess ищет файл
     /// и в текущем каталоге, а команду запускает SYSTEM (установщик), и подложенный там sc.exe выполнился бы от его имени.
@@ -478,19 +440,4 @@ public static class ServiceRecovery
         RedirectStandardOutput = true,
         WorkingDirectory = Environment.SystemDirectory,
     };
-
-    private static int RunSc(string arguments)
-    {
-        using var process = Process.Start(ScStartInfo(arguments))!;
-        var output = process.StandardOutput.ReadToEndAsync();
-        if (!process.WaitForExit(30_000))
-        {
-            // Зависший sc.exe не должен задерживать восстановление: чтение кода завершения на нём же и падало.
-            process.Kill(entireProcessTree: true);
-            return -1;
-        }
-
-        output.GetAwaiter().GetResult();
-        return process.ExitCode;
-    }
 }

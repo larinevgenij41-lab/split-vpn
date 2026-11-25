@@ -1,31 +1,62 @@
 ﻿<#
 .SYNOPSIS
-    Аварийное восстановление сети «Раздельный VPN». Запускать с повышением (recover-network.cmd делает это сам).
+    Экстренное отключение «Раздельного VPN» и возврат обычной сети. recover-network.cmd запускает этот скрипт; права
+    администратора скрипт запрашивает сам.
 
 .DESCRIPTION
-    1. Штатный путь: команда recover установленной службы или dev-утилиты (снимает RAS, маршруты, DNS, WFP).
-    2. Если штатный путь недоступен: встроенные средства Windows — удалить маршруты с меткой-метрикой 3917,
-       сбросить DNS интерфейсов, для которых есть резервная копия программы, разорвать соединения приложения.
-    3. Фильтры WFP встроенными средствами не снимаются: перевести службу в ручной запуск и перезагрузить —
-       BFE не загрузит persistent-фильтры провайдера, чья служба не в автозапуске. Прежний тип запуска и
-       команда его возврата печатаются: автозапуск возвращают вручную, когда сеть снова в порядке.
+    1. Штатный путь: SplitVpn.Service.exe recover (то же, что emergency-off) установленной службы или dev-сборки:
+       отметка отключения, ручной запуск службы, остановка службы, затем фильтры WFP, соединения RAS, маршруты, DNS,
+       настройка Wi-Fi Windows и кеш DNS. Отчёт: %ProgramData%\SplitVpn.Recovery\last.json.
+    2. Если штатный путь вернул не всё (или не запустился), выполняется каждый запасной шаг встроенными средствами
+       Windows, независимо от исхода остальных: отметка отключения и ручной запуск, остановка службы, маршруты с
+       меткой-метрикой 3917, DNS по копии программы и сброс нашего loopback, соединения RAS программы, кеш DNS.
+    3. Фильтры WFP встроенными средствами не снимаются: служба в ручном запуске, и после перезагрузки BFE не загрузит
+       постоянные фильтры провайдера, чья служба не в автозапуске.
+    Включить программу снова: «Включить программу» в приложении или SplitVpn.Service.exe emergency-on от имени
+    администратора.
 #>
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
+
+function Wait-Enter {
+    Write-Host 'Нажмите Enter, чтобы закрыть окно.'
+    [void][Console]::ReadLine()
+}
+
+# Права администратора: без них запрашиваются через UAC. Отказ в UAC — понятное сообщение, а не молча закрытое окно.
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    try {
+        # Путь в кавычках: Start-Process в Windows PowerShell 5.1 не экранирует -ArgumentList, а установка лежит в «Program Files».
+        Start-Process powershell.exe -Verb RunAs -ErrorAction Stop -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath)
+        exit 0
+    }
+    catch {
+        Write-Host 'Восстановление сети не запущено: нужны права администратора, а запрос прав отклонён или не удался.' -ForegroundColor Yellow
+        Write-Host "Причина: $($_.Exception.Message)"
+        Write-Host 'Запустите «Восстановить сеть» ещё раз и разрешите изменения в окне контроля учётных записей.'
+        Wait-Enter
+        exit 1
+    }
+}
+
 function Restore-SavedDns($dns, $saved) {
     foreach ($family in $dns) {
         $v6 = $family.AddressFamily -eq 23
         $loopback = if ($v6) { '::1' } else { '127.0.0.1' }
-        # Наш набор: один loopback либо (IPv4, с 0.17.9) «адрес самого адаптера, 127.0.0.1».
+        # Наш набор: один loopback либо (IPv4, с 0.17.9) «адрес адаптера, 127.0.0.1».
         $servers = @($family.ServerAddresses)
         $ours = ($servers.Count -eq 1 -and $servers[0] -eq $loopback) -or
             (-not $v6 -and $servers.Count -eq 2 -and $servers[1] -eq $loopback -and $servers[0] -match '^\d+\.\d+\.\d+\.\d+$')
         if (-not $ours) { continue }
-        # Исходный IPv6-список в копии неизвестен (ipv6Unknown): ::1 программа тогда не ставила, это ::1 пользователя.
-        if ($v6 -and $saved.PSObject.Properties['ipv6Unknown'] -and $saved.ipv6Unknown) { continue }
         $property = if ($v6) { 'NameServerV6' } else { 'NameServerV4' }
-        if (-not $saved.PSObject.Properties[$property]) { throw "Нет поля $property в копии DNS" }
-        $addresses = @($saved.$property -split '[,;\s]+' | Where-Object { $_ })
+        $unknown = $v6 -and $saved -and $saved.PSObject.Properties['ipv6Unknown'] -and $saved.ipv6Unknown
+        $addresses = @()
+        if ($saved -and -not $unknown -and $saved.PSObject.Properties[$property]) {
+            $addresses = @($saved.$property -split '[,;\s]+' | Where-Object { $_ -and $_ -ne $loopback })
+        }
+        # Копии нет, исходный список неизвестен или в нём только loopback — «автоматически»: служба остановлена, наш
+        # loopback без посредника не отвечает.
         if ($addresses.Count) {
             $family | Set-DnsClientServerAddress -ServerAddresses $addresses -ErrorAction Stop
         } else {
@@ -35,88 +66,118 @@ function Restore-SavedDns($dns, $saved) {
 }
 
 function Stop-RecoveryServices($services, $problems) {
-    $stopped = $true
     foreach ($name in 'SplitVpn', 'SplitVpnDev') {
         try {
             $info = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop
             if (-not $info) { continue }
             $services.Add($info)
             if ($info.State -eq 'Stopped') { continue }
+            # Если процесс придётся завершить, диспетчер служб может поднять его снова (действия при сбое), но с отметкой
+            # отключения служба запустится «пустой» и ничего не применит.
             Stop-Service -Name $name -Force -ErrorAction Stop
             (Get-Service -Name $name -ErrorAction Stop).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
         } catch {
             $problems.Add("Остановка службы $name не подтверждена - $_")
-            $stopped = $false
+            try {
+                $info = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop
+                if ($info -and $info.ProcessId) {
+                    Stop-Process -Id $info.ProcessId -Force -ErrorAction Stop
+                    Write-Host "Процесс службы $name ($($info.ProcessId)) завершён принудительно."
+                }
+            } catch { $problems.Add("Процесс службы $name не завершён - $_") }
         }
     }
-    return $stopped
 }
 
 $marker = 3917
+$dataRoot = Join-Path $env:ProgramData 'SplitVpn'
 $candidates = @(
     (Join-Path $env:ProgramFiles 'SplitVpn\SplitVpn.Service.exe'),
     (Join-Path $env:ProgramFiles 'SplitVpn.Dev\service\SplitVpn.Service.exe')
 ) | Where-Object { Test-Path $_ }
 
 $problems = [Collections.Generic.List[string]]::new()
-$recovered = $false
+$networkDone = $false
+$serviceDone = $false
 foreach ($exe in $candidates) {
-    Write-Host "Штатное восстановление: $exe recover"
-    & $exe recover
-    if ($LASTEXITCODE -eq 0) { $recovered = $true; break }
+    # «recover» — то же, что emergency-off; прежние сборки понимают его как восстановление сети.
+    Write-Host "Экстренное отключение: $exe recover"
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        & $exe recover
+        $code = $LASTEXITCODE
+        if ($code -ne 5) { break }
+        Write-Host 'Уже выполняется другое отключение или включение программы — повтор через 20 с.'
+        Start-Sleep -Seconds 20
+    }
+    switch ($code) {
+        0 { $networkDone = $true; $serviceDone = $true }
+        2 { $networkDone = $true; $problems.Add('Сеть возвращена, но остановка службы не подтверждена.') }
+        3 { $problems.Add('Штатное отключение вернуло сеть не полностью (подробности - в отчёте выше).') }
+        4 { $problems.Add('Штатное отключение: нет прав администратора.') }
+        5 { $problems.Add('Штатное отключение занято другой командой.') }
+        default { $problems.Add("Штатное отключение завершилось с кодом $code.") }
+    }
+    if ($networkDone -and $serviceDone) { break }
 }
 
-$services = [Collections.Generic.List[object]]::new()
-if (-not $recovered) {
-    $stopped = Stop-RecoveryServices $services $problems
-    $cli = Join-Path $env:ProgramFiles 'SplitVpn.Dev\cli\splitvpn-cli.exe'
-    if ($stopped -and (Test-Path $cli -PathType Leaf)) {
-        & $cli recover
-        $recovered = $LASTEXITCODE -eq 0
-    }
-}
-if (-not $recovered -and $stopped) {
-    Write-Host 'Штатное восстановление недоступно — встроенные средства Windows.'
-    $changed = @()
-    foreach ($info in $services) {
-        if ($info.StartMode -ne 'Auto') { continue }
-        $service = $info.Name
-        $previous = if ($info.DelayedAutoStart) { 'delayed-auto' } else { 'auto' }
-        sc.exe config $service start= demand | Out-Null
-        if ($LASTEXITCODE -eq 0) { $changed += [pscustomobject]@{ Name = $service; Previous = $previous } }
-        else { $problems.Add("Тип запуска службы $service не изменён (sc config, код $LASTEXITCODE).") }
-    }
+if (-not ($networkDone -and $serviceDone)) {
+    Write-Host 'Штатный путь вернул не всё — запасные шаги встроенными средствами Windows.'
+    $services = [Collections.Generic.List[object]]::new()
+
+    # Отметка отключения: служба, запущенная кем угодно, будет «пустой» и ничего не применит.
     try {
-        foreach ($route in Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | Where-Object RouteMetric -eq $marker) {
-            try { $route | Remove-NetRoute -Confirm:$false -ErrorAction Stop }
-            catch { $problems.Add("Маршрут $($route.DestinationPrefix) - $_") }
-        }
-    } catch { $problems.Add("Чтение маршрутов - $_") }
+        $key = 'HKLM:\Software\SplitVpn'
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+        New-ItemProperty -Path $key -Name 'EmergencyOffUtc' -Value ([DateTime]::UtcNow.ToString('o')) -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $key -Name 'EmergencyOff' -Value 1 -PropertyType DWord -Force | Out-Null
+    } catch { $problems.Add("Отметка отключения не записана - $_") }
 
-    # DNS: только интерфейсы, для которых у программы есть резервная копия (dns-backup.json). Без копии нельзя
-    # отличить наш loopback от статического 127.0.0.1 пользователя (свой резолвер), поэтому такие не трогаем.
-    $dataRoot = Join-Path $env:ProgramData 'SplitVpn'
-    $backupFile = Join-Path $dataRoot 'dns-backup.json'
-    $owned = @{}
-    if (Test-Path $backupFile) {
+    # Ручной запуск: прежний тип запоминается для «Включить программу» (emergency-on), если ещё не запомнен.
+    foreach ($name in 'SplitVpn', 'SplitVpnDev') {
         try {
-            $entries = Get-Content -Raw -Encoding UTF8 $backupFile | ConvertFrom-Json
-            foreach ($item in $entries) {
-                foreach ($prop in $item.PSObject.Properties) {
-                    if ($prop.Name -ieq 'InterfaceGuid') { $owned[([string]$prop.Value).Trim('{}').ToLowerInvariant()] = $item }
+            $info = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop
+            if (-not $info -or $info.StartMode -ne 'Auto') { continue }
+            $previous = if ($info.DelayedAutoStart) { 'delayed-auto' } else { 'auto' }
+            if ($name -eq 'SplitVpn') {
+                $saved = Get-ItemProperty -Path 'HKLM:\Software\SplitVpn' -Name 'EmergencyOffPreviousStart' -ErrorAction SilentlyContinue
+                if (-not $saved) { New-ItemProperty -Path 'HKLM:\Software\SplitVpn' -Name 'EmergencyOffPreviousStart' -Value $previous -PropertyType String -Force | Out-Null }
+            }
+            sc.exe config $name start= demand | Out-Null
+            if ($LASTEXITCODE -ne 0) { $problems.Add("Тип запуска службы $name не изменён (sc config, код $LASTEXITCODE).") }
+            else { Write-Host "Служба $name переведена в ручной запуск (было: $previous)." }
+        } catch { $problems.Add("Тип запуска службы $name - $_") }
+    }
+
+    if (-not $serviceDone) {
+        try { Stop-RecoveryServices $services $problems } catch { $problems.Add("Остановка службы - $_") }
+    }
+
+    if (-not $networkDone) {
+        try {
+            foreach ($route in Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | Where-Object RouteMetric -eq $marker) {
+                try { $route | Remove-NetRoute -Confirm:$false -ErrorAction Stop }
+                catch { $problems.Add("Маршрут $($route.DestinationPrefix) - $_") }
+            }
+        } catch { $problems.Add("Чтение маршрутов - $_") }
+
+        # DNS: по копии программы (dns-backup.json), а без копии — только наш набор (loopback или «адрес, 127.0.0.1»)
+        # сбрасывается на «автоматически»: служба остановлена, и посредник на 127.0.0.1 не отвечает.
+        $owned = @{}
+        $backupFile = Join-Path $dataRoot 'dns-backup.json'
+        if (Test-Path $backupFile) {
+            try {
+                $entries = Get-Content -Raw -Encoding UTF8 $backupFile | ConvertFrom-Json
+                foreach ($item in $entries) {
+                    foreach ($prop in $item.PSObject.Properties) {
+                        if ($prop.Name -ieq 'InterfaceGuid') { $owned[([string]$prop.Value).Trim('{}').ToLowerInvariant()] = $item }
+                    }
                 }
             }
+            catch { $problems.Add("Чтение резервной копии DNS - $_") }
         }
-        catch { $problems.Add("Чтение резервной копии DNS - $_") }
-    }
-    if ($owned.Count -eq 0) {
-        Write-Host 'Резервной копии DNS нет — DNS не сбрасываю (нельзя отличить наш loopback от вашего). Если DNS не работает, задайте его вручную.'
-    }
-    else {
         try { $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop) }
         catch { $adapters = @(); $problems.Add("Чтение списка адаптеров - $_") }
         foreach ($adapter in $adapters) {
-            if (-not $owned.ContainsKey(([string]$adapter.InterfaceGuid).Trim('{}').ToLowerInvariant())) { continue }
             $saved = $owned[([string]$adapter.InterfaceGuid).Trim('{}').ToLowerInvariant()]
             try {
                 $dns = Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ErrorAction Stop
@@ -124,40 +185,38 @@ if (-not $recovered -and $stopped) {
             }
             catch { $problems.Add("DNS адаптера $($adapter.Name) - $_") }
         }
-    }
 
-    # Соединения из телефонной книги программы: записи «Раздельный VPN <id>» (по одной на профиль) и прежние имена.
-    $entries = @('SplitVpn Proto', 'Раздельный VPN')
-    $pbk = Join-Path $dataRoot 'splitvpn.pbk'
-    if (Test-Path $pbk) {
-        foreach ($line in Get-Content -Encoding UTF8 $pbk) {
-            if ($line -match '^\[(.+)\]\s*$') {
-                $section = $Matches[1]
-                if ($section.StartsWith('Раздельный VPN') -or $section.StartsWith('SplitVpn Proto')) { $entries += $section }
+        # Соединения из телефонной книги программы: записи «Раздельный VPN <id>» (по одной на профиль) и прежние имена.
+        try {
+            $entries = @('SplitVpn Proto', 'Раздельный VPN')
+            $pbk = Join-Path $dataRoot 'splitvpn.pbk'
+            if (Test-Path $pbk) {
+                foreach ($line in Get-Content -Encoding UTF8 $pbk) {
+                    if ($line -match '^\[(.+)\]\s*$') {
+                        $section = $Matches[1]
+                        if ($section.StartsWith('Раздельный VPN') -or $section.StartsWith('SplitVpn Proto')) { $entries += $section }
+                    }
+                }
+                foreach ($name in ($entries | Select-Object -Unique)) {
+                    rasdial $name /disconnect "/PHONEBOOK:$pbk" 2>$null | Out-Null
+                }
             }
-        }
-    }
-    foreach ($name in ($entries | Select-Object -Unique)) {
-        if (Test-Path $pbk) { rasdial $name /disconnect "/PHONEBOOK:$pbk" 2>$null | Out-Null }
-    }
+        } catch { $problems.Add("Разрыв соединений RAS - $_") }
 
-    # Ручной запуск нужен до перезагрузки и после неё: BFE не загружает persistent-фильтры провайдера, чья служба
-    # не в автозапуске. Вернуть автозапуск сам скрипт не может — после следующей перезагрузки фильтры загрузились
-    # бы снова, а снять их сможет только работающая служба. Поэтому смена явная: печатается прежний тип запуска и
-    # точная команда возврата. Службы в ручном или отключённом запуске не меняются, отложенный автозапуск
-    # запоминается как есть.
-    ipconfig /flushdns | Out-Null
-    if ($LASTEXITCODE -ne 0) { $problems.Add("Сброс кеша DNS, код $LASTEXITCODE") }
-    if ($problems.Count -eq 0) { Write-Host 'Обработка маршрутов и DNS завершена. Если интернет не появился — перезагрузите компьютер: фильтры SplitVpn не загрузятся.' }
-    foreach ($item in $changed) {
-        Write-Host ''
-        Write-Host ("Служба {0} переведена в ручной запуск (было: {1}): сама она больше не запустится, VPN и защита не работают." -f $item.Name, $item.Previous)
-        Write-Host ("Когда сеть восстановится, верните автозапуск в командной строке администратора: sc config {0} start= {1}" -f $item.Name, $item.Previous)
+        ipconfig /flushdns | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Сброс кеша DNS, код $LASTEXITCODE" }
+        Write-Host 'Если интернет не появился — перезагрузите компьютер: служба в ручном запуске, и фильтры защиты не загрузятся.'
     }
 }
 
+$last = Join-Path $env:ProgramData 'SplitVpn.Recovery\last.json'
+if (Test-Path $last) { Write-Host "Отчёт штатного отключения: $last" }
 foreach ($problem in $problems) { Write-Warning $problem }
-Write-Host 'Восстановление завершено. Нажмите Enter, чтобы закрыть окно.'
-[void][Console]::ReadLine()
+if ($networkDone -and $serviceDone) {
+    Write-Host 'Программа экстренно отключена: сеть возвращена, служба остановлена и сама не запустится.' -ForegroundColor Green
+}
+Write-Host 'Включить программу снова: «Включить программу» в приложении или SplitVpn.Service.exe emergency-on от имени администратора.'
+Wait-Enter
 
-if ($problems.Count) { exit 1 }
+if ($networkDone -and $serviceDone) { exit 0 }
+exit 1

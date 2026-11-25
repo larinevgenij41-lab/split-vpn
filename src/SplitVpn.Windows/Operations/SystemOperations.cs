@@ -354,6 +354,18 @@ public sealed class SystemDnsOps : IDnsOps
             throw new IOException("Не удалось очистить системный кеш DNS.");
         }
     }
+
+    public string? ReadNameServerV6(Guid interfaceGuid) => InterfaceDnsOps.TryReadIpv6(interfaceGuid, warn: false)?.NameServer;
+
+    public bool ResetToAutomatic(Guid interfaceGuid, bool v4, bool v6)
+    {
+        if (v4)
+        {
+            InterfaceDnsOps.SetNameServer(interfaceGuid, "", ipv6: false);
+        }
+
+        return !v6 || InterfaceDnsOps.TrySetIpv6NameServer(interfaceGuid, "");
+    }
 }
 
 public sealed class SystemRasOps(string phonebookPath) : IRasOps

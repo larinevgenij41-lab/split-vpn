@@ -357,8 +357,12 @@ internal sealed class FakeInventory : INetInventory
             });
         }
 
+        adapters.AddRange(Extra);
         return new NetSnapshot(adapters, []);
     }
+
+    /// <summary>Дополнительные адаптеры снимка (например, выключенный Ethernet с оставшимся DNS).</summary>
+    public List<AdapterCandidate> Extra { get; } = [];
 
     public IReadOnlyList<uint> DhcpDnsServers(Guid interfaceGuid) => interfaceGuid == FakeWorld.WiFiGuid ? [FakeWorld.Gateway] : [];
 }
@@ -627,6 +631,19 @@ internal sealed class FakeDns : IDnsOps
     {
         if (FailFlush) { throw new IOException("Сбой сброса кеша DNS"); }
         Flushes++;
+    }
+
+    public string? ReadNameServerV6(Guid interfaceGuid) => NameServersV6.GetValueOrDefault(interfaceGuid, "");
+
+    /// <summary>Сбросы на «автоматически»: адаптер и какие списки.</summary>
+    public List<(Guid Interface, bool V4, bool V6)> Resets { get; } = [];
+
+    public bool ResetToAutomatic(Guid interfaceGuid, bool v4, bool v6)
+    {
+        Resets.Add((interfaceGuid, v4, v6));
+        if (v4) { NameServers[interfaceGuid] = ""; }
+        if (v6) { NameServersV6[interfaceGuid] = ""; }
+        return true;
     }
 }
 

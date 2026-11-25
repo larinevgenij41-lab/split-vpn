@@ -227,9 +227,10 @@ public sealed partial class CoordinatorTests : IDisposable
         Assert.Equal(replacements + 1, _world.Wfp.Replacements);
         Assert.Equal(ConnectionState.Connected, coordinator.DeriveState());
 
-        // Внешний DNS не становится «исходным»: после отключения возвращается исходный (пустой, DHCP).
+        // Внешний DNS (не наш) — последний выбор пользователя: он запоминается исходным и возвращается при отключении,
+        // а не прежний исходный из старой копии (пустой, DHCP).
         await coordinator.HandleRequestAsync(new DisconnectRequest(KeepProtection: false), CancellationToken.None);
-        Assert.Equal("", _world.Dns.NameServers[FakeWorld.WiFiGuid]);
+        Assert.Equal("8.8.8.8", _world.Dns.NameServers[FakeWorld.WiFiGuid]);
     }
 
     [Fact]
