@@ -178,10 +178,36 @@ public partial class MainWindow : FluentWindow
         }
     }
 
-    /// <summary>В узком окне меню сворачивается до значков; при расширении раскрывается снова (только при переходе через порог).</summary>
+    /// <summary>
+    /// Ниже этой высоты окна в свёрнутом меню пункты становятся ниже (<see cref="LowMenuItemHeight"/>): иначе при
+    /// минимальной высоте окна «Диагностика» уходит в прокрутку меню, а её полоса у WPF-UI видна только при наведении.
+    /// </summary>
+    internal const double LowMenuHeight = 480;
+
+    /// <summary>Высота пункта меню в низком окне (обычная — 40): шесть пунктов и подвал помещаются при высоте окна 440.</summary>
+    internal const double LowMenuItemHeight = 34;
+
+    /// <summary>
+    /// В узком или низком окне меню сворачивается до значков; при расширении раскрывается снова (только при переходе
+    /// через порог). Раскрытое меню с блоками состояния и службы занимает по высоте больше, чем есть в окне ниже
+    /// <see cref="CompactHeight"/>: пункты ушли бы в прокрутку, и видна была бы одна «Главная».
+    /// </summary>
     private void AdaptPane()
     {
-        var narrow = ActualWidth < CompactPaneWidth;
+        var low = ActualHeight < LowMenuHeight;
+        foreach (var item in Navigation.MenuItems.Cast<object>().Concat(Navigation.FooterMenuItems.Cast<object>()).OfType<NavigationViewItem>())
+        {
+            if (low)
+            {
+                item.Height = LowMenuItemHeight;
+            }
+            else
+            {
+                item.ClearValue(HeightProperty);
+            }
+        }
+
+        var narrow = ActualWidth < CompactPaneWidth || ActualHeight < CompactHeight;
         if (_wasNarrow == narrow)
         {
             return;

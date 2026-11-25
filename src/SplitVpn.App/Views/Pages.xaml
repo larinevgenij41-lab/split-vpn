@@ -131,7 +131,7 @@
                         <!-- Подключать нечего (подключений нет или все выключены): кнопка ведёт на «Подключения», а не в ошибку. -->
                         <ui:Button Height="52" FontSize="16" Appearance="Primary" HorizontalAlignment="Stretch" Margin="0"
                                    AutomationProperties.Name="{Binding ButtonText}" Command="{Binding PrimaryActionCommand}"
-                                   Content="{Binding ButtonText}" IsEnabled="{Binding Main.ServiceAvailable}"
+                                   Content="{Binding ButtonText}" IsEnabled="{Binding Main.CanSendCommands}"
                                    Visibility="{Binding Main.Emergency.IsOff, Converter={StaticResource VisibleWhen}, ConverterParameter=invert}" />
                         <!-- Программа экстренно выключена: подключать нечего. Кнопка «Включить программу» — одна, в баннере над
                              страницей (виден на любой странице); здесь — только подсказка, где она. -->
@@ -142,10 +142,10 @@
                                    Visibility="{Binding SetupHint, Converter={StaticResource VisibleWhen}}" />
                         <ui:Button Margin="0,8,0,0" HorizontalAlignment="Stretch" Appearance="Secondary" Content="Отключить и восстановить интернет"
                                    ToolTip="Снять защиту: фильтры, маршруты и DNS возвращаются к исходным, трафик идёт напрямую. Спросит подтверждение"
-                                   Command="{Binding Main.DisconnectAndRestoreCommand}" IsEnabled="{Binding Main.ServiceAvailable}"
+                                   Command="{Binding Main.DisconnectAndRestoreCommand}" IsEnabled="{Binding Main.CanSendCommands}"
                                    Visibility="{Binding CanRestore, Converter={StaticResource VisibleWhen}}" />
                         <ui:Button Margin="0,8,0,0" HorizontalAlignment="Stretch" Appearance="Secondary" Content="Повторить подключение"
-                                   Icon="{ui:SymbolIcon ArrowClockwise24}" Command="{Binding Main.ConnectCommand}" IsEnabled="{Binding Main.ServiceAvailable}"
+                                   Icon="{ui:SymbolIcon ArrowClockwise24}" Command="{Binding Main.ConnectCommand}" IsEnabled="{Binding Main.CanSendCommands}"
                                    ToolTip="Повторы остановлены до вашего действия: исправьте причину и повторите"
                                    Visibility="{Binding CanRetry, Converter={StaticResource VisibleWhen}}" />
                         <!-- Следующий шаг есть у каждого сбойного состояния, а не только у «Ошибки». -->
@@ -693,8 +693,15 @@
                               Visibility="{Binding IsExpanded, Converter={StaticResource VisibleWhen}}">
                     <ItemsControl.Template>
                         <ControlTemplate TargetType="ItemsControl">
-                            <ScrollViewer CanContentScroll="True" VerticalScrollBarVisibility="Auto" Focusable="False"
-                                          views:WheelChain.IsEnabled="True"><ItemsPresenter /></ScrollViewer>
+                            <!-- Полоса прокрутки WPF-UI рисуется поверх содержимого: пока она видна, правила отступают от неё,
+                                 и полоса остаётся внутри карточки папки, не на кнопках правил и не на полосе колонки. -->
+                            <ScrollViewer x:Name="Scroll" CanContentScroll="True" VerticalScrollBarVisibility="Auto" Focusable="False"
+                                          views:WheelChain.IsEnabled="True"><ItemsPresenter x:Name="Items" /></ScrollViewer>
+                            <ControlTemplate.Triggers>
+                                <Trigger SourceName="Scroll" Property="ComputedVerticalScrollBarVisibility" Value="Visible">
+                                    <Setter TargetName="Items" Property="Margin" Value="0,0,14,0" />
+                                </Trigger>
+                            </ControlTemplate.Triggers>
                         </ControlTemplate>
                     </ItemsControl.Template>
                     <ItemsControl.ItemsPanel><ItemsPanelTemplate><VirtualizingStackPanel /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
@@ -744,8 +751,14 @@
                         <ControlTemplate TargetType="ItemsControl">
                             <!-- Прокрутка по пикселям: раскрытая папка выше окна списка, и построчная прокрутка
                                  перескакивала бы её целиком. -->
-                            <ScrollViewer CanContentScroll="True" VerticalScrollBarVisibility="Auto"
-                                          views:WheelChain.IsEnabled="True"><ItemsPresenter /></ScrollViewer>
+                            <ScrollViewer x:Name="Scroll" CanContentScroll="True" VerticalScrollBarVisibility="Auto"
+                                          views:WheelChain.IsEnabled="True"><ItemsPresenter x:Name="Items" /></ScrollViewer>
+                            <!-- Пока полоса колонки видна, карточки отступают от неё: она не ложится на край карточек и на полосу папки. -->
+                            <ControlTemplate.Triggers>
+                                <Trigger SourceName="Scroll" Property="ComputedVerticalScrollBarVisibility" Value="Visible">
+                                    <Setter TargetName="Items" Property="Margin" Value="0,0,14,0" />
+                                </Trigger>
+                            </ControlTemplate.Triggers>
                         </ControlTemplate>
                     </ItemsControl.Template>
                     <ItemsControl.ItemsPanel><ItemsPanelTemplate><VirtualizingStackPanel /></ItemsPanelTemplate></ItemsControl.ItemsPanel>

@@ -503,8 +503,14 @@ public sealed record EmergencyRunResult
         };
     }
 
+    /// <summary>
+    /// Шаги отчёта: сначала не выполненные (сбой, срок), затем предупреждения, затем выполненные, внутри — в порядке
+    /// выполнения. Список стоит в шапке окна, ограниченной по высоте, и то, что не получилось, должно быть видно первым.
+    /// </summary>
     private static List<EmergencyStepRow> Rows(EmergencyReport? report) =>
-        report?.Steps?.Where(s => s is not null).Select(EmergencyStepRow.From).ToList() ?? [];
+        report?.Steps?.Where(s => s is not null).Select(EmergencyStepRow.From)
+            .OrderBy(row => row.Severity switch { EmergencyStepSeverity.Error => 0, EmergencyStepSeverity.Warning => 1, _ => 2 })
+            .ToList() ?? [];
 
     /// <summary>Совет по коду и отчёту. Список неудавшихся шагов уже есть в итоге команды и здесь не повторяется.</summary>
     private static string Advise(bool on, int code, EmergencyReport? report) => (on, code) switch

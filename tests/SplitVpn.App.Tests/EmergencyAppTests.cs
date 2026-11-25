@@ -390,10 +390,12 @@ public sealed class EmergencyAppTests
         var result = EmergencyRunResult.FromExitCode(on: false, 3, report, ReportPath);
 
         Assert.Equal(report.Summary, result.Summary);
-        Assert.Equal(["сделано", "уже было так", "не требовалось", "не удалось", "не уложился в срок", "не удалось"], result.Steps.Select(s => s.OutcomeText));
-        Assert.Equal("Маршруты программы", result.Steps[1].Title);
+        // Не выполненные — первыми (список в шапке ограничен по высоте), затем предупреждения, затем выполненные; внутри — по порядку.
+        Assert.Equal(["не удалось", "не уложился в срок", "не удалось", "сделано", "уже было так", "не требовалось"], result.Steps.Select(s => s.OutcomeText));
+        Assert.Equal("Фильтры защиты (WFP)", result.Steps[0].Title);
+        Assert.Equal("Маршруты программы", result.Steps[4].Title);
         Assert.Equal(
-            [EmergencyStepSeverity.Ok, EmergencyStepSeverity.Ok, EmergencyStepSeverity.Ok, EmergencyStepSeverity.Error, EmergencyStepSeverity.Error, EmergencyStepSeverity.Warning],
+            [EmergencyStepSeverity.Error, EmergencyStepSeverity.Error, EmergencyStepSeverity.Warning, EmergencyStepSeverity.Ok, EmergencyStepSeverity.Ok, EmergencyStepSeverity.Ok],
             result.Steps.Select(s => s.Severity));
         Assert.True(result.HasProblems);
         // Совет не повторяет список шагов (он уже в итоге команды), но говорит, что делать.
@@ -995,6 +997,33 @@ public sealed class EmergencyAppTests
     }
 
     // ---------- Подмены ----------
+
+    /// <summary>
+    /// Шапка не противоречит блоку «Служба»: до первого ответа службы красной плашки нет (окно показывает
+    /// «Подключение к службе…»), а пока служба останавливается, «Подключить» недоступна, хотя канал ещё отвечает.
+    /// </summary>
+    [Fact]
+    public Task ServiceHeader_IsConsistentWithServiceBlock() => RunStaAsync(async () =>
+    {
+        using var service = new ServiceConnection((_, _) => Task.FromResult(IpcResponse.Success(new StatusDto())));
+        using var main = NewMain(service, out _, out _);
+        main.ServiceHost.Show(ServiceHostState.Running, "1.0.0");
+        Assert.False(main.ServiceAvailable);
+        Assert.False(main.ShowServiceError);
+
+        await main.RefreshAsync();
+        Assert.True(main.ConnectCommand.CanExecute(null));
+        Assert.True(main.CanSendCommands);
+
+        main.ServiceHost.Show(ServiceHostState.StopPending, "1.0.0");
+        Assert.True(main.ServiceAvailable);
+        Assert.False(main.CanSendCommands);
+        Assert.False(main.ConnectCommand.CanExecute(null));
+        Assert.False(main.ToggleConnectionCommand.CanExecute(null));
+
+        main.ServiceHost.Show(ServiceHostState.Running, "1.0.0");
+        Assert.True(main.ConnectCommand.CanExecute(null));
+    });
 
     private static MainViewModel NewMain(ServiceConnection service, out FakeLauncher launcher, out FakeFlags flags)
     {

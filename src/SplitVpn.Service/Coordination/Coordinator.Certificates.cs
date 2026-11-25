@@ -215,7 +215,7 @@ public sealed partial class Coordinator
 
     private void RetryAfterRevocationPin(TunnelFacts tunnel)
     {
-        if (tunnel.BlockingError == ErrorCategory.Certificate && tunnel.LastErrorCode == unchecked((int)0x80092013))
+        if (tunnel.BlockingError == ErrorCategory.Certificate && ConnectionErrorGuide.IsRevocationCheckFailure(tunnel.LastErrorCode))
         {
             // Отказ был из-за закрытого адреса проверки отзыва: теперь он открыт, и повтор имеет смысл.
             tunnel.BlockingError = ErrorCategory.None;

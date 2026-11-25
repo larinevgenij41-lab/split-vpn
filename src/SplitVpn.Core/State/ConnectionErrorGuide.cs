@@ -37,6 +37,13 @@ public static class ConnectionErrorGuide
     public const int NoRevocationCheck = unchecked((int)0x80092012);
     public const int ChainNotTrusted = unchecked((int)0x800B010A);
 
+    /// <summary>
+    /// Отказ из-за того, что проверка отзыва сертификата не выполнилась (0x80092013 «недоступна» или
+    /// 0x80092012 «не выполнена»): оба снимаются открытием адресов списка отзыва, поэтому повтор после их
+    /// открытия решается одним правилом.
+    /// </summary>
+    public static bool IsRevocationCheckFailure(int? code) => code is RevocationOffline or NoRevocationCheck;
+
     /// <summary>Как отключают проверку отзыва SSTP: то же, что описано в docs/CA-TRUST.md.</summary>
     private const string DisableRevocationCommand =
         "reg add HKLM\\SYSTEM\\CurrentControlSet\\Services\\SstpSvc\\Parameters /v NoCertRevocationCheck /t REG_DWORD /d 1 /f";
@@ -286,7 +293,8 @@ public static class ConnectionErrorGuide
         734 => (
             "Сервер прервал согласование PPP",
             "Согласование канала (LCP) прервано: чаще всего сервер не принимает выбранный способ входа или шифрование. "
-                + "Повторы остановлены — без изменения настроек результат будет тем же.",
+                + "Такой же код бывает при обрыве ненадёжного канала, поэтому служба сначала дважды повторяет попытку сама; "
+                + "если отказ повторяется, повторы останавливаются — без изменения настроек результат будет тем же.",
             [
                 "В «Подключениях» смените «Способ входа» на тот, который требует сервер (например, EAP-MSCHAPv2 вместо MS-CHAPv2).",
                 "Уточните у владельца сервера требования к шифрованию.",

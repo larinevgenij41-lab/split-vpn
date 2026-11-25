@@ -136,7 +136,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private StatusDto? _status;
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(ShowServiceRecovery), nameof(ShowServiceError))]
+    [NotifyPropertyChangedFor(nameof(ShowServiceRecovery), nameof(ShowServiceError), nameof(CanSendCommands))]
     [NotifyCanExecuteChangedFor(nameof(ConnectCommand), nameof(DisconnectCommand), nameof(DisconnectAndRestoreCommand), nameof(ToggleConnectionCommand))]
     private bool _serviceAvailable;
 
@@ -148,7 +148,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
     /// <summary>Причина недоступности службы; null — служба отвечает.</summary>
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(ShowServiceRecovery))]
+    [NotifyPropertyChangedFor(nameof(ShowServiceRecovery), nameof(ShowServiceError))]
     private ServiceUnavailableReason? _unavailableReason;
 
     /// <summary>
@@ -158,8 +158,12 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     public bool ShowServiceRecovery => !ServiceAvailable && !Emergency.IsOff
         && UnavailableReason is ServiceUnavailableReason.NotRunning or ServiceUnavailableReason.Timeout;
 
-    /// <summary>Красная плашка «Служба недоступна»; после экстренного выключения вместо неё спокойный баннер.</summary>
-    public bool ShowServiceError => !ServiceAvailable && !Emergency.IsOff;
+    /// <summary>
+    /// Красная плашка «Служба недоступна»; после экстренного выключения вместо неё спокойный баннер. Только после
+    /// неудачного опроса (известна причина): до первого ответа службы окно показывает «Подключение к службе…», а не ошибку
+    /// рядом с блоком «Служба», где она «Работает».
+    /// </summary>
+    public bool ShowServiceError => !ServiceAvailable && UnavailableReason is not null && !Emergency.IsOff;
 
     [ObservableProperty]
     private string _stateText = "Подключение к службе…";
@@ -382,8 +386,23 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private void Navigate(PageViewModel page) => NavigateTo(page);
 
-    /// <summary>Команды службе недоступны, пока идёт другая, служба не отвечает или программа экстренно выключена.</summary>
-    private bool CanRunCommand => !IsBusy && ServiceAvailable && !Emergency.IsOff;
+    /// <summary>
+    /// Команды службе недоступны, пока идёт другая, служба не отвечает или останавливается, или программа экстренно выключена.
+    /// </summary>
+    private bool CanRunCommand => !IsBusy && CanSendCommands && !Emergency.IsOff;
+
+    /// <summary>Служба отвечает и не останавливается: главной кнопке есть кому отправить команду.</summary>
+    public bool CanSendCommands => ServiceAvailable && !ServiceHost.IsStopping;
+
+    /// <summary>Состояние службы Windows сменилось: «Подключить» недоступна, пока служба останавливается.</summary>
+    internal void OnServiceHostChanged()
+    {
+        OnPropertyChanged(nameof(CanSendCommands));
+        ConnectCommand.NotifyCanExecuteChanged();
+        DisconnectCommand.NotifyCanExecuteChanged();
+        DisconnectAndRestoreCommand.NotifyCanExecuteChanged();
+        ToggleConnectionCommand.NotifyCanExecuteChanged();
+    }
 
     /// <summary>«Подключить» и «Повторить»: служба сбрасывает остановленные повторы и дозванивается заново.</summary>
     [RelayCommand(CanExecute = nameof(CanRunCommand))]

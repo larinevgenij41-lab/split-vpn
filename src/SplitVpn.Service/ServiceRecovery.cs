@@ -196,29 +196,14 @@ public static class ServiceRecovery
         var trusted = system.Trusted;
         var cleanable = MayPurgeData(report, trusted, staleMarkCleared);
 
-        // Записи RAS (с ключами IPsec в хранилище RAS) удаляются при удалении программы всегда: каталог данных их не
-        // содержит, а служба после отменённого удаления создаёт их заново перед дозвоном. Экстренное отключение их не трогает.
-        var rasStep = RunUninstallStep(UninstallRasStep, "Записи RAS программы", () => DeleteRasEntries(paths.Phonebook));
-
-        bool cleaned;
-        if (mode == RecoveryMode.UninstallNetwork)
-        {
-            // Данные и ключ реестра удаляет установщик после фиксации удаления: здесь только разрешение на это.
-            cleaned = cleanable && TryStep("отметка очистки данных", SetPurgeMark);
-        }
-        else
-        {
-            cleaned = cleanable && (TryStep("данные", () => DeleteData(paths.Root)) & TryStep("реестр", DeleteRegistryKey));
-        }
-
-        // Секреты не ждут полной очистки: без неё данные остаются (dns-backup.json нужен повторному восстановлению), но
-        // пароли, ключи IPsec и SSH в них оставались бы на диске после удаления программы. С разрешением на очистку их
-        // удалит установщик вместе с каталогом после фиксации удаления, и откаченное удаление вернёт программу с паролями.
-        var secretsStep = cleaned
-            ? new EmergencyStepReport(UninstallSecretsStep, SecretsStepTitle, EmergencyStepOutcome.Skipped,
-                mode == RecoveryMode.UninstallNetwork ? "удаляются вместе с данными после фиксации удаления" : "удалены вместе с данными", 0, Required: false)
-            : RunUninstallStep(UninstallSecretsStep, SecretsStepTitle, () => DeleteSecretFiles(paths.Root, HasTrustedOwner));
-        report = report with { Steps = [.. report.Steps, rasStep, secretsStep] };
+        var finish = FinishUninstall(mode, cleanable, report.Steps, new UninstallActions(
+            SetPurgeMark,
+            () => DeleteData(paths.Root),
+            DeleteRegistryKey,
+            () => DeleteSecretFiles(paths.Root, HasTrustedOwner),
+            () => DeleteRasEntries(paths.Phonebook)), RasEntriesTimeout);
+        var cleaned = finish.Cleaned;
+        report = report with { Steps = [.. report.Steps, finish.Secrets, finish.RasEntries] };
 
         var json = JsonSerializer.Serialize(report, JsonDefaults.Options);
         Console.WriteLine(json);
@@ -263,6 +248,75 @@ public static class ServiceRecovery
     /// <summary>Основной файл паролей: ключи IPsec и SSH — рядом с ним (secrets.bin.ipsec, secrets.bin.sshkey).</summary>
     internal const string SecretsFileName = "secrets.bin";
 
+    private const string RasEntriesStepTitle = "Записи RAS программы";
+
+    /// <summary>
+    /// Срок удаления записей RAS: RasEnumEntries и RasDeleteEntry синхронны и при зависшей службе RasMan ждали бы
+    /// бесконечно, а сторож удаления (<see cref="Watchdog"/>) тогда бросил бы весь запуск без отчёта. Укладывается в
+    /// запас сторожа (<see cref="WatchdogGrace"/>).
+    /// </summary>
+    internal static readonly TimeSpan RasEntriesTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>Действия завершения удаления программы; в тестах подменяются.</summary>
+    internal sealed record UninstallActions(
+        Action SetPurgeMark,
+        Action DeleteData,
+        Action DeleteRegistry,
+        Func<string> DeleteSecrets,
+        Func<string> DeleteRasEntries);
+
+    /// <summary>Итог завершения удаления: разрешена (или выполнена) полная очистка данных и шаги для отчёта.</summary>
+    internal sealed record UninstallFinish(bool Cleaned, EmergencyStepReport Secrets, EmergencyStepReport RasEntries);
+
+    /// <summary>
+    /// Завершение удаления после сетевых шагов. Порядок: сначала отметка очистки данных (или удаление данных самим),
+    /// затем файлы паролей, и только потом записи RAS — их удаление идёт через RasMan и может зависнуть, поэтому оно
+    /// последнее, со своим сроком, и пропускается, если служба RAS уже не ответила при восстановлении сети. Каждый шаг
+    /// изолирован от исключений любого типа: сбой одного не отменяет следующих.
+    /// <para>
+    /// Полная очистка разрешена — пароли и записи RAS не трогаются здесь: их удалит установщик вместе с каталогом данных
+    /// (там и телефонная книга) после фиксации удаления, а отменённое или откаченное удаление вернёт программу с
+    /// настройками, паролями и ключами IPsec. Не разрешена — данные остаются для повторного восстановления, но пароли,
+    /// ключи и записи RAS программы (с общим ключом IPsec в хранилище RAS) удаляются сразу.
+    /// </para>
+    /// </summary>
+    internal static UninstallFinish FinishUninstall(RecoveryMode mode, bool cleanable, IReadOnlyList<EmergencyStepReport> networkSteps,
+        UninstallActions actions, TimeSpan rasTimeout)
+    {
+        ArgumentNullException.ThrowIfNull(networkSteps);
+        ArgumentNullException.ThrowIfNull(actions);
+        bool cleaned;
+        if (mode == RecoveryMode.UninstallNetwork)
+        {
+            // Данные и ключ реестра удаляет установщик после фиксации удаления: здесь только разрешение на это.
+            cleaned = cleanable && TryStep("отметка очистки данных", actions.SetPurgeMark);
+        }
+        else
+        {
+            cleaned = cleanable && (TryStep("данные", actions.DeleteData) & TryStep("реестр", actions.DeleteRegistry));
+        }
+
+        if (cleaned)
+        {
+            var later = mode == RecoveryMode.UninstallNetwork;
+            return new UninstallFinish(true,
+                new EmergencyStepReport(UninstallSecretsStep, SecretsStepTitle, EmergencyStepOutcome.Skipped,
+                    later ? "удаляются вместе с данными после фиксации удаления" : "удалены вместе с данными", 0, Required: false),
+                new EmergencyStepReport(UninstallRasStep, RasEntriesStepTitle, EmergencyStepOutcome.Skipped,
+                    later ? "удаляются вместе с телефонной книгой в каталоге данных после фиксации удаления" : "удалены вместе с телефонной книгой в каталоге данных", 0, Required: false));
+        }
+
+        // Секреты не ждут полной очистки: без неё данные остаются (dns-backup.json нужен повторному восстановлению), но
+        // пароли, ключи IPsec и SSH в них оставались бы на диске после удаления программы.
+        var secrets = RunUninstallStep(UninstallSecretsStep, SecretsStepTitle, actions.DeleteSecrets);
+        var rasHung = networkSteps.Any(s => s.Step == EmergencySteps.Ras && s.Outcome == EmergencyStepOutcome.Timeout);
+        var ras = rasHung
+            ? new EmergencyStepReport(UninstallRasStep, RasEntriesStepTitle, EmergencyStepOutcome.Timeout,
+                "не запущен: служба RAS не ответила при восстановлении сети", 0, Required: false)
+            : RunBoundedUninstallStep(UninstallRasStep, RasEntriesStepTitle, actions.DeleteRasEntries, rasTimeout);
+        return new UninstallFinish(false, secrets, ras);
+    }
+
     /// <summary>Шаг удаления с итогом в отчёте; необязательный — сеть он не касается и код команды не меняет.</summary>
     private static EmergencyStepReport RunUninstallStep(string id, string title, Func<string> action)
     {
@@ -272,12 +326,37 @@ public static class ServiceRecovery
             var detail = action();
             return new EmergencyStepReport(id, title, EmergencyStepOutcome.Done, detail, watch.ElapsedMilliseconds, Required: false);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException
-            or System.ComponentModel.Win32Exception or Windows.Native.NativeCallException)
+        catch (Exception ex)
         {
+            // Любой тип исключения: сбой шага не должен отменять следующие шаги удаления и отчёт.
             Console.Error.WriteLine(title + ": " + ex.Message);
             return new EmergencyStepReport(id, title, EmergencyStepOutcome.Failed, ex.Message, watch.ElapsedMilliseconds, Required: false);
         }
+    }
+
+    /// <summary>
+    /// Шаг со своим сроком: синхронный вызов идёт в пуле потоков, и по истечении срока отчёт получает «timeout», а
+    /// зависший поток остаётся ждать до выхода процесса.
+    /// </summary>
+    private static EmergencyStepReport RunBoundedUninstallStep(string id, string title, Func<string> action, TimeSpan timeout)
+    {
+        var watch = Stopwatch.StartNew();
+        var work = Task.Run(() => RunUninstallStep(id, title, action));
+        try
+        {
+            if (work.Wait(timeout))
+            {
+                return work.Result;
+            }
+        }
+        catch (AggregateException ex)
+        {
+            return new EmergencyStepReport(id, title, EmergencyStepOutcome.Failed, ex.InnerException?.Message ?? ex.Message, watch.ElapsedMilliseconds, Required: false);
+        }
+
+        Console.Error.WriteLine(title + ": не завершено за " + timeout.TotalSeconds.ToString("F0", CultureInfo.InvariantCulture) + " с");
+        return new EmergencyStepReport(id, title, EmergencyStepOutcome.Timeout,
+            string.Create(CultureInfo.InvariantCulture, $"не завершено за {timeout.TotalSeconds:F0} с: служба RAS не ответила"), watch.ElapsedMilliseconds, Required: false);
     }
 
     /// <summary>
@@ -367,8 +446,9 @@ public static class ServiceRecovery
             action();
             return true;
         }
-        catch (IOException ex)
+        catch (Exception ex)
         {
+            // Любой тип исключения: шаг изолирован, следующие шаги удаления и отчёт выполняются.
             Console.Error.WriteLine(name + ": " + ex.Message);
             return false;
         }

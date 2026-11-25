@@ -18,6 +18,9 @@ internal static class SelfTest
     /// <summary>Ход проверки пишется в файл: у оконного приложения нет консоли.</summary>
     private static readonly string LogPath = Path.Combine(Path.GetTempPath(), "splitvpn-selftest.log");
 
+    /// <summary>Версия службы в блоке «Служба» на снимках — версия продукта, как у установленной вместе с приложением службы.</summary>
+    private static readonly string ServiceVersion = typeof(SelfTest).Assembly.GetName().Version?.ToString(3) ?? "";
+
     public static int Run()
     {
         File.WriteAllText(LogPath, "");
@@ -50,6 +53,11 @@ internal static class SelfTest
             Left = -20000,
             Top = -20000,
             ShowActivated = false,
+            // Размеры из разметки, а не по рабочей области монитора (WindowFit): снимки одинаковы на любом экране.
+            Width = 1080,
+            Height = 740,
+            MinWidth = 640,
+            MinHeight = 440,
         };
         Log("Окно создано.");
         window.Show();
@@ -61,6 +69,10 @@ internal static class SelfTest
 
         // Блок «Служба» внизу меню: состояния с разным набором доступных кнопок, раскрытое и свёрнутое меню.
         var root = (FrameworkElement)window.Content;
+        // Ход службы приходит только в её ответе: служба отвечает и запущена (иначе снимок показывал бы ход рядом с
+        // «Служба недоступна», чего в приложении не бывает).
+        main.ServiceAvailable = true;
+        main.ServiceHost.Show(Core.State.ServiceHostState.Running, ServiceVersion);
         main.ApplyProgress(new Core.Ipc.ServiceProgressDto
         {
             Stage = "Обновление маршрутов", Percent = 35, Completed = 128, Total = 356,
@@ -80,7 +92,7 @@ internal static class SelfTest
             errors.AppendLine("Ожидание входа не отображается в индикаторе службы.");
         }
         main.ApplyProgress(null);
-        main.ServiceHost.Show(Core.State.ServiceHostState.Running, "0.3.9");
+        main.ServiceHost.Show(Core.State.ServiceHostState.Running, ServiceVersion);
         Settle(root);
         Shot(root, shots, "window-service-running");
         var block = window.ServiceBlock.TransformToAncestor(root).TransformBounds(new Rect(window.ServiceBlock.RenderSize));
@@ -93,7 +105,7 @@ internal static class SelfTest
         main.UnavailableReason = Core.Ipc.ServiceUnavailableReason.Timeout;
         main.ServiceAvailable = false;
         (main.ServiceErrorTitle, _, main.ServiceError) = MainViewModel.Describe(main.UnavailableReason.Value);
-        main.ServiceHost.Show(Core.State.ServiceHostState.Running, "0.3.9");
+        main.ServiceHost.Show(Core.State.ServiceHostState.Running, ServiceVersion);
         Settle(root);
         if (!window.ServiceRecoveryActions.IsVisible || !main.ServiceHost.RestartCommand.CanExecute(null))
         {
@@ -102,7 +114,7 @@ internal static class SelfTest
         Shot(root, shots, "window-service-not-responding");
         main.UnavailableReason = Core.Ipc.ServiceUnavailableReason.NotRunning;
         (main.ServiceErrorTitle, _, main.ServiceError) = MainViewModel.Describe(main.UnavailableReason.Value);
-        main.ServiceHost.Show(Core.State.ServiceHostState.Stopped, "0.3.9");
+        main.ServiceHost.Show(Core.State.ServiceHostState.Stopped, ServiceVersion);
         Settle(root);
         Shot(root, shots, "window-service-stopped");
         if (!main.ServiceHost.StartCommand.CanExecute(null) || main.ServiceHost.StopCommand.CanExecute(null))
@@ -119,13 +131,19 @@ internal static class SelfTest
         main.UnavailableReason = null;
         main.ServiceAvailable = true;
 
-        main.ServiceHost.Show(Core.State.ServiceHostState.StopPending, "0.3.9");
+        main.ServiceHost.Show(Core.State.ServiceHostState.StopPending, ServiceVersion);
         Settle(root);
         Shot(root, shots, "window-service-stopping");
+        if (main.CanSendCommands || main.ConnectCommand.CanExecute(null))
+        {
+            errors.AppendLine("Служба останавливается, а «Подключить» доступна.");
+        }
+
         var (width, height) = (window.Width, window.Height);
         window.Height = window.MinHeight;
         Settle(root);
         Shot(root, shots, "window-service-min-height");
+        CheckMenuReachable(window, errors);
         block = window.ServiceBlock.TransformToAncestor(root).TransformBounds(new Rect(window.ServiceBlock.RenderSize));
         Log($"Блок «Служба» при минимальной высоте: {block}, окно {root.ActualWidth}×{root.ActualHeight}");
 
@@ -140,7 +158,7 @@ internal static class SelfTest
         main.UnavailableReason = Core.Ipc.ServiceUnavailableReason.Timeout;
         main.ServiceAvailable = false;
         (main.ServiceErrorTitle, _, main.ServiceError) = MainViewModel.Describe(main.UnavailableReason.Value);
-        main.ServiceHost.Show(Core.State.ServiceHostState.Running, "0.3.9");
+        main.ServiceHost.Show(Core.State.ServiceHostState.Running, ServiceVersion);
         var pageWithMessage = main.CurrentPage ?? main.Home;
         pageWithMessage.ShowError("Проверка сообщения страницы в шапке окна.");
         Settle(root);
@@ -157,7 +175,7 @@ internal static class SelfTest
         main.ProxyError = null;
         main.UnavailableReason = null;
         main.ServiceAvailable = true;
-        main.ServiceHost.Show(Core.State.ServiceHostState.StopPending, "0.3.9");
+        main.ServiceHost.Show(Core.State.ServiceHostState.StopPending, ServiceVersion);
         window.Height = height;
         window.Width = 760;
         Settle(root);
@@ -179,7 +197,8 @@ internal static class SelfTest
         // Страницы отрисовываются как модели в ContentControl: шаблоны из Pages.xaml те же,
         // а Page без навигационного узла в тесте не нужен.
         var host = new ContentControl { Width = 1180, Height = 760 };
-        window.Content = host;
+        // Холст не ограничивает размер страницы окном: на маленьком экране окно уже снимка, и страница обрезалась бы его краем.
+        window.Content = new Canvas { Children = { host } };
         foreach (var page in main.Pages)
         {
             host.Content = page;
@@ -260,7 +279,7 @@ internal static class SelfTest
         main.Home.HasErrorDetails = true;
         main.Home.ErrorSummary = "Windows не смогла проверить, не отозван ли сертификат сервера";
         main.Home.ErrorMeaning = "Сам сертификат может быть полностью исправен: Windows отдельно обращается за списком отзыва (CRL) по адресу, записанному в сертификате, и этот адрес не ответил.";
-        main.Home.ErrorCertificateText = "Сертификат сервера: vpn.example.org, выдал Let's Encrypt, действует до 27.09.2026 11:42 (осталось 6 дней).";
+        main.Home.ErrorCertificateText = new Core.State.ServerCertificateFacts { Subject = "vpn.example.org", Issuer = "Let's Encrypt", NotBefore = DateTimeOffset.UtcNow.AddDays(-84), NotAfter = DateTimeOffset.UtcNow.AddDays(6).AddHours(1) }.Describe(DateTimeOffset.UtcNow);
         main.Home.ErrorCodeText = "Код 0x80092013 (-2146885613, CryptoAPI)";
         main.Home.ErrorSteps.Add("1. Подождите повтора: программа открывает адрес проверки отзыва через защиту и подключается снова сама (ye1.c.lencr.org).");
         main.Home.ErrorSteps.Add("2. Если повтор не помогает — снимите защиту, подключитесь напрямую и нажмите «Повторить».");
@@ -356,6 +375,7 @@ internal static class SelfTest
         }
 
         main.Connections.Profiles.Add(ProfileItem.From(new Core.Settings.ConnectionProfile { Name = "Проверка", Server = "vpn.example.org", PrimaryAdapter = Core.Settings.AdapterSelection.Pinned, PinnedInterfaceGuid = Guid.NewGuid(), AuthMethod = Core.Settings.AuthMethod.PeapMsChapV2, Role = Core.Settings.ProfileRole.Primary }));
+        main.Connections.RenumberProfiles();
         main.Connections.Selected = main.Connections.Profiles[0];
         host.Content = null;
         host.Content = main.Connections;
@@ -392,6 +412,7 @@ internal static class SelfTest
 
         var anyConnect = ProfileItem.From(new Core.Settings.ConnectionProfile { Name = "Шлюз", Server = "vpn.example.org", Protocol = Core.Settings.VpnProtocol.AnyConnect, AuthMethod = Core.Settings.AuthMethod.GatewayForm, Role = Core.Settings.ProfileRole.Secondary });
         main.Connections.Profiles.Add(anyConnect);
+        main.Connections.RenumberProfiles();
         main.Connections.Selected = anyConnect;
         host.Content = null;
         host.Content = main.Connections;
@@ -466,6 +487,7 @@ internal static class SelfTest
         pinnedProfile.PasswordDraft = "";
         pinnedProfile.IsDirty = false;
         main.Connections.Profiles.Remove(newProfile);
+        main.Connections.RenumberProfiles();
 
         main.Diagnostics.GatewaySessions.Add(new GatewaySessionRow("Шлюз · 10.0.0.2", "быстрый канал (UDP) · 69 сетей", "Канал DTLS (UDP) · MTU 1230"));
         // Строки журнала событий с меню «Копировать»: шаблон строки применяется только с данными.
@@ -702,7 +724,7 @@ internal static class SelfTest
         main.UnavailableReason = Core.Ipc.ServiceUnavailableReason.NotRunning;
         main.ServiceAvailable = false;
         (main.ServiceErrorTitle, _, main.ServiceError) = MainViewModel.Describe(main.UnavailableReason.Value);
-        main.ServiceHost.Show(Core.State.ServiceHostState.Stopped, "0.3.9");
+        main.ServiceHost.Show(Core.State.ServiceHostState.Stopped, ServiceVersion);
         main.Emergency.Show(new Core.Recovery.EmergencyFlag(DateTimeOffset.UtcNow.AddMinutes(-42)));
         Settle(root);
         Shot(root, shots, "window-emergency-off");
@@ -753,6 +775,16 @@ internal static class SelfTest
         if (!window.EmergencyResult.IsVisible || !result.Advice.Contains("Перезагрузите", StringComparison.Ordinal) || !window.EmergencyStepsExpander.IsExpanded)
         {
             errors.AppendLine("Итог экстренного выключения не показан, без совета перезагрузить компьютер или шаги со сбоями не раскрыты.");
+        }
+
+        // Обычная высота окна: не выполненные шаги видны без прокрутки шапки.
+        window.HeaderScroll.ScrollToTop();
+        Settle(root);
+        var failedRows = Descendants(window.EmergencyStepsExpander).OfType<ContentPresenter>()
+            .Where(p => p.Content is EmergencyStepRow { IsProblem: true }).ToList();
+        if (failedRows.Count == 0 || failedRows.Any(row => !FullyInViewport(row, window.HeaderScroll)))
+        {
+            errors.AppendLine("Итог экстренного выключения: не выполненные шаги не видны без прокрутки шапки при обычной высоте окна.");
         }
 
         // Свернул человек — так и остаётся (двусторонняя привязка); новый итог снова задаёт раскрытие.
@@ -822,7 +854,7 @@ internal static class SelfTest
         main.UnavailableReason = null;
         main.ServiceAvailable = true;
         (main.StateText, main.SummaryText) = (stateText, summaryText);
-        main.ServiceHost.Show(Core.State.ServiceHostState.Running, "0.3.9");
+        main.ServiceHost.Show(Core.State.ServiceHostState.Running, ServiceVersion);
         Settle(root);
         Log("Экстренное выключение в окне проверено.");
     }
@@ -996,14 +1028,17 @@ internal static class SelfTest
     /// </summary>
     private static void CheckTrayWindow(MainViewModel main, FrameworkElement root, StringBuilder errors)
     {
-        var window = new MainWindow { DataContext = main, Left = -20000, Top = -20000, ShowActivated = false };
+        var window = new MainWindow { DataContext = main, Left = -20000, Top = -20000, ShowActivated = false, Width = 1080, Height = 740, MinWidth = 640, MinHeight = 440 };
         // Очередь окна обрабатывается, пока оно скрыто: здесь WPF и разрешает привязки шапки и подвала.
         Settle(root);
         window.Show();
         var content = (FrameworkElement)window.Content;
         Settle(content);
+        // Раскрыто ли меню, решает размер окна (узкое или низкое окно сворачивает его): блок и значок — по состоянию меню.
+        var open = window.Navigation.IsPaneOpen;
         if (!ReferenceEquals(window.ServiceFooter.DataContext, main.ServiceHost)
-            || window.ServiceBlock.Visibility != Visibility.Visible || window.ServiceIcon.Visibility != Visibility.Collapsed)
+            || window.ServiceBlock.Visibility != (open ? Visibility.Visible : Visibility.Collapsed)
+            || window.ServiceIcon.Visibility != (open ? Visibility.Collapsed : Visibility.Visible))
         {
             errors.AppendLine("Окно, открытое из трея: блок \"Служба\" без данных или виден вместе со значком свёрнутого меню.");
         }
@@ -1195,6 +1230,38 @@ internal static class SelfTest
         encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap));
         using var file = File.Create(Path.Combine(folder, name + ".png"));
         encoder.Save(file);
+    }
+
+    /// <summary>
+    /// Все пункты меню видны без прокрутки: полоса прокрутки меню WPF-UI появляется только при наведении, и при
+    /// минимальной высоте окна страницы ниже «Главной» были бы недостижимы на вид.
+    /// </summary>
+    private static void CheckMenuReachable(MainWindow window, StringBuilder errors)
+    {
+        var items = window.Navigation.MenuItems.OfType<Wpf.Ui.Controls.NavigationViewItem>().ToList();
+        if (items.Count == 0 || FindAncestor<ScrollViewer>(items[^1]) is not { } scroll)
+        {
+            return;
+        }
+
+        Log($"Меню при высоте окна {window.ActualHeight:0}: пунктов {items.Count}, видно {scroll.ViewportHeight:0} из {scroll.ExtentHeight:0}");
+        if (scroll.ExtentHeight > scroll.ViewportHeight + 1)
+        {
+            errors.AppendLine(System.Globalization.CultureInfo.InvariantCulture,
+                $"При высоте окна {window.ActualHeight:0} пункты меню не помещаются: видно {scroll.ViewportHeight:0} из {scroll.ExtentHeight:0}.");
+        }
+    }
+
+    private static T? FindAncestor<T>(DependencyObject element)
+        where T : DependencyObject
+    {
+        var current = System.Windows.Media.VisualTreeHelper.GetParent(element);
+        while (current is not null and not T)
+        {
+            current = System.Windows.Media.VisualTreeHelper.GetParent(current);
+        }
+
+        return current as T;
     }
 
     private static void Log(string text)

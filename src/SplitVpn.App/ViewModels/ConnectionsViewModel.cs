@@ -310,7 +310,7 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         return null;
     });
 
-    private void RenumberProfiles()
+    internal void RenumberProfiles()
     {
         for (var i = 0; i < Profiles.Count; i++)
         {

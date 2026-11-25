@@ -192,8 +192,11 @@
                                        Command="{Binding Emergency.TurnOnCommand}"
                                        AutomationProperties.Name="Включить программу"
                                        AutomationProperties.HelpText="Снять экстренное выключение и запустить службу. Windows запросит права администратора; VPN после этого подключается кнопкой «Подключить»" />
+                            <!-- Пока виден итог команды, пояснение баннера скрыто: итог говорит то же подробнее, а шапке
+                                 (не выше 40 % окна) нужно место для его шагов. -->
                             <TextBlock Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,4,0,0" TextWrapping="Wrap" Text="{Binding Emergency.BannerText}"
-                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                       Visibility="{Binding Emergency.Result, Converter={StaticResource VisibleWhen}, ConverterParameter=invert}" />
                         </Grid>
                     </Border>
                     <!-- Итог команды: что получилось, что делать, шаги и путь к отчёту; виден на любой странице, пока не закрыт.
@@ -226,10 +229,10 @@
                             <StackPanel Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2">
                                 <TextBlock Margin="0,4,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorPrimaryBrush}"
                                            Text="{Binding Emergency.Result.Summary, FallbackValue=''}" />
-                                <TextBlock Margin="0,4,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                                           Text="{Binding Emergency.Result.Advice, FallbackValue=''}"
-                                           Visibility="{Binding Emergency.Result.HasAdvice, Converter={StaticResource VisibleWhen}, FallbackValue=Collapsed}" />
-                                <!-- Раскрыт ли список — свойство модели, заданное заново для каждого итога; дальше его меняет человек (TwoWay). -->
+                                <!-- Раскрыт ли список — свойство модели, заданное заново для каждого итога; дальше его меняет человек (TwoWay).
+                                     Список — сразу под итогом и до совета, а не выполненные шаги в нём первые: при обычной высоте окна
+                                     они видны без прокрутки шапки. -->
+
                                 <Expander x:Name="EmergencyStepsExpander" Margin="0,8,0,0" HorizontalContentAlignment="Stretch"
                                           Header="{Binding Emergency.Result.StepsHeader, FallbackValue=''}"
                                           IsExpanded="{Binding Emergency.StepsExpanded, Mode=TwoWay}"
@@ -256,6 +259,9 @@
                                         </ItemsControl.ItemTemplate>
                                     </ItemsControl>
                                 </Expander>
+                                <TextBlock Margin="0,6,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                           Text="{Binding Emergency.Result.Advice, FallbackValue=''}"
+                                           Visibility="{Binding Emergency.Result.HasAdvice, Converter={StaticResource VisibleWhen}, FallbackValue=Collapsed}" />
                                 <TextBlock Margin="0,8,0,0" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                            Visibility="{Binding Emergency.Result.ReportPath, Converter={StaticResource VisibleWhen}, FallbackValue=Collapsed}">
                                     <Run Text="Отчёт: " /><Run Text="{Binding Emergency.Result.ReportPath, Mode=OneWay, FallbackValue=''}" />

@@ -88,6 +88,14 @@ public sealed partial class ServiceHostViewModel : ObservableObject, IDisposable
 
     private bool NotResponding => _main.UnavailableReason == ServiceUnavailableReason.Timeout;
 
+    /// <summary>
+    /// Служба останавливается (по диспетчеру служб или по нашей команде «Остановить»): канал ещё может отвечать, но
+    /// команда подключения ушла бы службе, которая вот-вот завершится, — «Подключить» в это время недоступна.
+    /// </summary>
+    public bool IsStopping => _state == ServiceHostState.StopPending || _pending == ServiceHostAction.Stop;
+
+    partial void OnViewChanged(ServiceHostView value) => _main.OnServiceHostChanged();
+
     private void OnTick()
     {
         if (!_main.IsWindowVisible)

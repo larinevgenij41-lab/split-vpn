@@ -455,6 +455,16 @@ public sealed partial class Coordinator
             }
         }
 
+        if (result.ErrorCode == LcpTerminatedCode && tunnel.LcpTerminatedRetries < LcpTerminatedAutoRetries)
+        {
+            // 734 бывает и при обрыве ненадёжного канала: один такой обрыв не должен оставлять пользователя
+            // без сети до нажатия «Подключить».
+            tunnel.LcpTerminatedRetries++;
+            var wait = ScheduleRetry(tunnel, _deps.Time.GetUtcNow());
+            Journal("Ошибка", $"{tunnel.LastErrorText}. Повтор {tunnel.LcpTerminatedRetries} из {LcpTerminatedAutoRetries} через {wait.TotalSeconds:F0} с.");
+            return;
+        }
+
         if (!info.Retryable)
         {
             tunnel.BlockingError = info.Category;
@@ -529,7 +539,13 @@ public sealed partial class Coordinator
     private static bool RevocationRetryDue(TunnelFacts tunnel, RasDialResult result) =>
         !tunnel.RevocationRetryUsed
         && tunnel.RevocationHosts.Count > 0
-        && (int)result.ErrorCode is ConnectionErrorGuide.RevocationOffline or ConnectionErrorGuide.NoRevocationCheck;
+        && ConnectionErrorGuide.IsRevocationCheckFailure((int)result.ErrorCode);
+
+    /// <summary>ERROR_PPP_LCP_TERMINATED: согласование PPP (LCP) прервано.</summary>
+    internal const uint LcpTerminatedCode = 734;
+
+    /// <summary>Сколько повторов даётся после отказа 734, прежде чем он считается отказом входа.</summary>
+    internal const int LcpTerminatedAutoRetries = 2;
 
     private const int MinRetryDelaySeconds = 5;
     private const int MaxRetryDelaySeconds = 3600;
@@ -745,6 +761,7 @@ public sealed partial class Coordinator
         // Повтор после открытия адресов проверки отзыва даётся заново: следующий обрыв через несколько дней
         // может снова упереться в недоступную проверку отзыва, и без повтора туннель стоял бы до вмешательства.
         tunnel.RevocationRetryUsed = false;
+        tunnel.LcpTerminatedRetries = 0;
         tunnel.LastErrorText = null;
         tunnel.LastErrorCategory = ErrorCategory.None;
         tunnel.LastErrorCode = null;

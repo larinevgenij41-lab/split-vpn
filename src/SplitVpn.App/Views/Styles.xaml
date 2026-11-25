@@ -88,6 +88,47 @@
         <Setter Property="Padding" Value="20" />
         <Setter Property="HorizontalContentAlignment" Value="Stretch" />
     </Style>
+    <!-- Бейдж без лишних отступов и со своими цветами. Цвета бейджа WPF-UI заданы в его шаблоне и местами нечитаемы:
+         белый текст на светло-голубом («Info») и на светло-зелёном, белый на белом («Secondary») в светлой теме, чёрный на
+         тёмно-сером в тёмной. Здесь цвета — из кистей темы с контрастом текста не ниже WCAG AA (4,5:1) в обеих темах:
+         цветные бейджи — системные цвета состояния и акцента с текстом для акцента (белым в светлой теме, чёрным в тёмной),
+         нейтральный — подложка с рамкой и основным цветом текста. -->
+    <Style x:Key="AppBadge" BasedOn="{StaticResource {x:Type ui:Badge}}" TargetType="ui:Badge">
+        <Setter Property="Padding" Value="8,2" />
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Background" Value="{DynamicResource AccentFillColorDefaultBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource TextOnAccentFillColorPrimaryBrush}" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ui:Badge">
+                    <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="4" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" TextElement.Foreground="{TemplateBinding Foreground}"
+                                          TextElement.FontSize="{TemplateBinding FontSize}" />
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+        <Style.Triggers>
+            <Trigger Property="Appearance" Value="Success">
+                <Setter Property="Background" Value="{DynamicResource SystemFillColorSuccessBrush}" />
+            </Trigger>
+            <Trigger Property="Appearance" Value="Caution">
+                <Setter Property="Background" Value="{DynamicResource SystemFillColorCautionBrush}" />
+            </Trigger>
+            <Trigger Property="Appearance" Value="Danger">
+                <Setter Property="Background" Value="{DynamicResource SystemFillColorCriticalBrush}" />
+            </Trigger>
+            <Trigger Property="Appearance" Value="Secondary">
+                <Setter Property="Background" Value="{DynamicResource SubtleFillColorSecondaryBrush}" />
+                <Setter Property="BorderBrush" Value="{DynamicResource ControlStrokeColorDefaultBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
+            </Trigger>
+        </Style.Triggers>
+    </Style>
     <!-- Группа кнопок и полей, переносимая на новую строку: интервал 8 справа и снизу у каждого элемента,
          отрицательный отступ панели убирает его у правого и нижнего края — последняя кнопка стоит вровень с краем,
          а перенесённая строка отделена от первой. Подходит и для элемента управления строки-карточки (CardRow). -->
@@ -97,7 +138,7 @@
                 <Setter Property="Margin" Value="0,0,8,8" />
                 <Setter Property="VerticalAlignment" Value="Center" />
             </Style>
-            <Style TargetType="ui:Badge" BasedOn="{StaticResource {x:Type ui:Badge}}">
+            <Style TargetType="ui:Badge" BasedOn="{StaticResource AppBadge}">
                 <Setter Property="Margin" Value="0,0,8,8" />
             </Style>
             <Style TargetType="ComboBox" BasedOn="{StaticResource {x:Type ComboBox}}">
@@ -229,10 +270,5 @@
         </Setter>
     </Style>
 
-    <!-- Бейдж без лишних отступов -->
-    <Style BasedOn="{StaticResource {x:Type ui:Badge}}" TargetType="ui:Badge">
-        <Setter Property="Padding" Value="8,2" />
-        <Setter Property="FontSize" Value="12" />
-        <Setter Property="VerticalAlignment" Value="Center" />
-    </Style>
+    <Style BasedOn="{StaticResource AppBadge}" TargetType="ui:Badge" />
 </ResourceDictionary>

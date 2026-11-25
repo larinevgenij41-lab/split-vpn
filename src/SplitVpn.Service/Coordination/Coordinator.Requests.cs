@@ -674,6 +674,7 @@ public sealed partial class Coordinator
             tunnel.ServerCertificate = null;
             tunnel.RevocationHosts = [];
             tunnel.RevocationRetryUsed = false;
+            tunnel.LcpTerminatedRetries = 0;
             tunnel.CertificateProbeGeneration = 0;
             tunnel.CertificateProbeRunning = false;
             tunnel.LastCertificateProbeUtc = default;
@@ -883,6 +884,7 @@ public sealed partial class Coordinator
             }
             // «Подключить» - действие пользователя: повтор после открытия адресов проверки отзыва даётся заново.
             tunnel.RevocationRetryUsed = false;
+            tunnel.LcpTerminatedRetries = 0;
             // Общее «Подключить» поднимает всё, что было положено вручную. Но «Подключить» с паролем для
             // одного профиля (ввод пароля на главной) не должен молча поднимать чужие положенные туннели.
             if (request.ProfileId is null || request.ProfileId == tunnel.ProfileId)
