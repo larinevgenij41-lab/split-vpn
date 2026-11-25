@@ -123,9 +123,18 @@ public static class VpnProtocols
 
     public static bool IsThumbprint(string value) => NormalizeThumbprint(value) is { Length: 40 } clean && clean.All(Uri.IsHexDigit);
 
-    public static IReadOnlyList<string> ValidateAuthentication(ConnectionProfile profile)
+    public static IReadOnlyList<string> ValidateAuthentication(ConnectionProfile profile) => ValidateAuthentication(profile, true, true);
+
+    /// <param name="profile">Подключение.</param>
+    /// <param name="protocolKnown">
+    /// false - протокол подставлен вместо неизвестного этой версии: разделы AnyConnect и SSH и проверки способа входа
+    /// не выполняются, остаются общие ограничения имени пользователя и домена.
+    /// </param>
+    /// <param name="authKnown">false - способ входа подставлен: раздел EAP не проверяется.</param>
+    public static IReadOnlyList<string> ValidateAuthentication(ConnectionProfile profile, bool protocolKnown, bool authKnown)
     {
         ArgumentNullException.ThrowIfNull(profile);
+        authKnown &= protocolKnown;
 
         // Профиль приходит из файла настроек и по каналу управления: «null» вместо строки или раздела
         // не должен ронять проверку — сначала нормализация, потом разбор.
@@ -136,7 +145,7 @@ public static class VpnProtocols
             errors.Add("Имя пользователя/домен не помещаются в поля RAS или содержат нулевой символ.");
         }
 
-        if (NeedsServerValidation(profile.AuthMethod))
+        if (authKnown && NeedsServerValidation(profile.AuthMethod))
         {
             var names = profile.Eap.ServerNames.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
             if (names.Length == 0 || names.Any(n => Uri.CheckHostName(n) != UriHostNameType.Dns))
@@ -150,17 +159,17 @@ public static class VpnProtocols
             }
         }
 
-        if (profile.AuthMethod == AuthMethod.EapTls && !IsThumbprint(profile.Eap.ClientCertificateThumbprint))
+        if (authKnown && profile.AuthMethod == AuthMethod.EapTls && !IsThumbprint(profile.Eap.ClientCertificateThumbprint))
         {
             errors.Add("Укажите SHA-1 отпечаток клиентского сертификата EAP-TLS.");
         }
 
-        if (profile.Protocol == VpnProtocol.AnyConnect)
+        if (protocolKnown && profile.Protocol == VpnProtocol.AnyConnect)
         {
             ValidateAnyConnect(profile.AnyConnect, errors);
         }
 
-        if (profile.Protocol == VpnProtocol.SshVpn)
+        if (protocolKnown && profile.Protocol == VpnProtocol.SshVpn)
         {
             ValidateSshVpn(profile, errors);
         }

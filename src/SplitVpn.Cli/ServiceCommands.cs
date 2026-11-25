@@ -130,7 +130,10 @@ internal static class ServiceCommands
         {
             case "get":
                 var current = Expect<AppSettings>(await SendAsync(client, new GetSettingsRequest()));
-                var json = JsonSerializer.Serialize(current, JsonDefaults.Options);
+                // Тот же текст, что служба пишет в свой файл: значения, неизвестные этой версии, и исходные цели и группы
+                // выключенных ими подключений стоят на своих местах. Модель как есть (с подставленными блокировками и
+                // служебными разделами) после «settings set» без правок потеряла бы цели и участников групп.
+                var json = SettingsSerializer.Serialize(current);
                 var revision = SettingsSerializer.Revision(current);
                 if (args.Option("--out") is { } output)
                 {

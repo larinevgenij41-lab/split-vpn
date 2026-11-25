@@ -396,4 +396,97 @@ public sealed class UnknownSettingValuesTests
         Assert.Equal(RouteTarget.Blocked, repaired.DefaultTarget);
         Assert.Single(repairs);
     }
+
+    /// <summary>
+    /// Итерация 9 (C2): у подключения с неизвестным протоколом проверяются поля, смысл которых от протокола не зависит:
+    /// название, что адрес сервера задан и без управляющих символов, имя пользователя и домен.
+    /// </summary>
+    [Fact]
+    public void PreservedProfile_UnknownProtocol_GeneralFieldsAreValidated()
+    {
+        var json = JsonNode.Parse(TwoProfiles())!.AsObject();
+        var profile = json["profiles"]![0]!.AsObject();
+        profile["name"] = " ";
+        profile["server"] = "wg.example.org\u0001";
+        profile["userName"] = "user\0";
+
+        var settings = SettingsSerializer.Deserialize(json.ToJsonString()).Settings!;
+        var errors = SettingsValidator.Validate(settings).Errors;
+
+        Assert.True(UnknownSettingValues.HasPreservedValues(settings.Profiles[0]));
+        Assert.Contains("У подключения не задано название.", errors);
+        Assert.Contains(errors, e => e.Contains("неверный адрес сервера", StringComparison.Ordinal));
+        Assert.Contains(errors, e => e.Contains("нулевой символ", StringComparison.Ordinal));
+    }
+
+    /// <summary>C2: неизвестна только роль - протокол, сервер и способ входа известны и проверяются полностью.</summary>
+    [Fact]
+    public void PreservedProfile_UnknownRoleOnly_KnownFieldsAreFullyValidated()
+    {
+        var json = JsonNode.Parse(TwoProfiles("Sstp"))!.AsObject();
+        var profile = json["profiles"]![0]!.AsObject();
+        profile["role"] = "Standby";
+        profile["server"] = "0.0.0.0";
+        profile["authMethod"] = "EapTls";
+
+        var settings = SettingsSerializer.Deserialize(json.ToJsonString()).Settings!;
+        var errors = SettingsValidator.Validate(settings).Errors;
+
+        Assert.True(UnknownSettingValues.HasPreservedValues(settings.Profiles[0]));
+        Assert.Contains(errors, e => e.Contains("не может быть адресом VPN-сервера", StringComparison.Ordinal));
+        Assert.Contains(errors, e => e.Contains("EAP", StringComparison.Ordinal));
+    }
+
+    /// <summary>C2: способ входа подставлен - зависящие от него проверки (имя пользователя, поддержка протоколом) не мешают сохранению.</summary>
+    [Fact]
+    public void PreservedProfile_UnknownAuthMethod_AuthDependentChecksAreSkipped()
+    {
+        var json = JsonNode.Parse(TwoProfiles("Sstp"))!.AsObject();
+        json["profiles"]![0]!["authMethod"] = "Passkey";
+
+        var settings = SettingsSerializer.Deserialize(json.ToJsonString()).Settings!;
+        var validation = SettingsValidator.Validate(settings);
+
+        Assert.True(UnknownSettingValues.HasPreservedValues(settings.Profiles[0]));
+        Assert.True(validation.IsValid, string.Join(" ", validation.Errors));
+    }
+
+    /// <summary>
+    /// Итерация 9 (C1): «settings get» без правок, затем «settings set» того же файла после отката. Команда выдаёт текст,
+    /// который служба пишет в свой файл (<see cref="SettingsSerializer.Serialize"/>): подключение неизвестного протокола -
+    /// цель «Остальной интернет» и участник группы - после записи остаётся там же, файл службы не меняется.
+    /// </summary>
+    [Fact]
+    public void CliGetThenSet_Unedited_IsLossless()
+    {
+        var json = JsonNode.Parse(TwoProfiles())!.AsObject();
+        var mixed = new Guid("cccccccc-3333-0000-0000-000000000003");
+        json["groups"] = JsonNode.Parse($$"""
+            [ { "id": "{{mixed}}", "name": "Смешанная", "members": [ "{{Future}}", "{{Office}}" ] } ]
+            """);
+        var current = SettingsSerializer.Deserialize(json.ToJsonString()).Settings!;
+        var stored = SettingsSerializer.Serialize(current);
+
+        // settings get: этот текст выводится или пишется в файл; settings set: файл разбирается и уходит службе.
+        var printed = SettingsSerializer.Serialize(IpcRoundTrip(current));
+        var loaded = SettingsSerializer.Deserialize(printed);
+        Assert.NotNull(loaded.Settings);
+        var received = UnknownSettingValues.KeepOnlyTrusted(IpcRoundTrip(loaded.Settings), current);
+        Assert.True(SettingsValidator.Validate(received).IsValid);
+        Assert.Equal(SettingsSerializer.Revision(current), SettingsSerializer.Revision(loaded.Settings));
+        var written = SettingsSerializer.Serialize(received);
+
+        Assert.Equal(stored, written);
+        var file = JsonNode.Parse(written)!.AsObject();
+        Assert.Equal("WireGuard", file["profiles"]![0]!["protocol"]!.GetValue<string>());
+        Assert.Equal("Primary", file["profiles"]![0]!["role"]!.GetValue<string>());
+        Assert.Equal(Future.ToString(), file["defaultTarget"]!["id"]!.GetValue<string>());
+        Assert.Equal(Future.ToString(), file["rules"]![1]!["target"]!["id"]!.GetValue<string>());
+        Assert.Equal([Future.ToString(), Office.ToString()], file["groups"]![0]!["members"]!.AsArray().Select(m => m!.GetValue<string>()));
+
+        // Прежний вывод «settings get» - модель как есть - терял цель и участника группы на той же круговой записи.
+        var raw = SettingsSerializer.Deserialize(JsonSerializer.Serialize(current, JsonDefaults.Options)).Settings!;
+        var lossy = JsonNode.Parse(SettingsSerializer.Serialize(UnknownSettingValues.KeepOnlyTrusted(raw, current)))!.AsObject();
+        Assert.Equal("Block", lossy["defaultTarget"]!["kind"]!.GetValue<string>());
+    }
 }

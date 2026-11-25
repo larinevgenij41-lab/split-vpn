@@ -255,15 +255,18 @@ public static class SettingsValidator
             if (UnknownSettingValues.HasPreservedValues(profile))
             {
                 // Подключение записано более новой версией программы: его протокол, роль или способ входа здесь
-                // подставлены вместо неизвестных, проверять их бессмысленно, а поднимать такое подключение нельзя.
-                // Пропуск проверки нужен только подключениям из файла настроек службы: раздел, пришедший от клиента
-                // канала управления или из файла импорта, служба снимает до проверки (UnknownSettingValues.KeepOnlyTrusted,
-                // ConnectionEdits.PrepareImport), и такое подключение проверяется полностью.
+                // подставлены вместо неизвестных, проверять подставленное бессмысленно, а поднимать такое подключение
+                // нельзя. Остальные поля, которые эта версия понимает, проверяются (название, сервер, имя пользователя,
+                // разделы EAP, AnyConnect и SSH там, где их смысл не зависит от подставленного). Раздел, пришедший от
+                // клиента канала управления или из файла импорта, служба снимает до проверки
+                // (UnknownSettingValues.KeepOnlyTrusted, ConnectionEdits.PrepareImport), и такое подключение
+                // проверяется полностью.
                 if (profile.Role != ProfileRole.Off)
                 {
                     errors.Add(Text($"Подключение «{profile.Name}» записано более новой версией программы, и часть его параметров этой версии неизвестна: включить его можно только в той версии."));
                 }
 
+                ValidateProfile(profile, errors, UnknownSettingValues.SubstitutedFields(profile));
                 continue;
             }
 
@@ -547,14 +550,31 @@ public static class SettingsValidator
         }
     }
 
-    private static void ValidateProfile(ConnectionProfile profile, List<string> errors)
+    /// <param name="substituted">
+    /// JSON-имена полей, значения которых подставлены вместо неизвестных этой версии (подключение из файла более новой
+    /// версии, см. <see cref="UnknownSettingValues.SubstitutedFields"/>): они и проверки, смысл которых от них зависит,
+    /// пропускаются. Протокол подставлен - формат адреса сервера неизвестен, и проверяется только, что адрес задан и
+    /// без управляющих символов; способ входа и разделы EAP, AnyConnect и SSH тогда тоже не проверяются.
+    /// </param>
+    private static void ValidateProfile(ConnectionProfile profile, List<string> errors, IReadOnlySet<string>? substituted = null)
     {
+        bool Known(string field) => substituted?.Contains(field) != true;
+        var protocolKnown = Known("protocol");
+        var authKnown = protocolKnown && Known("authMethod");
+
         if (string.IsNullOrWhiteSpace(profile.Name))
         {
             errors.Add("У подключения не задано название.");
         }
 
-        if (!VpnProtocols.TryParseServer(profile.Server, profile.Protocol, out var server))
+        if (!protocolKnown)
+        {
+            if (string.IsNullOrWhiteSpace(profile.Server) || profile.Server.Length > MaxForeignServerLength || profile.Server.Any(char.IsControl))
+            {
+                errors.Add(Text($"Подключение «{profile.Name}»: неверный адрес сервера."));
+            }
+        }
+        else if (!VpnProtocols.TryParseServer(profile.Server, profile.Protocol, out var server))
         {
             errors.Add(Text($"Подключение «{profile.Name}»: неверный адрес сервера."));
         }
@@ -563,29 +583,36 @@ public static class SettingsValidator
             errors.Add(Text($"Подключение «{profile.Name}»: {server.Host} не может быть адресом VPN-сервера."));
         }
 
-        if (!VpnProtocols.Supports(profile.Protocol, profile.AuthMethod) || !Enum.IsDefined(profile.IpsecAuthentication) || !Enum.IsDefined(profile.Role))
+        if ((authKnown && !VpnProtocols.Supports(profile.Protocol, profile.AuthMethod))
+            || (Known("ipsecAuthentication") && !Enum.IsDefined(profile.IpsecAuthentication)) || !Enum.IsDefined(profile.Role))
         {
             errors.Add(Text($"Подключение «{profile.Name}»: неподдерживаемый протокол, способ входа или роль."));
         }
 
-        // Число вместо имени значения JSON принимает любое: неизвестный выбор адаптера работал бы как «Автоматически».
-        if (!Enum.IsDefined(profile.PrimaryAdapter))
+        if (Known("primaryAdapter"))
         {
-            errors.Add(Text($"Подключение «{profile.Name}»: неизвестный способ выбора адаптера."));
+            // Число вместо имени значения JSON принимает любое: неизвестный выбор адаптера работал бы как «Автоматически».
+            if (!Enum.IsDefined(profile.PrimaryAdapter))
+            {
+                errors.Add(Text($"Подключение «{profile.Name}»: неизвестный способ выбора адаптера."));
+            }
+
+            if (profile.PrimaryAdapter == AdapterSelection.Pinned && profile.PinnedInterfaceGuid is null)
+            {
+                errors.Add(Text($"Подключение «{profile.Name}»: не выбран адаптер для закрепления."));
+            }
         }
 
-        errors.AddRange(VpnProtocols.ValidateAuthentication(profile));
+        errors.AddRange(VpnProtocols.ValidateAuthentication(profile, protocolKnown, authKnown));
 
-        if (VpnProtocols.NeedsPassword(profile.AuthMethod) && string.IsNullOrWhiteSpace(profile.UserName))
+        if (authKnown && VpnProtocols.NeedsPassword(profile.AuthMethod) && string.IsNullOrWhiteSpace(profile.UserName))
         {
             errors.Add(Text($"Подключение «{profile.Name}»: не задано имя пользователя."));
         }
-
-        if (profile.PrimaryAdapter == AdapterSelection.Pinned && profile.PinnedInterfaceGuid is null)
-        {
-            errors.Add(Text($"Подключение «{profile.Name}»: не выбран адаптер для закрепления."));
-        }
     }
+
+    /// <summary>Предел длины адреса сервера подключения с неизвестным этой версии протоколом.</summary>
+    private const int MaxForeignServerLength = 512;
 
     private static void ValidateGeoSource(GeoUpdateSettings geo, List<string> errors)
     {

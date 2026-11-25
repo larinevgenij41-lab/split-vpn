@@ -65,6 +65,24 @@ public static class UnknownSettingValues
     public static bool HasPreservedValues(ConnectionProfile? profile) => profile?.Extra?.ContainsKey(PreservedKey) == true;
 
     /// <summary>
+    /// JSON-имена полей подключения, значения которых подставлены вместо сохранённых в разделе <see cref="PreservedKey"/>
+    /// (сравнение без учёта регистра); роль в разделе есть всегда. Раздела нет - пусто.
+    /// </summary>
+    public static IReadOnlySet<string> SubstitutedFields(ConnectionProfile? profile)
+    {
+        var fields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (profile?.Extra?.TryGetValue(PreservedKey, out var section) == true && section.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in section.EnumerateObject())
+            {
+                fields.Add(property.Name);
+            }
+        }
+
+        return fields;
+    }
+
+    /// <summary>
     /// Есть служебный раздел (в любом регистре имени) у настроек или подключений: запись файла должна пройти через
     /// <see cref="Restore"/>, который вернёт сохранённое и уберёт сами разделы.
     /// </summary>

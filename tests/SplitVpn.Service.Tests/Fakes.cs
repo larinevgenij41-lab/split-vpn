@@ -420,8 +420,12 @@ internal sealed class FakeWfp : IWfpOps
 
     public int Reopens { get; private set; }
 
+    /// <summary>Вызывается в начале каждой замены групп (посреди сверки).</summary>
+    public Action? BeforeReplace { get; set; }
+
     public IReadOnlyDictionary<FilterGroup, int> ReplaceGroups(IReadOnlyDictionary<FilterGroup, IReadOnlyList<FilterSpec>> groups, Action<int, int>? progress = null)
     {
+        BeforeReplace?.Invoke();
         if (FailNextReplace > 0)
         {
             FailNextReplace--;
@@ -1026,7 +1030,8 @@ internal sealed class FakeProxy : IDnsProxy
     {
         if (FailStart)
         {
-            throw new IOException("порт 53 занят другой программой");
+            // Как DnsProxyServer: эксклюзивная привязка UDP к 127.0.0.1:53 не удалась.
+            throw new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.AddressAlreadyInUse);
         }
 
         IsRunning = true;

@@ -202,7 +202,10 @@ $declared = ([xml](Get-Content (Join-Path $root 'Directory.Build.props'))).Proje
 if (-not $Version) { $Version = $declared }
 if ($Version -ne $declared) { throw "Версия $Version не совпадает с Directory.Build.props ($declared)" }
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Версия должна быть вида «0.8.0», а не «$Version»" }
-if (-not (Test-Path $NotesFile)) { throw "Нет файла заметок: $NotesFile" }
+if (-not (Test-Path -LiteralPath $NotesFile -PathType Leaf)) { throw "Нет файла заметок: $NotesFile" }
+# Полный путь файловой системы сразу: методы .NET ([IO.File]::ReadAllText ниже) берут относительный путь от
+# текущего каталога процесса, а не от каталога PowerShell, и прочли бы другой файл или не нашли бы его.
+$NotesFile = (Resolve-Path -LiteralPath $NotesFile).ProviderPath
 if (-not (Test-Path $KeyPath)) { throw "Нет ключа выпуска: $KeyPath. Создайте его командой splitvpn-cli release-keygen." }
 
 # Пароль ключа — до сборки: спрашивать его через несколько минут сборки неудобно.
@@ -308,6 +311,24 @@ if ($cliFileVersion -ne $Version -and -not "$cliFileVersion".StartsWith("$Versio
 
 $msi = Join-Path $root "artifacts\installer\SplitVpn-$Version.msi"
 if (-not (Test-Path $msi)) { throw "Нет установщика $msi" }
+
+# При -SkipBuild установщик собран раньше и неизвестно из чего: выкладывается только MSI с отметкой
+# build-installer.ps1 о сборке из чистого дерева текущего HEAD (снимок исходников берётся из HEAD), и только
+# тот самый файл, для которого отметка записана (SHA-256).
+if ($SkipBuild) {
+    $stampPath = "$msi.build.json"
+    if (-not (Test-Path -LiteralPath $stampPath -PathType Leaf)) {
+        throw "Нет отметки сборки ${stampPath}: установщик не привязан к коммиту. Пересоберите его (без -SkipBuild или scripts\build-installer.ps1 из чистого дерева)."
+    }
+    try { $stamp = [IO.File]::ReadAllText($stampPath, [Text.Encoding]::UTF8) | ConvertFrom-Json }
+    catch { throw "Отметка сборки $stampPath не читается: $($_.Exception.Message)" }
+    $headCommit = (git -C $root rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $headCommit) { throw 'Не удалось прочитать HEAD репозитория' }
+    if ($stamp.clean -ne $true) { throw "Установщик $msi собран не из чистого дерева (отметка $stampPath): пересоберите его из зафиксированного состояния." }
+    if ([string]$stamp.commit -ne $headCommit) { throw "Установщик $msi собран из коммита $($stamp.commit), а HEAD — ${headCommit}: пересоберите его." }
+    $msiHash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ([string]$stamp.sha256 -ne $msiHash) { throw "Отметка $stampPath записана для другого файла (SHA-256 $($stamp.sha256), а у $msi — $msiHash): пересоберите установщик." }
+}
 
 # Версия внутри пакета: ловит случай «выложили MSI от прошлой сборки».
 $productVersion = MsiProductVersion $msi

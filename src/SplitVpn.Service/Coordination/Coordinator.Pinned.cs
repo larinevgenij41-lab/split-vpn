@@ -401,6 +401,8 @@ public sealed partial class Coordinator
 
     private void CompletePins(bool applied)
     {
+        // В очереди актора: перевод часов, замеченный здесь, сдвигает сроки актора сразу, а не в следующей работе.
+        DetectClockJumpBack();
         lock (_pinGate)
         {
             if (applied)
@@ -435,6 +437,7 @@ public sealed partial class Coordinator
         var dns = ServiceDnsAddresses().Concat(UpstreamDnsAddresses())
             .Concat(Facts.Tunnels.Values.SelectMany(t => TunnelDnsRoute(t)?.Servers.Select(s => Ipv4.ToUInt(s.Address)) ?? []))
             .ToHashSet();
+        DetectClockJumpBack();
         lock (_pinGate)
         {
             var now = ClockNowLocked();
@@ -598,6 +601,7 @@ public sealed partial class Coordinator
     /// <summary>Снимает закрепления с истёкшим сроком. true — набор изменился и нужна сверка.</summary>
     private bool DropExpiredPins()
     {
+        DetectClockJumpBack();
         lock (_pinGate)
         {
             var now = ClockNowLocked();

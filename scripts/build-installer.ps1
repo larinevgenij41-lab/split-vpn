@@ -61,6 +61,27 @@ if ($writableGrants.Count) {
     Write-Warning "Корень репозитория $root или его каталог git доступны на запись обычным пользователям — собранный MSI может содержать подменённый ими код (в git worktree каталог git лежит в основной копии):`n  $($writableGrants -join "`n  ")`nКак закрыть доступ — см. scripts\publish-release.ps1 (проверка ACL) или docs\RELEASE.md."
 }
 
+# Состояние дерева, из которого собирается MSI: коммит и чистота по git status --porcelain. Записывается рядом с
+# MSI (SplitVpn-<версия>.msi.build.json); publish-release.ps1 -SkipBuild выкладывает только MSI, собранный из
+# чистого дерева текущего HEAD. Снимается до сборки и сверяется после: правка во время сборки делает его «грязным».
+function Get-TreeState {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $commit = @(& git -C $root rev-parse HEAD 2>$null)
+        if ($LASTEXITCODE -ne 0 -or -not $commit.Count) { return [pscustomobject]@{ Commit = ''; Clean = $false } }
+        $status = @(& git -C $root status --porcelain 2>$null)
+        $clean = $LASTEXITCODE -eq 0 -and -not @($status | Where-Object { $_ }).Count
+        return [pscustomobject]@{ Commit = ([string]$commit[0]).Trim(); Clean = $clean }
+    }
+    finally { $ErrorActionPreference = $previous }
+}
+
+$treeBefore = Get-TreeState
+if (-not $treeBefore.Clean) {
+    Write-Warning 'Рабочее дерево не чистое (git status --porcelain): такой установщик publish-release.ps1 -SkipBuild не выложит.'
+}
+
 $publish =Join-Path $root 'artifacts\publish\install'
 if (Test-Path $publish) { [IO.Directory]::Delete($publish, $true) }
 $env:DOTNET_NOLOGO = '1'
@@ -152,4 +173,19 @@ dotnet build (Join-Path $root 'installer\SplitVpn.Installer.wixproj') -c $Config
 if ($LASTEXITCODE -ne 0) { throw "Сборка установщика завершилась с кодом $LASTEXITCODE" }
 
 $msi = Get-ChildItem (Join-Path $root 'artifacts\installer\*.msi') | Sort-Object LastWriteTime | Select-Object -Last 1
-Write-Host ("Установщик: {0} ({1:N1} МБ)" -f $msi.FullName, ($msi.Length / 1MB))
+
+$treeAfter = Get-TreeState
+$stamp = [ordered]@{
+    commit = $treeBefore.Commit
+    clean = [bool]($treeBefore.Clean -and $treeAfter.Clean -and $treeBefore.Commit -eq $treeAfter.Commit)
+    version = $version
+    sha256 = (Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    builtUtc = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+$stampPath = "$($msi.FullName).build.json"
+[IO.File]::WriteAllText($stampPath, ($stamp | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+if (-not $stamp.clean) {
+    Write-Warning "Установщик собран не из чистого дерева коммита $($stamp.commit): отметка $stampPath запрещает выкладывать его через publish-release.ps1 -SkipBuild."
+}
+
+Write-Host ("Установщик: {0} ({1:N1} МБ), коммит {2}" -f $msi.FullName, ($msi.Length / 1MB), $stamp.commit)

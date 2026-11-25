@@ -419,12 +419,20 @@ public static class ServiceRecovery
         }
     }
 
+    /// <summary>
+    /// Сколько ждать штатной остановки службы, прежде чем завершить её процесс: срок остановки хоста
+    /// (<see cref="CoordinatorHost.ShutdownTimeout"/>) и 2 с на выход процесса. Меньший срок обрывал бы ещё идущую
+    /// штатную остановку - возврат DNS, снятие фильтров и прощание помощников со шлюзом.
+    /// </summary>
+    internal static readonly TimeSpan StopWaitBeforeKill = CoordinatorHost.ShutdownTimeout + TimeSpan.FromSeconds(2);
+
     private static void StopService(CancellationToken cancellationToken)
     {
         var (pid, _) = SystemMetrics.ServiceStatus(ServicePaths.ServiceName);
         RunSc($"stop {ServicePaths.ServiceName}");
-        for (var i = 0; i < 40 && !cancellationToken.IsCancellationRequested
-            && SystemMetrics.ServiceStatus(ServicePaths.ServiceName).State != "SERVICE_STOPPED"; i++)
+        var waiting = Stopwatch.StartNew();
+        while (!cancellationToken.IsCancellationRequested && waiting.Elapsed < StopWaitBeforeKill
+            && SystemMetrics.ServiceStatus(ServicePaths.ServiceName).State != "SERVICE_STOPPED")
         {
             Thread.Sleep(500);
         }

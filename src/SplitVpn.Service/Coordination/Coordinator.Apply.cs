@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using System.Globalization;
 using System.Net;
+using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
 using SplitVpn.Core.Net;
 using SplitVpn.Core.OpenConnect;
@@ -1593,7 +1594,16 @@ public sealed partial class Coordinator
 
     private void EnsureDns()
     {
-        EnsureProxyRunning();
+        try
+        {
+            EnsureProxyRunning();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException && !_deps.DnsProxy.IsRunning)
+        {
+            // Посредник не слушает 127.0.0.1:53: адаптеры не должны оставаться направленными туда (см. WithdrawProxyDns).
+            WithdrawProxyDns();
+            throw ProxyStartFailure(ex);
+        }
 
         // Сбой на одном адаптере или туннеле не должен оставлять без DNS остальные и посредник без настроек:
         // каждый обрабатывается отдельно, первая ошибка пробрасывается в конце (сверка отметит неполное применение).
@@ -1610,8 +1620,10 @@ public sealed partial class Coordinator
         // Занятые адреса, которые ещё нельзя отпускать: нужные сейчас и те, что могли остаться DNS-сервером на адаптере,
         // где запись DNS не удалась. null - список такого адаптера не прочитан, и не отпускается ничего.
         HashSet<uint>? keep = [.. claimed];
+        var processed = new HashSet<Guid>();
         foreach (var adapter in adapters)
         {
+            processed.Add(adapter.InterfaceGuid);
             var dnsWritten = false;
             try
             {
@@ -1655,6 +1667,11 @@ public sealed partial class Coordinator
         // адаптеров. Адрес, который после сбоя записи ещё стоит DNS-сервером на сбойном адаптере, остаётся занятым;
         // сбой на постороннем адаптере (или туннеле, которому свой адрес не ставится) прочие адреса не держит - иначе
         // прежний адрес был бы занят бессрочно, пока тот адаптер сбоит.
+        if (keep is not null && !WithdrawReleasedAddresses(processed, keep))
+        {
+            keep = null;
+        }
+
         if (keep is not null)
         {
             _deps.DnsProxy.ReleaseAdapterAddresses(keep);
@@ -1662,6 +1679,114 @@ public sealed partial class Coordinator
 
         failure?.Throw();
     }
+
+    /// <summary>
+    /// Адаптеры, которых нет среди обработанных этой сверкой (отключён, пропал адрес, перестал быть основным), но чей
+    /// IPv4-список DNS - наш «адрес, 127.0.0.1» с адресом, который сейчас будет освобождён: им ставится одиночный
+    /// 127.0.0.1 до освобождения. Иначе после переподключения адаптера Windows спрашивала бы освобождённый адрес:53, а
+    /// его до следующей сверки мог занять процесс без прав администратора. Запись DNS по GUID работает и на
+    /// отключённом адаптере. Перебираются адаптеры с копией DNS: только им служба ставит свой список (без копии он
+    /// не трогается, см. <see cref="EnsureAdapterLoopback"/>). Запись не удалась - адреса списка остаются занятыми.
+    /// false - список не прочитан, и не освобождается ничего.
+    /// </summary>
+    private bool WithdrawReleasedAddresses(HashSet<Guid> processed, HashSet<uint> keep)
+    {
+        foreach (var (guid, backup) in _deps.DnsBackups.Load().Where(b => !processed.Contains(b.Key)))
+        {
+            string current;
+            try
+            {
+                current = _deps.Dns.ReadNameServer(guid);
+            }
+            catch (NativeCallException ex) when (ex.Code == 2)
+            {
+                // Интерфейса больше нет: спрашивать его адрес некому.
+                continue;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _deps.Logger.LogDebug(ex, "DNS адаптера {Interface} не прочитан: занятые адреса не освобождаются", guid);
+                return false;
+            }
+
+            var released = ParseAddresses(current).Where(a => !keep.Contains(a)).ToList();
+            if (released.Count == 0 || !InterfaceDnsOps.IsProxySet(current))
+            {
+                continue;
+            }
+
+            try
+            {
+                var originalV6 = InterfaceDnsOps.KnownOriginalV6(backup);
+                _wifiRecorder?.Note($"Служба: DNS адаптера {guid} - было «{current}», ставится «{InterfaceDnsOps.ProxyNameServers(null)}» (адрес освобождается)");
+                _deps.Dns.ApplyLoopback(guid, originalV6, InterfaceDnsOps.ProxyNameServers(null), ipv6Known: originalV6 is not null);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _deps.Logger.LogWarning(ex, "DNS адаптера {Interface} не переписан: его прежний адрес остаётся занятым посредником", guid);
+                keep.UnionWith(released);
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Посредник не запустился (порт 53 на 127.0.0.1 держит другая программа): адаптерам, которым служба ставила свой
+    /// DNS, возвращается исходный из копий - иначе их запросы получал бы тот, кто занял порт. Наш 127.0.0.1 снимается
+    /// и с туннелей. Сбой возврата не прячет причину: в ошибку сверки уходит сбой запуска посредника, а возврат и запуск
+    /// повторяются на следующих сверках. Утечки DNS мимо политики нет: DNS-страж защиты (порт 53 закрыт всем, кроме
+    /// loopback, самой службы и трафика туннеля) не пропускает запросы к исходным серверам, и имена не разрешаются, пока
+    /// посредник не займёт порт.
+    /// </summary>
+    private void WithdrawProxyDns()
+    {
+        // Сверка повторяется, пока порт занят: кеш DNS сбрасывается, только когда что-то действительно возвращено.
+        var changed = _deps.DnsBackups.Load().Count > 0;
+        try
+        {
+            RestoreAllDns();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _deps.Logger.LogWarning(ex, "DNS адаптеров не возвращён после сбоя запуска DNS-посредника; повтор на следующей сверке");
+        }
+
+        foreach (var tunnel in Facts.Tunnels.Values.Where(t => t.Adapter is not null))
+        {
+            try
+            {
+                var guid = tunnel.Adapter!.InterfaceGuid;
+                if (InterfaceDnsOps.IsLoopback(_deps.Dns.ReadNameServer(guid)))
+                {
+                    _deps.Dns.ClearNameServer(guid);
+                    changed = true;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _deps.Logger.LogWarning(ex, "DNS туннеля {Name} не снят после сбоя запуска DNS-посредника", tunnel.Name);
+            }
+        }
+
+        if (changed)
+        {
+            FlushDnsCacheSafely("DNS-посредник не запустился");
+        }
+    }
+
+    /// <summary>
+    /// Ошибка сверки с причиной: занятый порт (эксклюзивная привязка UDP к 127.0.0.1:53 не удалась - WSAEADDRINUSE или
+    /// WSAEACCES) называется прямо.
+    /// </summary>
+    private static IOException ProxyStartFailure(Exception cause) => cause is SocketException
+        {
+            SocketErrorCode: SocketError.AddressAlreadyInUse or SocketError.AccessDenied,
+        }
+        ? new IOException(
+            "DNS-посредник не запущен: порт 53 на 127.0.0.1 занят другой программой. Обычный DNS адаптеров возвращён, "
+            + "имена не разрешаются до освобождения порта; служба повторяет запуск. (" + cause.Message + ")", cause)
+        : new IOException("DNS-посредник не запущен: " + cause.Message + ". Обычный DNS адаптеров возвращён; служба повторяет запуск.", cause);
 
     /// <summary>
     /// Запись DNS адаптера не удалась: адреса из его текущего IPv4-списка DNS добавляются к удерживаемым. false - список
