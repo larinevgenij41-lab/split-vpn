@@ -8,38 +8,74 @@ namespace SplitVpn.Service.Tests;
 public sealed class OrphanDnsTests
 {
     [Theory]
-    // Служба остановлена: всё, что выглядит нашим, сбрасывается, даже если порт 53 кто-то слушает.
-    [InlineData("127.0.0.1", "", true, true, true, true, false)]
-    [InlineData("127.0.0.1", "::1", true, true, true, true, true)]
-    [InlineData("192.168.1.50,127.0.0.1", "", true, true, true, true, false)] // прежний адрес адаптера, уже не его
-    [InlineData("10.0.0.7 127.0.0.1", "::1", true, false, false, true, true)]
-    [InlineData("8.8.8.8", "", true, false, false, false, false)]
-    [InlineData("", "", true, false, false, false, false)]
-    [InlineData("127.0.0.1,8.8.8.8", "", true, false, false, false, false)] // loopback не последним — не наш набор
-    // Служба работает: только если на 127.0.0.1:53 никто не слушает.
-    [InlineData("127.0.0.1", "::1", false, true, true, false, false)]
-    [InlineData("127.0.0.1", "::1", false, false, false, true, true)]
-    [InlineData("127.0.0.1", "::1", false, false, true, true, true)] // ::1 уходит вместе с нашим IPv4
-    // ::1 при не нашем IPv4: только если на [::1]:53 никто не слушает.
-    [InlineData("8.8.8.8", "::1", true, false, false, false, true)]
-    [InlineData("8.8.8.8", "::1", true, false, true, false, false)]
-    [InlineData("8.8.8.8", "2001:4860:4860::8888", true, false, false, false, false)]
-    public void Decide(string v4, string v6, bool serviceStopped, bool v4Listening, bool v6Listening, bool expectV4, bool expectV6)
+    // Служба остановлена: наш набор сбрасывается, если только порт 53 не слушают именно на 127.0.0.1 ([::1] для IPv6).
+    // Слушатель только на 0.0.0.0:53 или [::]:53 (V4/V6 без Exact) — чужая программа, а не резолвер пользователя: сброс.
+    [InlineData("127.0.0.1", "", true, true, true, false, false, false, true, false, false)]
+    [InlineData("127.0.0.1", "::1", true, true, true, false, false, false, true, true, false)]
+    // Резолвер пользователя именно на 127.0.0.1:53 (AdGuard Home, dnscrypt-proxy): адаптер не трогается целиком.
+    [InlineData("127.0.0.1", "", true, true, false, true, false, false, false, false, false)]
+    [InlineData("127.0.0.1", "::1", true, true, false, true, false, false, false, false, false)]
+    // Слушатель именно на [::1]:53: IPv6-список остаётся, наш IPv4 без резолвера на 127.0.0.1 — сбрасывается.
+    [InlineData("127.0.0.1", "::1", true, false, true, false, true, false, true, false, false)]
+    [InlineData("192.168.1.50,127.0.0.1", "", true, false, false, false, false, false, true, false, false)] // прежний адрес адаптера, уже не его
+    [InlineData("10.0.0.7 127.0.0.1", "::1", true, false, false, false, false, false, true, true, false)]
+    [InlineData("8.8.8.8", "", true, false, false, false, false, false, false, false, false)]
+    [InlineData("", "", true, false, false, false, false, false, false, false, false)]
+    [InlineData("127.0.0.1,8.8.8.8", "", true, false, false, false, false, false, false, false, false)] // loopback не последним — не наш набор
+    // ::1 при не нашем IPv4 (служба остановлена): только если [::1]:53 не слушают именно.
+    [InlineData("8.8.8.8", "::1", true, false, false, false, false, false, false, true, false)]
+    [InlineData("8.8.8.8", "::1", true, false, true, false, false, false, false, true, false)]
+    [InlineData("8.8.8.8", "::1", true, false, true, false, true, false, false, false, false)]
+    [InlineData("8.8.8.8", "2001:4860:4860::8888", true, false, false, false, false, false, false, false, false)]
+    // Служба работает («Восстановить сеть» без посредника): только если запросы к 127.0.0.1:53 никто не принимает.
+    [InlineData("127.0.0.1", "::1", false, true, true, false, false, false, false, false, false)]
+    [InlineData("127.0.0.1", "::1", false, false, false, false, false, false, true, true, false)]
+    [InlineData("127.0.0.1", "::1", false, false, true, false, false, false, true, true, false)] // ::1 уходит вместе с нашим IPv4
+    [InlineData("8.8.8.8", "::1", false, false, true, false, false, false, false, false, false)]
+    // Статический IPv4-адрес: «автоматически» оставило бы адаптер без DNS — адаптер не трогается, об этом говорится.
+    [InlineData("127.0.0.1", "::1", true, false, false, false, false, true, false, false, true)]
+    [InlineData("127.0.0.1", "", false, false, false, false, false, true, false, false, true)]
+    [InlineData("8.8.8.8", "", true, false, false, false, false, true, false, false, false)]
+    public void Decide(string v4, string v6, bool serviceStopped, bool v4Any, bool v6Any, bool v4Exact, bool v6Exact, bool staticIpv4,
+        bool expectV4, bool expectV6, bool expectKept)
     {
-        var reset = OrphanDns.Decide(v4, v6, serviceStopped, v4Listening, v6Listening);
+        var reset = OrphanDns.Decide(v4, v6, serviceStopped, new LoopbackListeners(v4Any || v4Exact, v6Any || v6Exact, v4Exact, v6Exact), staticIpv4);
 
         Assert.Equal(expectV4, reset.V4);
         Assert.Equal(expectV6, reset.V6);
         Assert.Equal(expectV4 || expectV6, reset.Any);
+        Assert.Equal(expectKept, reset.KeptStatic);
     }
 
     [Fact]
     public void Decide_Ipv6Unreadable_TouchesOnlyIpv4()
     {
-        var reset = OrphanDns.Decide("127.0.0.1", null, serviceStopped: true, v4Listening: false, v6Listening: false);
+        var reset = OrphanDns.Decide("127.0.0.1", null, serviceStopped: true, default);
 
         Assert.True(reset.V4);
         Assert.False(reset.V6);
+    }
+
+    [Fact]
+    public void StaticNote_AsksToSetDnsManually()
+    {
+        var note = OrphanDnsReset.StaticNote("Ethernet", "127.0.0.1");
+
+        Assert.Contains("адаптер «Ethernet» со статическим адресом", note, StringComparison.Ordinal);
+        Assert.Contains("DNS укажите вручную", note, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Listeners_ExactAndWildcard_AreTold()
+    {
+        static IPEndPoint At(string address, int port = 53) => new(IPAddress.Parse(address), port);
+
+        Assert.Equal(new LoopbackListeners(true, true, false, false), NetworkRecovery.ClassifyListeners([At("::")]));
+        Assert.Equal(new LoopbackListeners(true, false, false, false), NetworkRecovery.ClassifyListeners([At("0.0.0.0")]));
+        Assert.Equal(new LoopbackListeners(true, false, true, false), NetworkRecovery.ClassifyListeners([At("127.0.0.1")]));
+        Assert.Equal(new LoopbackListeners(true, false, true, false), NetworkRecovery.ClassifyListeners([At("::ffff:127.0.0.1")]));
+        Assert.Equal(new LoopbackListeners(false, true, false, true), NetworkRecovery.ClassifyListeners([At("::1")]));
+        Assert.Equal(default, NetworkRecovery.ClassifyListeners([At("127.0.0.1", 5353), At("192.168.1.10")]));
     }
 
     [Fact]

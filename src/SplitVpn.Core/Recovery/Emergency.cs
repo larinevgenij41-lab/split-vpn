@@ -41,7 +41,12 @@ public static class EmergencyExitCodes
     /// <summary>Команда запущена без прав администратора: ничего не делалось.</summary>
     public const int NotElevated = 4;
 
-    /// <summary>Уже выполняется другая команда экстренного отключения или включения: ничего не делалось.</summary>
+    /// <summary>
+    /// Прежде: уже выполняется другая команда, ничего не делалось. Команды emergency-off и emergency-on этот код больше
+    /// не возвращают: блокировку мог занять заранее обычный пользователь (мьютекс в Global\ создаётся без особых прав),
+    /// поэтому после ограниченного ожидания команда выполняется без блокировки, а в итоге (summary) об этом сказано.
+    /// Константа остаётся для скриптов и приложения, которые запускают прежние сборки.
+    /// </summary>
     public const int Busy = 5;
 
     /// <summary>Короткое описание кода для человека.</summary>
@@ -79,19 +84,50 @@ public static class EmergencyRegistry
     public const string StartDemand = "demand";
     public const string StartDisabled = "disabled";
 
-    /// <summary>Флаг из реестра; null — программа не отключена (или ключ недоступен).</summary>
+    /// <summary>
+    /// Строка: действия диспетчера служб при сбое службы, снятые командой на время остановки (формат —
+    /// <c>v1;reset=&lt;с&gt;;actions=&lt;тип&gt;:&lt;мс&gt;,…</c>). Пишется до снятия, удаляется после возврата. Осталась от
+    /// прерванной команды — действия возвращает следующая команда или запуск службы.
+    /// </summary>
+    public const string SavedFailureActionsValue = "EmergencySavedFailureActions";
+
+    /// <summary>Сколько раз читать флаг при сбое чтения.</summary>
+    private const int ReadAttempts = 3;
+
+    /// <summary>
+    /// Флаг из реестра; null — программа не отключена (нет ключа или значения). Сбой чтения повторяется; не прошёл и
+    /// повтор — ключ есть, но не читается, и это не «не отключена»: ответ — флаг с <see cref="EmergencyFlag.Unreadable"/>,
+    /// служба запускается «пустой» (лучше без VPN, чем включить отключённую программу).
+    /// </summary>
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    public static EmergencyFlag? Read()
+    public static EmergencyFlag? Read() => Read(() =>
     {
-        try
+        using var root = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64);
+        using var key = root.OpenSubKey(KeyPath);
+        return key is null ? (null, null, false) : (key.GetValue(FlagValue), key.GetValue(SinceValue), true);
+    }, TimeSpan.FromMilliseconds(200));
+
+    /// <summary>Шов для тестов: <paramref name="read"/> — значения флага и есть ли ключ (исключение — сбой чтения).</summary>
+    public static EmergencyFlag? Read(Func<(object? Flag, object? Since, bool KeyExists)> read, TimeSpan retryDelay)
+    {
+        ArgumentNullException.ThrowIfNull(read);
+        for (var attempt = 1; ; attempt++)
         {
-            using var root = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64);
-            using var key = root.OpenSubKey(KeyPath);
-            return Parse(key?.GetValue(FlagValue), key?.GetValue(SinceValue));
-        }
-        catch (Exception ex) when (ex is System.Security.SecurityException or IOException or UnauthorizedAccessException)
-        {
-            return null;
+            try
+            {
+                var (flag, since, _) = read();
+                return Parse(flag, since);
+            }
+            catch (Exception ex) when (ex is System.Security.SecurityException or IOException or UnauthorizedAccessException)
+            {
+                if (attempt >= ReadAttempts)
+                {
+                    // Отсутствующий ключ OpenSubKey отдаёт как null, без исключения: исключение — ключ есть, но не читается.
+                    return new EmergencyFlag(null, Unreadable: true);
+                }
+
+                Thread.Sleep(retryDelay);
+            }
         }
     }
 
@@ -103,7 +139,8 @@ public static class EmergencyRegistry
 }
 
 /// <summary>Программа экстренно отключена; <paramref name="SinceUtc"/> — когда (если известно).</summary>
-public sealed record EmergencyFlag(DateTimeOffset? SinceUtc);
+/// <param name="Unreadable">Флаг не прочитан и после повторов, хотя ключ есть: служба на всякий случай «пустая».</param>
+public sealed record EmergencyFlag(DateTimeOffset? SinceUtc, bool Unreadable = false);
 
 /// <summary>Взаимное исключение команд: две одновременно не выполняются.</summary>
 public static class EmergencyMutex
@@ -157,7 +194,10 @@ public enum EmergencyStepOutcome
     [JsonStringEnumMemberName("failed")]
     Failed,
 
-    /// <summary>Не уложился в свой срок; следующие шаги всё равно выполнены.</summary>
+    /// <summary>
+    /// Не уложился в свой срок (следующие шаги всё равно выполнены) или не запущен, потому что истёк общий срок команды
+    /// (подробности — «не запущен: истёк общий срок команды»).
+    /// </summary>
     [JsonStringEnumMemberName("timeout")]
     Timeout,
 }
@@ -176,6 +216,13 @@ public static class EmergencySteps
     public const string Routes = "routes";
     public const string Dns = "dns";
     public const string Wcm = "wcm";
+
+    /// <summary>
+    /// После сетевых шагов: процессы службы ещё живы (остановка не удалась) — завершаются, и фильтры, маршруты и DNS
+    /// снимаются ещё раз. Остались процессы — сеть не считается возвращённой (код 3): живая служба вернёт своё.
+    /// </summary>
+    public const string ServiceRecheck = "service-recheck";
+
     public const string FlushDns = "flush-dns";
     public const string RestoreFailureActions = "restore-failure-actions";
 
@@ -197,6 +244,7 @@ public static class EmergencySteps
         [Routes] = "Маршруты программы",
         [Dns] = "DNS адаптеров",
         [Wcm] = "Настройка Wi-Fi Windows",
+        [ServiceRecheck] = "Повторная проверка службы",
         [FlushDns] = "Кеш DNS",
         [RestoreFailureActions] = "Автоперезапуск службы возвращён",
         [ClearFlag] = "Отметка отключения снята",
@@ -239,7 +287,10 @@ public sealed record EmergencyReport
     /// <summary>Итог одной фразой по-русски.</summary>
     public string Summary { get; init; } = "";
 
-    /// <summary>Сетевые шаги (фильтры, соединения, маршруты, DNS, помощники) выполнены.</summary>
+    /// <summary>
+    /// Каждый сетевой шаг (помощники, фильтры, соединения, маршруты, DNS, настройка Wi-Fi, повторная проверка службы) есть
+    /// в отчёте и выполнен; шаг, не запущенный из-за общего срока, — не выполнен.
+    /// </summary>
     public bool NetworkClean { get; init; }
 
     /// <summary>off: служба подтверждённо остановлена. on: служба подтверждённо работает.</summary>

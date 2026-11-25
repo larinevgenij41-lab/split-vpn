@@ -22,17 +22,29 @@ public sealed partial class Coordinator
     /// <summary>Программа экстренно отключена: служба «пустая».</summary>
     internal bool EmergencyOff => _emergency is not null;
 
+    /// <summary>
+    /// Флаг при создании координатора. Сбой чтения — не «программа не отключена»: чтение повторяется (EmergencyRegistry.Read
+    /// повторяет и сам), а не прочитался и повтор — служба запускается «пустой» (<see cref="EmergencyFlag.Unreadable"/>):
+    /// включить отключённую программу хуже, чем остаться без VPN до перезапуска службы.
+    /// </summary>
     private static EmergencyFlag? ReadEmergencyFlag(ServiceDependencies deps)
     {
-        try
+        for (var attempt = 1; ; attempt++)
         {
-            return deps.EmergencyFlag();
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
-        {
-            // Флаг не прочитан: как раньше, служба работает обычно — иначе сбой чтения реестра выключал бы VPN.
-            deps.Logger.LogWarning(ex, "Флаг экстренного отключения не прочитан; служба работает обычно");
-            return null;
+            try
+            {
+                return deps.EmergencyFlag();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                if (attempt >= 3)
+                {
+                    deps.Logger.LogWarning(ex, "Флаг экстренного отключения не прочитан; служба запускается «пустой»");
+                    return new EmergencyFlag(null, Unreadable: true);
+                }
+
+                Thread.Sleep(100);
+            }
         }
     }
 
@@ -43,6 +55,12 @@ public sealed partial class Coordinator
     /// </summary>
     private void StartInert()
     {
+        if (_emergency is { Unreadable: true })
+        {
+            Journal("Предупреждение", @"Отметка экстренного отключения (HKLM\Software\SplitVpn, EmergencyOff) не прочитана и после повторов: "
+                + "служба на всякий случай запущена «пустой» и ничего не меняет в сети. Перезапустите службу или включите программу.");
+        }
+
         Journal("Предупреждение", "Программа экстренно отключена"
             + (_emergency?.SinceUtc is { } since ? $" ({since.ToLocalTime():dd.MM.yyyy HH:mm})" : "")
             + ": служба запущена без защиты, VPN и DNS-посредника и ничего не меняет в сети. Включите программу, чтобы снова пользоваться VPN.");
@@ -150,8 +168,11 @@ public sealed partial class Coordinator
 
     /// <summary>
     /// Адаптеры без копии DNS, на которых DNS выглядит нашим (<see cref="OrphanDns.Decide"/>), — на «автоматически».
-    /// <paramref name="serviceStopped"/> = false — команда «Восстановить сеть» работающей службы: свой посредник ещё
-    /// слушает порт 53, и тогда чужого резолвера на 127.0.0.1:53 быть не может; без посредника решает таблица UDP.
+    /// <paramref name="serviceStopped"/> = false — команда «Восстановить сеть» работающей службы: если свой посредник
+    /// слушает порт 53, чужого резолвера на 127.0.0.1:53 быть не может; без посредника решает таблица UDP. «Пустая»
+    /// служба (<paramref name="serviceStopped"/> = true) тоже смотрит таблицу: резолвер пользователя именно на
+    /// 127.0.0.1:53 (или [::1]:53) — его DNS, а не наш остаток. Адаптер со статическим IPv4-адресом не сбрасывается:
+    /// без DHCP он остался бы без DNS — в журнал идёт просьба указать DNS вручную.
     /// <paramref name="ourSuffixes"/> — суффиксы программы: список поиска только из них очищается (null — не трогать).
     /// </summary>
     private void ResetOrphanDns(bool serviceStopped, IReadOnlySet<string>? ourSuffixes, List<string> problems)
@@ -168,7 +189,7 @@ public sealed partial class Coordinator
             return;
         }
 
-        var listeners = new Lazy<(bool V4, bool V6)>(() => serviceStopped || _deps.DnsProxy.IsRunning ? (false, false) : _deps.LoopbackResolverListeners());
+        var listeners = new Lazy<LoopbackListeners>(() => _deps.DnsProxy.IsRunning ? default : _deps.LoopbackResolverListeners());
         foreach (var adapter in adapters.Where(a => !backups.ContainsKey(a.InterfaceGuid)))
         {
             try
@@ -185,7 +206,12 @@ public sealed partial class Coordinator
 
                 var v6 = _deps.Dns.ReadNameServerV6(adapter.InterfaceGuid);
                 var looksOurs = InterfaceDnsOps.IsProxySet(v4) || (v6 is not null && InterfaceDnsOps.IsLoopback(v6));
-                var reset = looksOurs ? OrphanDns.Decide(v4, v6, serviceStopped, listeners.Value.V4, listeners.Value.V6) : default;
+                var reset = looksOurs ? OrphanDns.Decide(v4, v6, serviceStopped, listeners.Value, _deps.IsStaticIpv4(adapter.InterfaceGuid)) : default;
+                if (reset.KeptStatic)
+                {
+                    Journal("Предупреждение", "DNS: " + OrphanDnsReset.StaticNote(adapter.Name, v4) + ".");
+                }
+
                 if (reset.Any)
                 {
                     if (!_deps.Dns.ResetToAutomatic(adapter.InterfaceGuid, reset.V4, reset.V6))

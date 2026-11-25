@@ -154,7 +154,8 @@ public static class NetworkRecovery
     /// иначе остался бы наш 127.0.0.1. Запись в копии — отметка того, что loopback поставила служба. Адаптер без записи
     /// решают правила <see cref="OrphanDns"/>: при работающей службе (<paramref name="serviceStopped"/> = false) и
     /// исправном файле копии loopback без записи — статический DNS пользователя, пока его резолвер слушает порт 53;
-    /// при остановленной службе (экстренное отключение) или без копии — сбрасывается на DHCP всё, что выглядит нашим.
+    /// при остановленной службе (экстренное отключение) или без копии — сбрасывается на DHCP всё, что выглядит нашим, кроме
+    /// адаптеров, где 127.0.0.1:53 слушает резолвер пользователя, и адаптеров со статическим IPv4-адресом.
     /// Записи копии, которым не нашлось адаптера, обрабатываются отдельно.
     /// <para>При остановленной службе дополнительно: IPv6-список, который не вернулся из копии (на адаптере остался ::1),
     /// сбрасывается на «автоматически», а список поиска адаптера без копии, состоящий только из наших суффиксов, очищается.</para>
@@ -200,7 +201,7 @@ public static class NetworkRecovery
 
         var ourSuffixes = OrphanDns.OurSuffixes(all);
         var handled = new HashSet<Guid>();
-        var listeners = new Lazy<(bool V4, bool V6)>(LoopbackResolverListeners);
+        var listeners = new Lazy<LoopbackListeners>(LoopbackResolverListeners);
         IReadOnlyList<SplitVpn.Core.Net.AdapterCandidate> adapters;
         try
         {
@@ -234,7 +235,7 @@ public static class NetworkRecovery
 
     /// <summary>Адаптер без записи в копии: см. <see cref="OrphanDns.Decide"/>. У части интерфейсов (loopback, Teredo) DNS-настроек нет.</summary>
     private static void ResetOrphanAdapter(Guid interfaceGuid, string name, bool serviceStopped, IReadOnlySet<string>? ourSuffixes,
-        Lazy<(bool V4, bool V6)> listeners, List<string> actions, List<string> errors)
+        Lazy<LoopbackListeners> listeners, List<string> actions, List<string> errors)
     {
         try
         {
@@ -252,8 +253,14 @@ public static class NetworkRecovery
             var v6 = InterfaceDnsOps.TryReadIpv6(interfaceGuid, warn: false)?.NameServer;
             var looksOurs = InterfaceDnsOps.IsProxySet(v4.NameServer) || (v6 is not null && InterfaceDnsOps.IsLoopback(v6));
             var reset = looksOurs
-                ? OrphanDns.Decide(v4.NameServer, v6, serviceStopped, listeners.Value.V4, listeners.Value.V6)
+                ? OrphanDns.Decide(v4.NameServer, v6, serviceStopped, listeners.Value, IsStaticIpv4(interfaceGuid))
                 : default;
+            if (reset.KeptStatic)
+            {
+                // Шаг остаётся успешным: сбросить нельзя, а что сделать — сказано в подробностях.
+                actions.Add(OrphanDnsReset.StaticNote(name, v4.NameServer));
+            }
+
             if (reset.V4)
             {
                 InterfaceDnsOps.SetNameServer(interfaceGuid, "", ipv6: false);
@@ -289,10 +296,32 @@ public static class NetworkRecovery
     /// (GetExtendedUdpTable через IPGlobalProperties), а не пробной привязкой к порту 53: проба на мгновение заняла бы
     /// порт у резолвера, стартующего в этот момент.
     /// </summary>
-    public static (bool V4, bool V6) LoopbackResolverListeners()
+    public static LoopbackListeners LoopbackResolverListeners() =>
+        ClassifyListeners(IPGlobalProperties.GetIPGlobalProperties().GetActiveUdpListeners());
+
+    /// <summary>Сводка слушателей (для тестов — по готовому списку).</summary>
+    internal static LoopbackListeners ClassifyListeners(IReadOnlyCollection<IPEndPoint> listeners) => new(
+        listeners.Any(ServesLoopbackResolver),
+        listeners.Any(ServesIpv6LoopbackResolver),
+        listeners.Any(l => l.Port == 53 && (l.Address.Equals(IPAddress.Loopback) || l.Address.Equals(IPAddress.Loopback.MapToIPv6()))),
+        listeners.Any(l => l.Port == 53 && l.Address.Equals(IPAddress.IPv6Loopback)));
+
+    /// <summary>
+    /// IPv4-адрес адаптера задан вручную: EnableDHCP = 0 в Tcpip\Parameters\Interfaces\{guid}. Нет раздела или значения
+    /// (или они не читаются) — не статический: так было до этой проверки.
+    /// </summary>
+    public static bool IsStaticIpv4(Guid interfaceGuid)
     {
-        var listeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveUdpListeners();
-        return (listeners.Any(ServesLoopbackResolver), listeners.Any(ServesIpv6LoopbackResolver));
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\" + interfaceGuid.ToString("B"));
+            return key?.GetValue("EnableDHCP") is int dhcp && dhcp == 0;
+        }
+        catch (Exception ex) when (ex is System.Security.SecurityException or IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     /// <summary>

@@ -135,17 +135,23 @@ public static class ServiceRecovery
             var orchestrator = new Emergency.EmergencyOrchestrator(system, new Emergency.EmergencyOptions());
             var report = on ? await orchestrator.OnAsync(CancellationToken.None) : await orchestrator.OffAsync(CancellationToken.None);
             var json = JsonSerializer.Serialize(report, JsonDefaults.Options);
-            Console.WriteLine(json);
-            if (report.ExitCode is not (EmergencyExitCodes.NotElevated or EmergencyExitCodes.Busy))
+            if (report.ExitCode != EmergencyExitCodes.NotElevated)
             {
-                // Без прав администратора в защищённый каталог не записать, а при занятой блокировке отчёт пишет та команда.
+                // Без прав администратора в защищённый каталог не записать. Не записался отчёт — он есть только в выводе
+                // команды, и итог об этом говорит.
                 if (Emergency.EmergencyReportWriter.Write(EmergencyReportFiles.DefaultDirectory, json,
                     Emergency.EmergencyReportWriter.SecureDirectory, HasTrustedOwner, Console.Error.WriteLine) is { } path)
                 {
                     Console.Error.WriteLine("Отчёт: " + path);
                 }
+                else
+                {
+                    report = report with { Summary = report.Summary + " " + Emergency.EmergencyReportWriter.NotWrittenNote };
+                    json = JsonSerializer.Serialize(report, JsonDefaults.Options);
+                }
             }
 
+            Console.WriteLine(json);
             Console.Error.WriteLine(report.Summary);
             return report.ExitCode;
         }
@@ -167,7 +173,7 @@ public static class ServiceRecovery
         // отметки отключения и без смены типа запуска: удаление, которое отменят, вернёт программу как была. Флаг
         // приостановки защиты в состоянии остаётся: служба после отмены ничего не применит до «Подключить».
         var system = new Emergency.SystemEmergency(paths, AppContext.BaseDirectory);
-        var orchestrator = new Emergency.EmergencyOrchestrator(system, new Emergency.EmergencyOptions { ProceedWhenBusy = true });
+        var orchestrator = new Emergency.EmergencyOrchestrator(system, new Emergency.EmergencyOptions());
         var report = await orchestrator.UninstallNetworkAsync(cancellationToken);
 
         lock (FinishGate)
@@ -186,7 +192,7 @@ public static class ServiceRecovery
         // подтверждённо остановлена: иначе копия исходных DNS ещё нужна повторному восстановлению, а работающая служба
         // осталась бы без данных. Каталог, который не удалось защитить, не удаляется рекурсивно.
         var trusted = system.Trusted;
-        var cleanable = report.NetworkClean && report.ServiceConfirmed && trusted && staleMarkCleared;
+        var cleanable = MayPurgeData(report, trusted, staleMarkCleared);
         bool cleaned;
         if (mode == RecoveryMode.UninstallNetwork)
         {
@@ -204,6 +210,19 @@ public static class ServiceRecovery
         }
 
         return cleaned ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Можно ли разрешить удаление данных (<see cref="PurgeMarkName"/>) или удалить их самим: команда завершилась успехом,
+    /// каждый сетевой шаг есть в отчёте и выполнен (шаг, не запущенный из-за общего срока, — «timeout», не успех),
+    /// служба подтверждённо остановлена, каталог данных свой и защищён, прежняя отметка снята. Иначе копия исходных DNS
+    /// (dns-backup.json) ещё нужна повторному восстановлению.
+    /// </summary>
+    internal static bool MayPurgeData(EmergencyReport report, bool trusted, bool staleMarkCleared)
+    {
+        ArgumentNullException.ThrowIfNull(report);
+        return report.ExitCode == EmergencyExitCodes.Success && report.NetworkClean && report.ServiceConfirmed && trusted && staleMarkCleared
+            && Emergency.EmergencyOrchestrator.IsNetworkClean(report.Steps);
     }
 
     /// <summary>
@@ -298,7 +317,7 @@ public static class ServiceRecovery
     }
 
     /// <summary>Почему в уже существующий каталог журнала писать нельзя; null — каталога нет или он свой.</summary>
-    private static string? ForeignLogDirectory(string directory, Func<DirectoryInfo, bool> trustedOwner)
+    internal static string? ForeignLogDirectory(string directory, Func<DirectoryInfo, bool> trustedOwner)
     {
         if (File.Exists(directory))
         {

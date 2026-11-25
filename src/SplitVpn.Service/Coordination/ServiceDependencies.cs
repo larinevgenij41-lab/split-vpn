@@ -116,8 +116,11 @@ public sealed record ServiceDependencies
     /// </summary>
     public Func<string?> EnsureManualStart { get; init; } = () => null;
 
-    /// <summary>Слушают ли UDP-порт 53 так, что туда доходят запросы к 127.0.0.1 (V4) и к [::1] (V6).</summary>
-    public Func<(bool V4, bool V6)> LoopbackResolverListeners { get; init; } = () => (false, false);
+    /// <summary>Кто слушает UDP-порт 53 так, что туда доходят запросы к 127.0.0.1 и к [::1] (в том числе именно на них).</summary>
+    public Func<Windows.Recovery.LoopbackListeners> LoopbackResolverListeners { get; init; } = () => default;
+
+    /// <summary>IPv4-адрес адаптера статический (DHCP выключен): его DNS без копии не сбрасывается на «автоматически».</summary>
+    public Func<Guid, bool> IsStaticIpv4 { get; init; } = _ => false;
 
     /// <summary>Каталог записей подключения Wi-Fi (<c>wifi-incident-*.log</c>); null — записи остаются в памяти.</summary>
     public string? WifiIncidentDirectory { get; init; }

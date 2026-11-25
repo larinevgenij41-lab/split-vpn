@@ -315,9 +315,10 @@ public sealed partial class SystemSshTunnelOps : ISshTunnelOps, IDisposable
     /// Завершает процессы движка, запущенные из этого файла: остались от упавшей службы (если Job не сработал)
     /// или мешают восстановлению сети. Чужой sing-box - из другой папки, от другой программы - не трогается.
     /// <paramref name="exceptProcessId"/> — процесс, который не трогается (сама команда восстановления, запущенная из
-    /// того же файла, что и служба).
+    /// того же файла, что и служба). <paramref name="include"/> — дополнительный отбор по номеру процесса (например, не
+    /// трогать другие команды восстановления из того же файла); null — все процессы файла.
     /// </summary>
-    public static int StopOwn(string enginePath, int? exceptProcessId = null)
+    public static int StopOwn(string enginePath, int? exceptProcessId = null, Func<int, bool>? include = null)
     {
         var path = Path.GetFullPath(enginePath);
         var stopped = 0;
@@ -330,7 +331,8 @@ public sealed partial class SystemSshTunnelOps : ISshTunnelOps, IDisposable
                 try
                 {
                     if (candidate.Id == exceptProcessId
-                        || !string.Equals(Native.ProcessImage.TryGetPath(candidate), path, StringComparison.OrdinalIgnoreCase))
+                        || !string.Equals(Native.ProcessImage.TryGetPath(candidate), path, StringComparison.OrdinalIgnoreCase)
+                        || (include is not null && !include(candidate.Id)))
                     {
                         continue;
                     }
@@ -360,8 +362,11 @@ public sealed partial class SystemSshTunnelOps : ISshTunnelOps, IDisposable
         return stopped;
     }
 
-    /// <summary>Номера работающих процессов, запущенных из этого файла, кроме <paramref name="exceptProcessId"/>.</summary>
-    public static IReadOnlyList<int> FindOwn(string imagePath, int? exceptProcessId = null)
+    /// <summary>
+    /// Номера работающих процессов, запущенных из этого файла, кроме <paramref name="exceptProcessId"/> и тех, кого не
+    /// пропустил <paramref name="include"/>.
+    /// </summary>
+    public static IReadOnlyList<int> FindOwn(string imagePath, int? exceptProcessId = null, Func<int, bool>? include = null)
     {
         var path = Path.GetFullPath(imagePath);
         var found = new List<int>();
@@ -369,7 +374,8 @@ public sealed partial class SystemSshTunnelOps : ISshTunnelOps, IDisposable
         {
             using (candidate)
             {
-                if (candidate.Id != exceptProcessId && string.Equals(Native.ProcessImage.TryGetPath(candidate), path, StringComparison.OrdinalIgnoreCase))
+                if (candidate.Id != exceptProcessId && string.Equals(Native.ProcessImage.TryGetPath(candidate), path, StringComparison.OrdinalIgnoreCase)
+                    && (include is null || include(candidate.Id)))
                 {
                     found.Add(candidate.Id);
                 }

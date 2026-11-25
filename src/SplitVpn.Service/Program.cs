@@ -48,6 +48,9 @@ foreach (var warning in dataWarnings)
 // отменено или откачено, и отметка снимается. Сбой - только в журнал.
 ServiceRecovery.ClearStalePurgeMark(problem => Log.Warning("Удаление программы: {Problem}", problem));
 
+// Действия при сбое, снятые прерванной командой экстренного отключения (записаны в реестр), возвращаются. Сбой - только в журнал.
+ServiceFailurePolicy.RestoreLeftover(ServicePaths.ServiceName, problem => Log.Warning("Экстренное отключение: {Problem}", problem));
+
 try
 {
     var builder = Host.CreateApplicationBuilder(args);
@@ -131,6 +134,7 @@ static ServiceDependencies CreateDependencies(ServicePaths paths, VerboseMode ve
         EmergencyFlag = SplitVpn.Core.Recovery.EmergencyRegistry.Read,
         EnsureManualStart = () => SplitVpn.Service.Emergency.ServiceStartType.EnsureManual(ServicePaths.ServiceName) is { } previous ? "был тип запуска " + previous : null,
         LoopbackResolverListeners = SplitVpn.Windows.Recovery.NetworkRecovery.LoopbackResolverListeners,
+        IsStaticIpv4 = SplitVpn.Windows.Recovery.NetworkRecovery.IsStaticIpv4,
         IsMeteredNetwork = SystemSignals.IsMeteredNetwork,
     };
 }

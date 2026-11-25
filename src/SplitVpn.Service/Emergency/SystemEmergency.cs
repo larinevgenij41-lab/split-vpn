@@ -21,10 +21,13 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
     private const uint ServiceDoesNotExist = 1060;
 
     private readonly string _serviceImage = Path.Combine(serviceDirectory, ServicePaths.ImageName);
-    private ServiceFailurePolicy? _failurePolicy;
+    private FailureActionsSnapshot? _suspendedFailureActions;
     private volatile bool _trusted;
 
-    /// <summary>Каталог данных свой и защищён: копии DNS и состоянию можно верить (проверяет шаг приостановки защиты).</summary>
+    /// <summary>
+    /// Каталог данных свой и защищён: копии DNS и состоянию можно верить. Проверяет шаг DNS (только чтением, ничего не
+    /// исправляя): шаг DNS не выполнен — и доверия нет.
+    /// </summary>
     public bool Trusted => _trusted;
 
     public bool IsElevated()
@@ -87,18 +90,19 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
             return StepResult.Skipped("служба не установлена");
         }
 
-        if (current == EmergencyRegistry.StartDemand)
-        {
-            return StepResult.Already("уже ручной запуск");
-        }
-
         using (var key = OpenOwnKey())
         {
-            // Прежний тип запоминается один раз: повторное отключение не затирает «auto» своим «demand».
+            // Прежний тип запоминается всегда, в том числе «demand» (иначе включение поставило бы автозапуск службе,
+            // которую человек держал в ручном), но один раз: повторное отключение не затирает «auto» своим «demand».
             if (key.GetValue(EmergencyRegistry.PreviousStartValue) is null)
             {
                 key.SetValue(EmergencyRegistry.PreviousStartValue, current, RegistryValueKind.String);
             }
+        }
+
+        if (current == EmergencyRegistry.StartDemand)
+        {
+            return StepResult.Already("уже ручной запуск");
         }
 
         ServiceStartType.Set(ServicePaths.ServiceName, EmergencyRegistry.StartDemand);
@@ -134,17 +138,30 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
         return current == target ? StepResult.Already("тип запуска: " + target) : StepResult.Done($"тип запуска: {target} (было: {current})");
     }
 
+    /// <summary>
+    /// Снимает действия при сбое, записав прежние в реестр (<see cref="EmergencyRegistry.SavedFailureActionsValue"/>).
+    /// Запись осталась от прерванной команды — сейчас у службы снятые (пустые) действия, а настоящие — в записи: они сначала
+    /// возвращаются, и только потом снимаются заново (иначе в запись попали бы пустые).
+    /// </summary>
     public StepResult SuspendFailureActions()
     {
-        if (_failurePolicy is not null)
+        if (_suspendedFailureActions is not null)
         {
             return StepResult.Already();
         }
 
+        var notes = new List<string>();
         try
         {
-            _failurePolicy = ServiceFailurePolicy.Suspend(ServicePaths.ServiceName);
-            return StepResult.Done("действия при сбое службы сняты на время остановки");
+            if (FailureActionsSnapshot.Parse(ServiceFailurePolicy.ReadSaved()) is { } leftover)
+            {
+                ServiceFailurePolicy.Apply(ServicePaths.ServiceName, leftover);
+                notes.Add("возвращены действия, оставшиеся от прерванной команды");
+            }
+
+            _suspendedFailureActions = ServiceFailurePolicy.Suspend(ServicePaths.ServiceName, ServiceFailurePolicy.WriteSaved);
+            notes.Add("действия при сбое службы сняты на время остановки (прежние записаны в реестр)");
+            return StepResult.Done(string.Join("; ", notes));
         }
         catch (InvalidOperationException ex) when (IsNotInstalled(ex))
         {
@@ -154,13 +171,23 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
 
     public StepResult RestoreFailureActions()
     {
-        var policy = Interlocked.Exchange(ref _failurePolicy, null);
-        if (policy is null)
+        var snapshot = Interlocked.Exchange(ref _suspendedFailureActions, null) ?? FailureActionsSnapshot.Parse(ServiceFailurePolicy.ReadSaved());
+        if (snapshot is null)
         {
             return StepResult.Skipped();
         }
 
-        policy.Dispose();
+        try
+        {
+            ServiceFailurePolicy.Apply(ServicePaths.ServiceName, snapshot);
+        }
+        catch (InvalidOperationException ex) when (IsNotInstalled(ex))
+        {
+            ServiceFailurePolicy.DeleteSaved();
+            return StepResult.Skipped("служба не установлена");
+        }
+
+        ServiceFailurePolicy.DeleteSaved();
         return StepResult.Done("действия при сбое службы возвращены");
     }
 
@@ -229,18 +256,38 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
         }
     }
 
-    public int KillOwnServiceProcesses() => SystemSshTunnelOps.StopOwn(_serviceImage, Environment.ProcessId);
+    public int KillOwnServiceProcesses() => SystemSshTunnelOps.StopOwn(_serviceImage, Environment.ProcessId, IsServiceHostProcess);
 
-    public int CountOwnServiceProcesses() => SystemSshTunnelOps.FindOwn(_serviceImage, Environment.ProcessId).Count;
+    public int CountOwnServiceProcesses() => SystemSshTunnelOps.FindOwn(_serviceImage, Environment.ProcessId, IsServiceHostProcess).Count;
+
+    private static bool IsServiceHostProcess(int processId) => IsServiceHost(ProcessImage.TryGetArguments(processId));
+
+    /// <summary>
+    /// Процесс SplitVpn.Service.exe — служба (или её запуск без аргументов), а не другая команда из того же файла: команда
+    /// восстановления (emergency-off/-on, recover — первый аргумент, как у <see cref="ServiceRecovery.IsRecoveryCommand"/>)
+    /// не завершается — её мог запустить, например, установщик или вторая копия «Восстановить сеть». Командную строку не
+    /// прочитать (<paramref name="arguments"/> = null) — процесс считается службой: живая служба опаснее.
+    /// </summary>
+    internal static bool IsServiceHost(IReadOnlyList<string>? arguments) =>
+        arguments is null || arguments.Count < 2 || !ServiceRecovery.IsRecoveryCommand(arguments[1]);
 
     public StepResult StopHelpers() => FromRecovery(NetworkRecovery.StopHelpers(serviceDirectory), "процессов помощников нет");
 
+    /// <summary>
+    /// Флаг приостановки защиты в state.json. Каталог данных только проверяется (владелец и DACL, без исправления и без
+    /// рекурсивного обхода прав): недоверенному каталогу состояние не пишется, шаг — предупреждение.
+    /// </summary>
     public StepResult SuspendProtection()
     {
-        _trusted = ServiceRecovery.TrySecureRecoveryRoot(paths.Root, SecretStore.SecureDataRoot);
-        if (!_trusted)
+        var trust = DataRootTrust.Check(paths.Root, paths.DnsBackup);
+        if (trust.Problem is { } problem)
         {
-            return StepResult.Failed("каталог данных недоверенный: состояние не записано, копия DNS не используется");
+            return StepResult.Failed("каталог данных недоверенный (" + problem + "): состояние не записано");
+        }
+
+        if (!trust.Exists)
+        {
+            return StepResult.Skipped("каталога данных нет: приостанавливать нечего");
         }
 
         var stores = new ServiceStores(paths) { OnCorrupt = file => Console.Error.WriteLine(file.Describe()) };
@@ -261,11 +308,24 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
 
     public StepResult RemoveRoutes() => FromRecovery(NetworkRecovery.RemoveRoutes(), "маршрутов программы нет");
 
-    public StepResult RestoreDns(bool serviceStopped) => FromRecovery(NetworkRecovery.RestoreDns(new RecoveryOptions
+    /// <summary>
+    /// DNS адаптеров. Сначала — проверка каталога данных только чтением (владелец и DACL каталога и dns-backup.json): от неё
+    /// зависят и копия DNS, и разрешение удалить данные при удалении программы (<see cref="Trusted"/>).
+    /// </summary>
+    public StepResult RestoreDns(bool serviceStopped)
     {
-        // Копии из недоверенного каталога не верим: её мог подложить пользователь, и DNS ушёл бы на его серверы.
-        DnsBackupPath = _trusted ? paths.DnsBackup : null,
-    }, serviceStopped), "DNS адаптеров уже обычный");
+        var trust = DataRootTrust.Check(paths.Root, paths.DnsBackup);
+        _trusted = trust.Problem is null;
+        var result = FromRecovery(NetworkRecovery.RestoreDns(new RecoveryOptions
+        {
+            // Копии из недоверенного каталога не верим: её мог подложить пользователь, и DNS ушёл бы на его серверы.
+            // Каталога нет — читать нечего (и он не появится чужим между проверкой и чтением).
+            DnsBackupPath = _trusted && trust.Exists ? paths.DnsBackup : null,
+        }, serviceStopped), "DNS адаптеров уже обычный");
+        return trust.Problem is { } problem
+            ? result with { Detail = string.Join("; ", new[] { result.Detail, "копия DNS не использована: каталог данных " + problem }.Where(d => !string.IsNullOrEmpty(d))) }
+            : result;
+    }
 
     public StepResult RestoreWcm() => WcmBadStateTracking.Restore()
         ? StepResult.Done("EnableBadStateTracking возвращено")
@@ -289,9 +349,10 @@ internal sealed class SystemEmergency(ServicePaths paths, string serviceDirector
     }
 
     /// <summary>
-    /// Именованный мьютекс принадлежит потоку, а команда асинхронная: захват и освобождение — в своём потоке. Создать
-    /// объект в Global\ может только учётная запись с правом SeCreateGlobalPrivilege (администраторы, службы), поэтому
-    /// обычный пользователь не займёт имя заранее.
+    /// Именованный мьютекс принадлежит потоку, а команда асинхронная: захват и освобождение — в своём потоке. Право
+    /// SeCreateGlobalPrivilege нужно только для объектов-разделов (file mapping) в Global\, а мьютекс там может создать и
+    /// обычный пользователь — и держать его сколько угодно. Поэтому блокировка не обязательна: не получена за срок
+    /// ожидания — команда выполняется без неё (EmergencyOrchestrator), а в итоге об этом сказано.
     /// </summary>
     private sealed class MutexLock : IDisposable
     {

@@ -1,4 +1,4 @@
-using SplitVpn.Core.Ipc;
+﻿using SplitVpn.Core.Ipc;
 using SplitVpn.Core.Net;
 using SplitVpn.Core.Protection;
 using SplitVpn.Core.Recovery;
@@ -6,6 +6,7 @@ using SplitVpn.Core.State;
 using SplitVpn.Service.Coordination;
 using SplitVpn.Windows.Dns;
 using SplitVpn.Windows.Net;
+using SplitVpn.Windows.Recovery;
 
 namespace SplitVpn.Service.Tests;
 
@@ -146,13 +147,140 @@ public sealed partial class CoordinatorTests
         }
     }
 
+    /// <summary>Флаг не прочитан и после повторов: это не «не отключена» — служба «пустая», а в журнале сказано почему.</summary>
     [Fact]
-    public async Task Emergency_ReadFailure_RunsNormally()
+    public async Task Emergency_ReadFailure_StartsInert_AndJournals()
     {
-        var coordinator = new Coordinator(_world.Dependencies() with { EmergencyFlag = () => throw new UnauthorizedAccessException("нет доступа") });
+        var reads = 0;
+        var coordinator = new Coordinator(EmergencyDependencies() with
+        {
+            EmergencyFlag = () => { reads++; throw new UnauthorizedAccessException("нет доступа"); },
+        });
+        await coordinator.StartupAsync(CancellationToken.None);
+
+        Assert.Equal(3, reads);
+        Assert.True(coordinator.BuildStatus().EmergencyOff);
+        Assert.Equal(0, _world.Ras.Dials);
+        Assert.Contains(_world.Journal.Since(0), e => e.Text.Contains("не прочитана", StringComparison.Ordinal));
+    }
+
+    /// <summary>Сбой чтения, прошедший при повторе, — обычный запуск.</summary>
+    [Fact]
+    public async Task Emergency_TransientReadFailure_RunsNormally()
+    {
+        var reads = 0;
+        var coordinator = new Coordinator(_world.Dependencies() with
+        {
+            EmergencyFlag = () => ++reads == 1 ? throw new IOException("занято") : null,
+        });
         await coordinator.StartupAsync(CancellationToken.None);
 
         Assert.False(coordinator.BuildStatus().EmergencyOff);
+    }
+
+    [Fact]
+    public void Emergency_RegistryRead_RetriesThenReportsUnreadable()
+    {
+        var calls = 0;
+        var flag = EmergencyRegistry.Read(() => { calls++; throw new UnauthorizedAccessException("нет доступа"); }, TimeSpan.Zero);
+
+        Assert.Equal(3, calls);
+        Assert.NotNull(flag);
+        Assert.True(flag.Unreadable);
+
+        calls = 0;
+        Assert.Null(EmergencyRegistry.Read(() => ++calls == 1 ? throw new IOException("занято") : (null, null, false), TimeSpan.Zero));
+        Assert.Equal(2, calls);
+        Assert.Null(EmergencyRegistry.Read(() => (0, null, true), TimeSpan.Zero));
+        Assert.False(EmergencyRegistry.Read(() => (1, null, true), TimeSpan.Zero)!.Unreadable);
+    }
+
+    /// <summary>
+    /// «Пустая» служба не сбрасывает 127.0.0.1 без копии, если именно на 127.0.0.1:53 слушает резолвер пользователя, и не
+    /// сбрасывает адаптер со статическим IPv4-адресом (в журнале — просьба указать DNS вручную); слушатель только на
+    /// 0.0.0.0:53 сброса не отменяет.
+    /// </summary>
+    [Fact]
+    public async Task Emergency_InertStart_KeepsUserResolverAndStaticAdapter()
+    {
+        var resolver = FakeInventory.TunnelGuid(2);
+        var fixedAddress = Guid.Parse("5e0f6c2a-1b7d-4c41-9a8e-3f2d6b7c8a91");
+        _world.Dns.NameServers[resolver] = "127.0.0.1";
+        _world.Dns.NameServers[fixedAddress] = "127.0.0.1";
+        _world.Inventory.Extra.Add(Adapter(resolver, "Ethernet 2"));
+        _world.Inventory.Extra.Add(Adapter(fixedAddress, "Ethernet 3"));
+
+        var coordinator = new Coordinator(EmergencyDependencies() with
+        {
+            LoopbackResolverListeners = () => new LoopbackListeners(V4: true, V6: false, V4Exact: true),
+        });
+        await coordinator.StartupAsync(CancellationToken.None);
+        Assert.Equal("127.0.0.1", _world.Dns.NameServers[resolver]);
+
+        // Слушатель только на 0.0.0.0:53 — сброс; но не адаптера со статическим адресом.
+        var wildcard = new Coordinator(EmergencyDependencies() with
+        {
+            LoopbackResolverListeners = () => new LoopbackListeners(V4: true, V6: true),
+            IsStaticIpv4 = guid => guid == fixedAddress,
+        });
+        await wildcard.StartupAsync(CancellationToken.None);
+
+        Assert.Equal("", _world.Dns.NameServers[resolver]);
+        Assert.Equal("127.0.0.1", _world.Dns.NameServers[fixedAddress]);
+        Assert.Contains(_world.Journal.Since(0), e => e.Text.Contains("«Ethernet 3» со статическим адресом", StringComparison.Ordinal)
+            && e.Text.Contains("DNS укажите вручную", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Другая программа переписывает DNS адаптера при каждой сверке: первая правка запоминается, но на третьей за 10 минут
+    /// копия возвращается к первой исходной, адаптер больше ничего не запоминает, а в журнале — одна запись.
+    /// </summary>
+    [Fact]
+    public async Task ExternalDnsFight_RevertsToFirstOriginal_AndStopsAdopting()
+    {
+        var coordinator = await StartAsync();
+        await ConnectAsync(coordinator);
+        var store = new DnsBackupStore(_world.Paths.DnsBackup);
+        Assert.Equal("", store.Load()[FakeWorld.WiFiGuid].NameServerV4);
+
+        foreach (var foreign in new[] { "10.8.0.1", "10.8.0.2", "10.8.0.3", "10.8.0.4" })
+        {
+            _world.Dns.NameServers[FakeWorld.WiFiGuid] = foreign;
+            _world.Time.Advance(Coordinator.FullReconcileInterval);
+            await TickAsync(coordinator);
+            if (foreign == "10.8.0.1")
+            {
+                var adopted = store.Load()[FakeWorld.WiFiGuid];
+                Assert.Equal("10.8.0.1", adopted.NameServerV4);
+                Assert.Equal("", adopted.FirstOriginal?.NameServerV4);
+            }
+        }
+
+        var backup = store.Load()[FakeWorld.WiFiGuid];
+        Assert.Equal("", backup.NameServerV4);
+        Assert.Single(_world.Journal.Since(0), e => e.Text.Contains("переписывается извне раз за разом", StringComparison.Ordinal));
+        Assert.True(InterfaceDnsOps.IsProxySet(_world.Dns.NameServers[FakeWorld.WiFiGuid]));
+
+        await coordinator.HandleRequestAsync(new DisconnectRequest(KeepProtection: false), CancellationToken.None);
+        Assert.Equal("", _world.Dns.NameServers[FakeWorld.WiFiGuid]);
+    }
+
+    /// <summary>Правки реже, чем 3 за 10 минут, — выбор человека: запоминается последняя.</summary>
+    [Fact]
+    public async Task ExternalDnsChanges_Spread_AreAdopted()
+    {
+        var coordinator = await StartAsync();
+        await ConnectAsync(coordinator);
+
+        foreach (var chosen in new[] { "1.1.1.1", "9.9.9.9", "8.8.8.8" })
+        {
+            _world.Dns.NameServers[FakeWorld.WiFiGuid] = chosen;
+            _world.Time.Advance(TimeSpan.FromMinutes(6));
+            await TickAsync(coordinator);
+        }
+
+        Assert.Equal("8.8.8.8", new DnsBackupStore(_world.Paths.DnsBackup).Load()[FakeWorld.WiFiGuid].NameServerV4);
+        Assert.DoesNotContain(_world.Journal.Since(0), e => e.Text.Contains("переписывается извне раз за разом", StringComparison.Ordinal));
     }
 
     /// <summary>«Восстановить сеть» работающей службы сбрасывает наш DNS, оставшийся без копии, как и команда без службы.</summary>
@@ -182,7 +310,7 @@ public sealed partial class CoordinatorTests
     [Fact]
     public async Task RecoverNetwork_KeepsUserResolverLoopback_WhenSomeoneListens()
     {
-        var coordinator = new Coordinator(_world.Dependencies() with { LoopbackResolverListeners = () => (true, true) });
+        var coordinator = new Coordinator(_world.Dependencies() with { LoopbackResolverListeners = () => new LoopbackListeners(true, true) });
         await coordinator.StartupAsync(CancellationToken.None);
         var orphan = FakeInventory.TunnelGuid(2);
         _world.Dns.NameServers[orphan] = "127.0.0.1";

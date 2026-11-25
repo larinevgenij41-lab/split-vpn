@@ -25,6 +25,17 @@ public sealed partial class Coordinator
     /// <summary>Максимальная пауза между повторами сверки после неполного применения.</summary>
     private static readonly TimeSpan MaxPartialErrorDelay = TimeSpan.FromSeconds(60);
 
+    /// <summary>Сколько внешних правок DNS адаптера за <see cref="ContestedDnsWindow"/> — уже борьба с другой программой.</summary>
+    internal const int ContestedDnsChanges = 3;
+
+    internal static readonly TimeSpan ContestedDnsWindow = TimeSpan.FromMinutes(10);
+
+    /// <summary>Когда замечены внешние правки DNS адаптера (в пределах <see cref="ContestedDnsWindow"/>).</summary>
+    private readonly Dictionary<Guid, Queue<DateTimeOffset>> _externalDnsChanges = [];
+
+    /// <summary>Адаптеры, за DNS которых идёт борьба: до перезапуска службы внешние значения не запоминаются.</summary>
+    private readonly HashSet<Guid> _contestedDns = [];
+
     /// <summary>Приводит систему к намерению пользователя. Каждый шаг идемпотентен.</summary>
     internal async Task ReconcileAsync(CancellationToken cancellationToken)
     {
@@ -1881,6 +1892,9 @@ public sealed partial class Coordinator
         {
             existing = _deps.Dns.Capture(interfaceGuid, null);
             _deps.DnsBackups.Upsert(existing);
+            // Новая запись копии — новая история внешних правок.
+            _externalDnsChanges.Remove(interfaceGuid);
+            _contestedDns.Remove(interfaceGuid);
         }
 
         _wifiRecorder?.Note($"Служба: DNS адаптера {interfaceGuid} - было «{current}», ставится «{nameServerV4}»");
@@ -1896,9 +1910,45 @@ public sealed partial class Coordinator
     /// с копией (запись посредника не удалась, и на адаптере остался исходный), копия не переписывается.
     /// Восстановление по-прежнему возвращает копию, только если на адаптере наш DNS (иначе «изменено пользователем»):
     /// после переписанной копии на адаптере снова посредник, и при отключении вернётся последний выбор пользователя.
+    /// <para>Самая первая копия хранится рядом (<see cref="InterfaceDnsBackup.FirstOriginal"/>). Если DNS адаптера
+    /// переписывают извне <see cref="ContestedDnsChanges"/> раза за <see cref="ContestedDnsWindow"/> — это не выбор
+    /// человека, а борьба с другой программой (чужой VPN-клиент ставит свой DNS при каждом подключении): копия
+    /// возвращается к первой, и до перезапуска службы или новой записи копии адаптер больше ничего не запоминает (в журнал —
+    /// один раз).</para>
     /// </summary>
     private InterfaceDnsBackup RememberExternalDns(Guid interfaceGuid, InterfaceDnsBackup existing, string current)
     {
+        if (_contestedDns.Contains(interfaceGuid))
+        {
+            return existing;
+        }
+
+        var now = _deps.Time.GetUtcNow();
+        if (!_externalDnsChanges.TryGetValue(interfaceGuid, out var seen))
+        {
+            seen = new Queue<DateTimeOffset>();
+            _externalDnsChanges[interfaceGuid] = seen;
+        }
+
+        seen.Enqueue(now);
+        while (seen.Count > 0 && now - seen.Peek() > ContestedDnsWindow)
+        {
+            seen.Dequeue();
+        }
+
+        var first = existing.FirstOriginal ?? existing;
+        if (seen.Count >= ContestedDnsChanges)
+        {
+            _contestedDns.Add(interfaceGuid);
+            _externalDnsChanges.Remove(interfaceGuid);
+            var restored = first with { FirstOriginal = null };
+            _deps.DnsBackups.Upsert(restored);
+            Journal("Предупреждение", $"DNS адаптера переписывается извне раз за разом (последнее значение «{(current.Length > 0 ? current : "автоматически")}»): "
+                + "похоже, его меняет другая программа. Исходным снова считается первый сохранённый DNS, новые значения до перезапуска службы не запоминаются; "
+                + "пока возвращён локальный посредник.");
+            return restored;
+        }
+
         var fresh = _deps.Dns.Capture(interfaceGuid, existing);
         if (InterfaceDnsOps.SameServers(fresh.NameServerV4, existing.NameServerV4)
             && InterfaceDnsOps.SameServers(fresh.NameServerV6, existing.NameServerV6)
@@ -1910,7 +1960,8 @@ public sealed partial class Coordinator
         }
 
         // Снимок сам отличает свои суффиксы шлюза от правки пользователя (по отметке применённого списка в прежней копии).
-        var remembered = fresh;
+        // Первая копия едет дальше без вложенной истории: хранится одна, самая первая.
+        var remembered = fresh with { FirstOriginal = first with { FirstOriginal = null } };
         _deps.DnsBackups.Upsert(remembered);
         Journal("Предупреждение", $"DNS адаптера изменён извне на «{(current.Length > 0 ? current : "автоматически")}»: "
             + "это значение запомнено как исходное и вернётся при отключении VPN, а пока возвращён локальный посредник.");

@@ -16,6 +16,11 @@ namespace SplitVpn.Windows.Dns;
 /// Пока так, ::1 на адаптер не ставится и восстановление IPv6 не трогает; сверка повторяет чтение и дополняет копию.
 /// Копии прежних версий этого поля не имеют — для них IPv6-список известен.
 /// </param>
+/// <param name="FirstOriginal">
+/// Самая первая копия адаптера (до того, как служба запомнила исходным DNS, сменённый извне); null — копию не переписывали.
+/// Если DNS адаптера раз за разом переписывает другая программа (чужой VPN-клиент), исходным снова становится она.
+/// Копии прежних версий этого поля не имеют.
+/// </param>
 public sealed record InterfaceDnsBackup(
     Guid InterfaceGuid,
     string NameServerV4,
@@ -24,7 +29,8 @@ public sealed record InterfaceDnsBackup(
     int DohServerPropertiesV4,
     DateTimeOffset SavedUtc,
     string SearchList = "", string? AppliedSearchList = null,
-    bool Ipv6Unknown = false);
+    bool Ipv6Unknown = false,
+    InterfaceDnsBackup? FirstOriginal = null);
 
 public sealed record InterfaceDnsState(string NameServer, string ProfileNameServer, int DohServerProperties, string SearchList = "");
 
