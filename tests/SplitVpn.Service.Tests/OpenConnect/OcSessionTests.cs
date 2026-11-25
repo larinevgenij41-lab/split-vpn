@@ -785,6 +785,157 @@ public sealed class OcSessionTests
         Assert.Empty(steps);
     }
 
+    /// <summary>Адрес туннеля из служебного диапазона не назначается адаптеру: сеанс прощается со шлюзом с понятной причиной.</summary>
+    [Theory]
+    [InlineData("127.0.0.1")]
+    [InlineData("0.1.2.3")]
+    [InlineData("169.254.10.1")]
+    [InlineData("224.0.0.251")]
+    [InlineData("255.255.255.255")]
+    [InlineData("не адрес")]
+    public async Task UnusableTunnelAddress_IsNotConfiguredAndSaysBye(string address)
+    {
+        var world = new SessionWorld();
+        var steps = RecordClose(world);
+        world.Lib.Session = world.Lib.Session with { Address = address };
+
+        var kind = await world.RunAsync(Start()).WaitAsync(Wait, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TerminationKind.Internal, kind);
+        Assert.Equal(["cancel", "mainloop"], steps);
+        Assert.Empty(world.System.Configured);
+        Assert.DoesNotContain(world.Output.All, e => e is EstablishedEvent);
+        Assert.Contains("адрес туннеля", world.Output.Next<TerminatedEvent>(Wait).Text, StringComparison.Ordinal);
+    }
+
+    /// <summary>После переподключения адрес из служебного диапазона тоже не назначается: сеанс завершается как обрыв.</summary>
+    [Fact]
+    public async Task Reconnect_UnusableTunnelAddress_CancelsSession()
+    {
+        var world = new SessionWorld();
+        world.Lib.OnMainloop = () =>
+        {
+            world.Lib.Session = world.Lib.Session with { Address = "127.0.0.1" };
+            world.Lib.Callbacks!.Reconnected();
+            return world.Lib.WaitForCancel();
+        };
+
+        var kind = await world.RunAsync(Start()).WaitAsync(Wait, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TerminationKind.NetworkError, kind);
+        Assert.Single(world.System.Configured);
+        Assert.DoesNotContain(world.Output.All, e => e is IpInfoChangedEvent);
+        Assert.Contains("адрес туннеля 127.0.0.1", world.Output.Next<TerminatedEvent>(Wait).Text, StringComparison.Ordinal);
+    }
+
+    /// <summary>Событие сеанса не доставлено службе (больше кадра канала): сеанс на шлюзе закрывается, а не висит без службы.</summary>
+    [Fact]
+    public async Task EstablishedNotDelivered_ClosesGatewaySession()
+    {
+        var world = new SessionWorld();
+        var steps = RecordClose(world);
+        world.Output.Undeliverable = e => e is EstablishedEvent;
+
+        var kind = await world.RunAsync(Start()).WaitAsync(Wait, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TerminationKind.Internal, kind);
+        Assert.Equal(["cancel", "mainloop"], steps);
+        Assert.StartsWith("Параметры сеанса не переданы службе", world.Output.Next<TerminatedEvent>(Wait).Text, StringComparison.Ordinal);
+    }
+
+    /// <summary>Новые параметры после переподключения не доставлены: служба осталась бы с прежними, сеанс отменяется.</summary>
+    [Fact]
+    public async Task IpInfoChangedNotDelivered_CancelsSession()
+    {
+        var world = new SessionWorld();
+        world.Output.Undeliverable = e => e is IpInfoChangedEvent;
+        world.Lib.OnMainloop = () =>
+        {
+            world.Lib.Callbacks!.Reconnected();
+            return world.Lib.WaitForCancel();
+        };
+
+        var kind = await world.RunAsync(Start()).WaitAsync(Wait, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TerminationKind.NetworkError, kind);
+        Assert.True(world.Lib.CancelSent);
+        Assert.Contains("не переданы службе", world.Output.Next<TerminatedEvent>(Wait).Text, StringComparison.Ordinal);
+    }
+
+    /// <summary>Десятки тысяч сетей шлюза урезаются до предела, и об этом знают служба и журнал.</summary>
+    [Fact]
+    public void HugeSplitInclude_IsCappedAndReported()
+    {
+        var world = new SessionWorld();
+        var includes = Enumerable.Range(0, 70_000).Select(i => $"10.{i / 65536}.{i / 256 % 256}.{i % 256}/255.255.255.255").ToList();
+        world.Lib.Session = world.Lib.Session with { SplitIncludes = includes, SplitDns = Enumerable.Range(0, 100).Select(i => $"d{i}.example.org").ToList() };
+
+        world.RunAsync(Start());
+        var established = world.Output.Next<EstablishedEvent>(Wait);
+        world.Session.Post(new StopCommand());
+
+        Assert.Equal(HelperLimits.MaxSplitRoutes, established.Session.SplitIncludes.Count);
+        Assert.Equal(HelperLimits.MaxSplitDns, established.Session.SplitDns.Count);
+        Assert.Equal(2, established.Session.Truncated.Count);
+        Assert.True(HelperContract.Serialize(established).Length < FrameCodec.MaxFrameBytes);
+        Assert.Contains(world.Output.All.OfType<LogEvent>(), e => e.Text.Contains("взято 4096 из 70000", StringComparison.Ordinal));
+    }
+
+    /// <summary>Адрес SSO длиннее предела не отправляется службе: вход завершается с понятной причиной.</summary>
+    [Fact]
+    public async Task TooLongSsoUri_EndsSignInWithReason()
+    {
+        var world = new SessionWorld();
+        world.Lib.OnObtain = callbacks => callbacks.OpenWebview("https://sso.example.org/?" + new string('a', HelperLimits.MaxSsoUri));
+
+        var kind = await world.RunAsync(Start()).WaitAsync(Wait, TestContext.Current.CancellationToken);
+
+        Assert.Equal(TerminationKind.Internal, kind);
+        Assert.DoesNotContain(world.Output.All, e => e is SsoOpenEvent);
+        Assert.Contains("слишком длинный адрес страницы входа", world.Output.Next<TerminatedEvent>(Wait).Text, StringComparison.Ordinal);
+    }
+
+    /// <summary>Баннер формы в мегабайты и сотни вариантов уходят службе в пределах.</summary>
+    [Fact]
+    public void HugeForm_IsCappedBeforeSending()
+    {
+        var world = new SessionWorld();
+        var choices = Enumerable.Range(0, 1000).Select(i => "g" + i).ToArray();
+        var group = new FakeField("group_list", OcFieldKindForTests.Select, choices, label: new string('L', 5000));
+        world.Lib.OnObtain = callbacks => callbacks.ProcessForm(FakeField.Form(group, 0, group) with { Banner = new string('b', 2_000_000) });
+
+        world.RunAsync(Start());
+        var form = world.Output.Next<AuthFormEvent>(Wait);
+        world.Session.Post(new StopCommand());
+
+        Assert.Equal(HelperLimits.MaxFormText, form.Title!.Length);
+        var field = Assert.Single(form.Fields);
+        Assert.Equal(HelperLimits.MaxLabel, field.Label.Length);
+        Assert.Equal(HelperLimits.MaxChoices, field.Choices.Count);
+    }
+
+    /// <summary>Канал помощника: событие больше кадра не отправляется, но канал остаётся годным для следующих.</summary>
+    [Fact]
+    public async Task HelperHost_OversizedEvent_ReturnsFalseAndKeepsChannel()
+    {
+        using var output = new MemoryStream();
+        var host = new HelperHost(Stream.Null, output, () => throw new InvalidOperationException());
+
+        Assert.False(host.Send(new LogEvent("info", new string('x', FrameCodec.MaxFrameBytes))));
+        Assert.True(host.Send(new LogEvent("info", "ok")));
+
+        output.Position = 0;
+        var events = new List<HelperEvent>();
+        while (await FrameCodec.ReadAsync(output, TestContext.Current.CancellationToken) is { } payload)
+        {
+            events.Add(HelperContract.TryDeserializeEvent(payload)!);
+        }
+
+        Assert.Equal(2, events.Count);
+        Assert.Contains("не передано службе", Assert.IsType<LogEvent>(events[0]).Text, StringComparison.Ordinal);
+        Assert.Equal("ok", Assert.IsType<LogEvent>(events[1]).Text);
+    }
+
     /// <summary>Порядок отмены и запуска цикла библиотеки; цикл пишет ошибку, как настоящий при неудачном адаптере.</summary>
     private static ConcurrentQueue<string> RecordClose(SessionWorld world)
     {
@@ -863,10 +1014,19 @@ internal sealed class RecordingOutput : IHelperOutput
 
     public IReadOnlyCollection<HelperEvent> All => _all.ToArray();
 
-    public void Send(HelperEvent helperEvent)
+    /// <summary>Какие события не доставляются (как событие больше кадра канала); null — доставляются все.</summary>
+    public Func<HelperEvent, bool>? Undeliverable { get; set; }
+
+    public bool Send(HelperEvent helperEvent)
     {
+        if (Undeliverable?.Invoke(helperEvent) == true)
+        {
+            return false;
+        }
+
         _all.Enqueue(helperEvent);
         _queue.Add(helperEvent);
+        return true;
     }
 
     /// <summary>Следующее событие указанного типа; события других типов пропускаются.</summary>

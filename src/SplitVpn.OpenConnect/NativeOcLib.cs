@@ -114,6 +114,8 @@ internal sealed unsafe class NativeOcLib : IOcLib
             }
         }
 
+        // Списки и строки шлюза - в пределах HelperLimits (что урезано - в Truncated): иначе событие сеанса могло бы не
+        // влезть в кадр канала со службой.
         return new SessionInfo
         {
             Address = OcNative.Utf8(ip->Addr) ?? "",
@@ -128,7 +130,7 @@ internal sealed unsafe class NativeOcLib : IOcLib
             SessionTimeoutSeconds = sessionTimeout,
             DtlsPort = dtlsPort,
             DtlsActive = DtlsActive,
-        };
+        }.Capped();
     }
 
     public void SetupCommandPipe()
@@ -298,12 +300,13 @@ internal sealed unsafe class NativeOcLib : IOcLib
             }
         }
 
+        // Тексты шлюза - в пределах HelperLimits, как их обрежет и служба: баннер в мегабайты не нужен ни в журнале, ни в окне входа.
         return new OcForm
         {
             AuthId = OcNative.Utf8(form->AuthId),
-            Banner = OcNative.Utf8(form->Banner),
-            Message = OcNative.Utf8(form->Message),
-            Error = OcNative.Utf8(form->Error),
+            Banner = HelperLimits.Truncate(OcNative.Utf8(form->Banner), HelperLimits.MaxFormText),
+            Message = HelperLimits.Truncate(OcNative.Utf8(form->Message), HelperLimits.MaxFormText),
+            Error = HelperLimits.Truncate(OcNative.Utf8(form->Error), HelperLimits.MaxFormText),
             Fields = fields,
             Group = group,
             GroupSelection = form->AuthgroupSelection,
@@ -324,17 +327,19 @@ internal sealed unsafe class NativeOcLib : IOcLib
         var choices = new List<AuthChoiceDto>();
         if (kind == OcFieldKind.Select)
         {
+            // Вариантов не больше HelperLimits.MaxChoices; имя варианта не обрезается: по нему библиотека выбирает значение.
             var select = (OcFormOptSelect*)option;
-            for (var i = 0; i < select->NrChoices; i++)
+            for (var i = 0; i < select->NrChoices && choices.Count < HelperLimits.MaxChoices; i++)
             {
-                choices.Add(new AuthChoiceDto(OcNative.Utf8(select->Choices[i]->Name) ?? "", OcNative.Utf8(select->Choices[i]->Label) ?? ""));
+                choices.Add(new AuthChoiceDto(OcNative.Utf8(select->Choices[i]->Name) ?? "",
+                    HelperLimits.Truncate(OcNative.Utf8(select->Choices[i]->Label), HelperLimits.MaxLabel) ?? ""));
             }
         }
 
         var pointer = (nint)option;
         return new OcField(
             OcNative.Utf8(option->Name) ?? "",
-            OcNative.Utf8(option->Label) ?? OcNative.Utf8(option->Name) ?? "",
+            HelperLimits.Truncate(OcNative.Utf8(option->Label) ?? OcNative.Utf8(option->Name), HelperLimits.MaxLabel) ?? "",
             kind,
             (option->Flags & OcNative.OptIgnore) != 0 && !isGroup,
             choices,

@@ -313,6 +313,9 @@ internal sealed class AnyConnectLink(IAnyConnectSession session, int generation)
 
     /// <summary>Порты UDP шлюза помимо порта профиля: порт DTLS, назначенный шлюзом.</summary>
     public SortedSet<ushort> GatewayUdpPorts { get; } = [];
+
+    /// <summary>DNS-серверы шлюза из локальной сети: убраны из DNS туннеля (локальная сеть важнее), о них - предупреждение.</summary>
+    public IReadOnlyList<uint> DnsLanConflicts { get; set; } = [];
 }
 
 /// <summary>Адрес, закреплённый за целью правилом для домена, и срок его действия.</summary>

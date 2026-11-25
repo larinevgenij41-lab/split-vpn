@@ -848,6 +848,7 @@ public sealed partial class Coordinator
     private void CompilePolicy()
     {
         PromotePins();
+        RefreshGatewayDns();
         // Неразобранные правила и адреса DNS пропускаются: о них — запись в журнале и предупреждение в состоянии.
         ReportSkippedSettings();
         var (rules, _) = ParsedRules();

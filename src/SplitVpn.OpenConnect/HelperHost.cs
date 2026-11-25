@@ -41,18 +41,39 @@ internal sealed class HelperHost(Stream input, Stream output, Func<OcSession> cr
         return kind is TerminationKind.Cancelled or TerminationKind.AuthRejected or TerminationKind.SessionExpired ? 0 : 1;
     }
 
-    public void Send(HelperEvent helperEvent)
+    public bool Send(HelperEvent helperEvent)
     {
         lock (_writeLock)
         {
             try
             {
                 FrameCodec.WriteAsync(output, HelperContract.Serialize(helperEvent), CancellationToken.None).GetAwaiter().GetResult();
+                return true;
             }
-            catch (IOException)
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException)
             {
                 // Служба закрыла канал: событие некому доставить, сеанс остановит поток команд.
+                return false;
             }
+            catch (IpcProtocolException ex)
+            {
+                // Событие больше кадра канала: оно не отправлено, канал цел. Сеанс решает сам, можно ли без него
+                // жить (параметры сеанса - нельзя), а служба узнаёт о потере из журнала.
+                TrySendLog("Событие " + helperEvent.GetType().Name + " не передано службе: " + ex.Message);
+                return false;
+            }
+        }
+    }
+
+    private void TrySendLog(string text)
+    {
+        try
+        {
+            FrameCodec.WriteAsync(output, HelperContract.Serialize(new LogEvent("error", text)), CancellationToken.None).GetAwaiter().GetResult();
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or IpcProtocolException)
+        {
+            // Канал закрыт: сообщить некому.
         }
     }
 

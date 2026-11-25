@@ -41,6 +41,134 @@ public static class HelperContract
     }
 }
 
+/// <summary>
+/// Пределы данных шлюза, которые помощник передаёт службе, а служба — приложению в каждом ответе о состоянии.
+/// Шлюз недоверенный: без пределов баннер в мегабайты или десятки тысяч сетей превысили бы кадр канала
+/// (<see cref="FrameCodec.MaxFrameBytes"/>). Помощник и служба обрезают по одним и тем же числам.
+/// </summary>
+public static class HelperLimits
+{
+    /// <summary>Сетей split-include и, отдельно, split-exclude.</summary>
+    public const int MaxSplitRoutes = 4096;
+
+    /// <summary>Суффиксов split DNS (и DNS-серверов).</summary>
+    public const int MaxSplitDns = 64;
+
+    /// <summary>Длина записи сети или адреса: «255.255.255.255/255.255.255.255» короче.</summary>
+    public const int MaxRouteLength = 64;
+
+    /// <summary>Длина имени DNS.</summary>
+    public const int MaxDnsNameLength = 255;
+
+    /// <summary>Длина домена по умолчанию и адреса PAC.</summary>
+    public const int MaxSessionText = 4096;
+
+    /// <summary>Заголовок, сообщение и ошибка формы входа.</summary>
+    public const int MaxFormText = 4096;
+
+    /// <summary>Подпись поля и варианта выбора.</summary>
+    public const int MaxLabel = 256;
+
+    /// <summary>Полей формы, которые показываются пользователю.</summary>
+    public const int MaxFormFields = 32;
+
+    /// <summary>Вариантов выбора одного поля.</summary>
+    public const int MaxChoices = 256;
+
+    /// <summary>Имя поля: длиннее служба не примет в ответе формы.</summary>
+    public const int MaxFieldName = 256;
+
+    /// <summary>Значение поля: длиннее служба не примет в ответе формы. Имя варианта - не длиннее <see cref="MaxLabel"/>.</summary>
+    public const int MaxFieldValue = 1024;
+
+    /// <summary>Адрес страницы входа SSO. Длиннее не обрезается (обрезанный адрес не откроет вход), а отклоняется.</summary>
+    public const int MaxSsoUri = 8192;
+
+    /// <summary>Строка не длиннее <paramref name="maxLength"/> символов; обрезанная кончается многоточием.</summary>
+    public static string? Truncate(string? text, int maxLength)
+    {
+        if (text is null || text.Length <= maxLength)
+        {
+            return text;
+        }
+
+        var cut = Math.Max(0, maxLength - 1);
+        if (cut > 0 && char.IsHighSurrogate(text[cut - 1]))
+        {
+            // Половина суррогатной пары дала бы недопустимый UTF-16, и сериализатор JSON отказался бы его писать.
+            cut--;
+        }
+
+        return string.Concat(text.AsSpan(0, cut), "…");
+    }
+
+    /// <summary>
+    /// Сколько символов всего занимают поля формы (имена, подписи, значения, варианты). Поштучные пределы вместе
+    /// допускают 32 × 256 вариантов по 256 символов — больше кадра канала; общий бюджет держит форму в десятках
+    /// килобайт даже при экранировании каждого символа в JSON.
+    /// </summary>
+    public const int MaxFormFieldChars = 32 * 1024;
+
+    /// <summary>
+    /// Поля формы в пределах: длинные подписи обрезаются, лишние поля и варианты отбрасываются, поля и варианты с
+    /// именем длиннее допустимого в ответе формы пропускаются (выбрать их всё равно нельзя). Когда общий бюджет
+    /// <see cref="MaxFormFieldChars"/> исчерпан, следующие варианты и поля не берутся.
+    /// </summary>
+    public static IReadOnlyList<AuthFieldDto> CapFields(IReadOnlyList<AuthFieldDto>? fields)
+    {
+        var budget = MaxFormFieldChars;
+        var result = new List<AuthFieldDto>();
+        foreach (var field in fields ?? [])
+        {
+            if (result.Count >= MaxFormFields)
+            {
+                break;
+            }
+
+            if (field is not { Name: { Length: > 0 and <= MaxFieldName } name })
+            {
+                continue;
+            }
+
+            var label = Truncate(field.Label ?? name, MaxLabel)!;
+            var value = field.Value is { Length: > MaxFieldValue } ? null : field.Value;
+            var cost = name.Length + label.Length + (value?.Length ?? 0);
+            if (cost > budget)
+            {
+                break;
+            }
+
+            budget -= cost;
+            var choices = new List<AuthChoiceDto>();
+            foreach (var choice in field.Choices ?? [])
+            {
+                if (choices.Count >= MaxChoices)
+                {
+                    break;
+                }
+
+                if (choice is not { Name: { Length: <= MaxLabel } choiceName })
+                {
+                    continue;
+                }
+
+                var choiceLabel = Truncate(choice.Label ?? choiceName, MaxLabel)!;
+                if (choiceName.Length + choiceLabel.Length > budget)
+                {
+                    break;
+                }
+
+                budget -= choiceName.Length + choiceLabel.Length;
+                choices.Add(choice with { Label = choiceLabel });
+            }
+
+            result.Add(field with { Label = label, Value = value, Choices = choices });
+        }
+
+        return result;
+    }
+}
+
 /// <summary>Команды службы помощнику.</summary>
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "type", UnknownDerivedTypeHandling = JsonUnknownDerivedTypeHandling.FailSerialization)]
 [JsonDerivedType(typeof(StartCommand), "start")]
@@ -111,7 +239,17 @@ public sealed record SsoOpenEvent(Guid RequestId, string Uri, string GatewayHost
 /// <summary>Итог SSO: Done — токен принят, окно можно закрыть; иначе Error.</summary>
 public sealed record SsoResultEvent(Guid RequestId, bool Done, string? Error) : HelperEvent;
 
-public sealed record AuthFormEvent(Guid RequestId, string? Title, string? Message, string? Error, IReadOnlyList<AuthFieldDto> Fields) : HelperEvent;
+public sealed record AuthFormEvent(Guid RequestId, string? Title, string? Message, string? Error, IReadOnlyList<AuthFieldDto> Fields) : HelperEvent
+{
+    /// <summary>Форма в пределах <see cref="HelperLimits"/>: тексты шлюза уходят в каждый ответ о состоянии.</summary>
+    public AuthFormEvent Capped() => this with
+    {
+        Title = HelperLimits.Truncate(Title, HelperLimits.MaxFormText),
+        Message = HelperLimits.Truncate(Message, HelperLimits.MaxFormText),
+        Error = HelperLimits.Truncate(Error, HelperLimits.MaxFormText),
+        Fields = HelperLimits.CapFields(Fields),
+    };
+}
 
 /// <summary>
 /// Помощнику нужен адрес узла шлюза. Порт — тот, к которому библиотека будет подключаться (после перенаправления
@@ -228,10 +366,109 @@ public sealed record SessionInfo
     /// такой «DNS шлюза» нельзя спросить через туннель, а адрес лёг бы в политику маршрутом и разрешением в туннель.
     /// </summary>
     public IReadOnlyList<uint> DnsAddresses() => Dns.Select(d => Ipv4.TryParse(d, out var value) ? value : (uint?)null).OfType<uint>()
-        .Where(a => !UnusableDns.Contains(a)).Distinct().ToList();
+        .Where(a => !SpecialRanges.GatewayUnusable.Contains(a)).Distinct().ToList();
 
-    private static readonly RangeSet UnusableDns = RangeSet.From([Ipv4Cidr.Parse("0.0.0.0/8"), Ipv4Cidr.Parse("224.0.0.0/3")])
-        .Union(SpecialRanges.Loopback);
+    /// <summary>
+    /// Что урезано помощником из-за пределов <see cref="HelperLimits"/> (для журнала службы); пусто — ничего.
+    /// Служба прежних версий поля не знает и пропускает его.
+    /// </summary>
+    public IReadOnlyList<string> Truncated { get; init; } = [];
+
+    /// <summary>
+    /// Почему адрес туннеля, выданный шлюзом, нельзя назначить адаптеру; null — адрес годится. Адрес из служебных
+    /// диапазонов (<see cref="SpecialRanges.GatewayUnusable"/>) на адаптере с /32 и принудительным Preferred
+    /// перехватил бы loopback, link-local или multicast всей машины.
+    /// </summary>
+    public string? TunnelAddressProblem()
+    {
+        if (!Ipv4.TryParse(Address ?? "", out var address))
+        {
+            return "шлюз не выдал IPv4-адрес туннеля";
+        }
+
+        return SpecialRanges.GatewayUnusable.Contains(address)
+            ? $"шлюз выдал недопустимый адрес туннеля {Ipv4.Format(address)} (служебный диапазон: loopback, link-local, multicast или 0.0.0.0/8)"
+            : null;
+    }
+
+    /// <summary>
+    /// Параметры сеанса в пределах <see cref="HelperLimits"/>: списки и строки шлюза обрезаются, а что обрезано —
+    /// в <see cref="Truncated"/>. Без этого десятки тысяч сетей split-include дали бы событие больше кадра канала
+    /// (<see cref="FrameCodec.MaxFrameBytes"/>), и служба не узнала бы о сеансе. Повторный вызов ничего не меняет.
+    /// </summary>
+    public SessionInfo Capped()
+    {
+        var truncated = new List<string>(Truncated ?? []);
+        var includes = CapList(SplitIncludes, HelperLimits.MaxSplitRoutes, HelperLimits.MaxRouteLength, "сети шлюза (split-include)", truncated);
+        var excludes = CapList(SplitExcludes, HelperLimits.MaxSplitRoutes, HelperLimits.MaxRouteLength, "исключения шлюза (split-exclude)", truncated);
+        var splitDns = CapList(SplitDns, HelperLimits.MaxSplitDns, HelperLimits.MaxDnsNameLength, "суффиксы split DNS", truncated);
+        var dns = CapList(Dns, HelperLimits.MaxSplitDns, HelperLimits.MaxRouteLength, "DNS-серверы шлюза", truncated);
+        var domain = CapText(Domain, HelperLimits.MaxSessionText, "домен по умолчанию", truncated);
+        var pac = ProxyPac is { Length: > HelperLimits.MaxSessionText } ? null : ProxyPac;
+        if (!ReferenceEquals(pac, ProxyPac))
+        {
+            truncated.Add(string.Create(CultureInfo.InvariantCulture, $"адрес PAC длиннее {HelperLimits.MaxSessionText} символов отброшен"));
+        }
+
+        // Адрес и маска длиннее записи IPv4 не разбираются: обрезка лишь не даёт им раздуть событие.
+        var address = CapText(Address, HelperLimits.MaxRouteLength, "адрес туннеля", null);
+        var netmask = CapText(Netmask, HelperLimits.MaxRouteLength, "маска туннеля", null);
+        var changed = !ReferenceEquals(includes, SplitIncludes) || !ReferenceEquals(excludes, SplitExcludes)
+            || !ReferenceEquals(splitDns, SplitDns) || !ReferenceEquals(dns, Dns) || !ReferenceEquals(domain, Domain)
+            || !ReferenceEquals(pac, ProxyPac) || !ReferenceEquals(address, Address) || !ReferenceEquals(netmask, Netmask);
+        if (!changed)
+        {
+            return this;
+        }
+
+        return this with
+        {
+            Address = address ?? "",
+            Netmask = netmask ?? "",
+            SplitIncludes = includes,
+            SplitExcludes = excludes,
+            SplitDns = splitDns,
+            Dns = dns,
+            Domain = domain,
+            ProxyPac = pac,
+            Truncated = truncated.Distinct(StringComparer.Ordinal).ToList(),
+        };
+    }
+
+    private static IReadOnlyList<string> CapList(IReadOnlyList<string>? list, int maxCount, int maxLength, string what, List<string> truncated)
+    {
+        list ??= [];
+        var tooLong = list.Count(item => item is null || item.Length > maxLength);
+        if (list.Count <= maxCount && tooLong == 0)
+        {
+            return list;
+        }
+
+        var kept = list.Where(item => item is not null && item.Length <= maxLength).ToList();
+        if (kept.Count > maxCount)
+        {
+            truncated.Add(string.Create(CultureInfo.InvariantCulture, $"{what}: взято {maxCount} из {kept.Count}"));
+            kept = kept.Take(maxCount).ToList();
+        }
+
+        if (tooLong > 0)
+        {
+            truncated.Add(string.Create(CultureInfo.InvariantCulture, $"{what}: отброшено слишком длинных записей {tooLong}"));
+        }
+
+        return kept;
+    }
+
+    private static string? CapText(string? text, int maxLength, string what, List<string>? truncated)
+    {
+        if (text is null || text.Length <= maxLength)
+        {
+            return text;
+        }
+
+        truncated?.Add(string.Create(CultureInfo.InvariantCulture, $"{what} обрезан до {maxLength} символов"));
+        return HelperLimits.Truncate(text, maxLength);
+    }
 
     /// <summary>Маршрут libopenconnect: «сеть/маска», «сеть/префикс» или адрес узла.</summary>
     public static Ipv4Cidr? ParseRoute(string route)

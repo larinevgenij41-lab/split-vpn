@@ -36,6 +36,16 @@ public static class SpecialRanges
         "203.0.113.0/24",
         "240.0.0.0/4").Subtract(Local);
 
+    /// <summary>
+    /// Адреса, которые шлюз VPN не может законно выдать ни туннелю, ни узлу кластера, ни своему DNS: «этот хост»
+    /// 0.0.0.0/8, loopback, link-local, multicast, 240.0.0.0/4 и широковещание (224.0.0.0/3 накрывает три последних).
+    /// </summary>
+    public static RangeSet GatewayUnusable { get; } = FromCidrs(
+        "0.0.0.0/8",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "224.0.0.0/3");
+
     /// <summary>Всё, что нельзя встретить в корректной RU-базе.</summary>
     public static RangeSet AllNonPublic { get; } = Local.Union(Loopback).Union(Reserved);
 

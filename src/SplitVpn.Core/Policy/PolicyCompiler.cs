@@ -204,9 +204,11 @@ public static class PolicyCompiler
         foreach (var host in input.TunnelHosts)
         {
             // DNS туннеля сильнее сетей шлюза и обычных правил, но не запрета пользователя: запрещённый им адрес
-            // не открывается ради DNS. Loopback в туннель не уводится никогда.
+            // не открывается ради DNS. Loopback и сеть своего адаптера в туннель не уводятся никогда: шлюз,
+            // назвавший своим DNS адрес из домашней сети (X-CSTP-DNS: 192.168.1.10), иначе забрал бы в туннель
+            // узел локальной сети. Такой адрес служба и сама убирает из DNS туннеля с предупреждением.
             painter.PaintKeeping(Ipv4Range.Host(host.Address), new Classification(Decision.Vpn, DecisionSource.TunnelInfrastructure, null, host.Tunnel),
-                label => IsUserBlock(label) || label.Source == DecisionSource.Loopback);
+                label => IsUserBlock(label) || label.Source is DecisionSource.Loopback or DecisionSource.OnLink);
         }
 
         // Решение правила для адреса сервера запоминается до слоя серверов, который его перекроет.

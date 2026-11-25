@@ -331,12 +331,17 @@ public sealed partial class Coordinator
                 link.ClientVersion = hello.OpenConnectVersion;
                 _deps.Logger.LogInformation("Помощник AnyConnect {Name}: {Version}", tunnel.Name, hello.OpenConnectVersion);
                 break;
+            case SsoOpenEvent open when open.Uri is null || open.Uri.Length > HelperLimits.MaxSsoUri:
+                // Обрезанный адрес вход не откроет, а целиком он уходил бы в каждый ответ о состоянии.
+                await RejectGatewaySessionAsync(tunnel, link, string.Create(CultureInfo.InvariantCulture,
+                    $"шлюз прислал слишком длинный адрес страницы входа ({open.Uri?.Length ?? 0} символов при пределе {HelperLimits.MaxSsoUri})"), cancellationToken);
+                break;
             case SsoOpenEvent open:
                 tunnel.SignIn = new SignInPromptDto
                 {
                     RequestId = open.RequestId,
                     Kind = SignInKind.Browser,
-                    GatewayHost = open.GatewayHost,
+                    GatewayHost = HelperLimits.Truncate(open.GatewayHost, HelperLimits.MaxDnsNameLength) ?? "",
                     Uri = open.Uri,
                     ExpiresUtc = _deps.Time.GetUtcNow() + SignInPromptLifetime,
                 };
@@ -347,7 +352,9 @@ public sealed partial class Coordinator
             case SsoResultEvent result:
                 OnSsoResult(tunnel, link, result);
                 break;
-            case AuthFormEvent form:
+            case AuthFormEvent received:
+                // Тексты и поля шлюза хранятся и уходят в каждый ответ о состоянии: только в пределах HelperLimits.
+                var form = received.Capped();
                 tunnel.SignIn = new SignInPromptDto
                 {
                     RequestId = form.RequestId,
@@ -366,8 +373,14 @@ public sealed partial class Coordinator
             case ResolveHostEvent resolve:
                 await ResolveGatewayAsync(tunnel, link, resolve.Host, resolve.Port, cancellationToken);
                 break;
+            case EstablishedEvent up when GatewayTunnelAddressProblem(tunnel, up.Session) is { } problem:
+                await RejectGatewaySessionAsync(tunnel, link, problem, cancellationToken);
+                break;
             case EstablishedEvent up:
                 await OnAnyConnectEstablishedAsync(tunnel, link, up, cancellationToken);
+                break;
+            case IpInfoChangedEvent changed when GatewayTunnelAddressProblem(tunnel, changed.Session) is { } problem:
+                await RejectGatewaySessionAsync(tunnel, link, problem, cancellationToken);
                 break;
             case IpInfoChangedEvent changed:
                 ApplySession(tunnel, changed.Session);
@@ -473,7 +486,14 @@ public sealed partial class Coordinator
         IReadOnlyList<uint> addresses;
         if (isLiteral)
         {
-            addresses = [literal];
+            // Адрес из профиля - выбор пользователя; адрес, на который перенаправил шлюз, проверяется.
+            addresses = isGateway ? [literal] : FilterGatewayNodeAddresses(tunnel, host, [literal]);
+            if (addresses.Count == 0)
+            {
+                Journal("Ошибка", $"«{tunnel.Name}»: шлюз перенаправил на недопустимый адрес {host}; узел не открыт.");
+                link.Session.Send(new ResolveReplyCommand(host, null, []));
+                return;
+            }
         }
         else if (string.Equals(host, GatewayHostOf(tunnel), StringComparison.OrdinalIgnoreCase) && tunnel.ServerAddresses.Count > 0)
         {
@@ -503,9 +523,19 @@ public sealed partial class Coordinator
             }
 
             if (!link.NodeAddresses.TryGetValue(host, out var known)) link.NodeAddresses[host] = known = [];
-            if (resolved is { Count: > 0 })
+            // Узлы кластера проверяются до предела: недопустимые адреса не должны вытеснять годные.
+            var usable = resolved is { Count: > 0 } && !isGateway ? FilterGatewayNodeAddresses(tunnel, host, resolved) : resolved;
+            var allDropped = resolved is { Count: > 0 } && usable is { Count: 0 };
+            if (allDropped)
             {
-                var fresh = resolved.Distinct().Take(MaxGatewayNodes).ToList();
+                // Прежние адреса узла тоже не отдаются: имя теперь ведёт только на недопустимые.
+                Journal("Ошибка", $"«{tunnel.Name}»: у узла шлюза {host} нет допустимых адресов; узел не открыт.");
+            }
+
+            resolved = usable;
+            if (resolved is { Count: > 0 } || allDropped)
+            {
+                var fresh = (resolved ?? []).Distinct().Take(MaxGatewayNodes).ToList();
                 var stale = known.Except(fresh).ToList();
                 known.Clear();
                 known.UnionWith(fresh);
@@ -641,21 +671,224 @@ public sealed partial class Coordinator
                 yield return new StatusWarning("gateway-networks-rejected",
                     $"«{tunnel.Name}»: сети шлюза отброшены целиком ({rejected}). Через подключение действуют только пользовательские правила.", null);
             }
+
+            if (tunnel.AnyConnect is { DnsLanConflicts.Count: > 0 } link)
+            {
+                yield return new StatusWarning("gateway-dns-lan", $"«{tunnel.Name}»: {DnsLanConflictText(link.DnsLanConflicts)}", null);
+            }
+
+            if (tunnel.Session!.Truncated is { Count: > 0 } truncated)
+            {
+                yield return new StatusWarning("gateway-session-truncated",
+                    $"«{tunnel.Name}»: шлюз прислал слишком много данных сеанса, лишнее отброшено ({string.Join("; ", truncated)}).", null);
+            }
         }
     }
 
-    private void ApplySession(TunnelFacts tunnel, SessionInfo session)
+    private void ApplySession(TunnelFacts tunnel, SessionInfo received)
     {
+        // Параметры шлюза уходят в каждый ответ о состоянии: служба держит их в тех же пределах, что и помощник.
+        var session = received.Capped();
         tunnel.AnyConnect!.ParametersReceivedUtc = _deps.Time.GetUtcNow();
         tunnel.AnyConnect.GatewayUdpPorts.Clear();
         tunnel.Session = session;
-        tunnel.VpnDns = session.DnsAddresses();
+        foreach (var item in session.Truncated)
+        {
+            Journal("Предупреждение", $"«{tunnel.Name}»: шлюз прислал слишком много данных сеанса, лишнее отброшено — {item}.");
+        }
+
+        RefreshGatewayDns(tunnel, RangeSet.From(OnLinkPrefixes()));
 
         // DTLS идёт на порт, назначенный шлюзом: без разрешения фильтров сеанс остался бы на TLS.
         if (tunnel.AnyConnect is { } link && session.DtlsPort is > 0 and <= ushort.MaxValue and var dtls && dtls != tunnel.ServerPort)
         {
             link.GatewayUdpPorts.Add((ushort)dtls);
         }
+    }
+
+    /// <summary>
+    /// DNS шлюзов AnyConnect без адресов локальной сети. Шлюз, назвавший своим DNS адрес из сети адаптера
+    /// (X-CSTP-DNS: 192.168.1.10), иначе получил бы запросы имён, отправленные узлу домашней сети, а политика
+    /// увела бы этот узел в туннель. Локальная сеть важнее: адрес убирается из DNS туннеля, о чём говорит
+    /// предупреждение. Сеть адаптера меняется со сменой сети, поэтому сверка повторяет отбор перед сборкой политики.
+    /// </summary>
+    private void RefreshGatewayDns()
+    {
+        if (!Facts.Tunnels.Values.Any(t => t is { Protocol: VpnProtocol.AnyConnect, Session: not null }))
+        {
+            return;
+        }
+
+        var onLink = RangeSet.From(OnLinkPrefixes());
+        foreach (var tunnel in Facts.Tunnels.Values.Where(t => t is { Protocol: VpnProtocol.AnyConnect, Session: not null, AnyConnect: not null }))
+        {
+            RefreshGatewayDns(tunnel, onLink);
+        }
+    }
+
+    private void RefreshGatewayDns(TunnelFacts tunnel, RangeSet onLink)
+    {
+        if (tunnel is not { Session: { } session, AnyConnect: { } link })
+        {
+            return;
+        }
+
+        var all = session.DnsAddresses();
+        var conflicts = all.Where(onLink.Contains).ToList();
+        tunnel.VpnDns = conflicts.Count == 0 ? all : all.Except(conflicts).ToList();
+        if (conflicts.SequenceEqual(link.DnsLanConflicts))
+        {
+            return;
+        }
+
+        link.DnsLanConflicts = conflicts;
+        if (conflicts.Count > 0)
+        {
+            Journal("Предупреждение", $"«{tunnel.Name}»: {DnsLanConflictText(conflicts)}");
+        }
+    }
+
+    private static string DnsLanConflictText(IReadOnlyList<uint> conflicts) =>
+        $"адрес DNS-сервера шлюза {string.Join(", ", conflicts.Select(Ipv4.Format))} совпадает с локальной сетью — "
+        + "запросы имён к нему не отправляются, этот адрес остаётся в локальной сети.";
+
+    /// <summary>
+    /// Почему адрес туннеля, выданный шлюзом, нельзя принять; null — адрес годится. Адаптер получает его как /32 с
+    /// принудительным Preferred: адрес маршрутизатора, узла локальной сети, DNS, сервера VPN или другого туннеля
+    /// перехватил бы трафик к нему у всей машины.
+    /// </summary>
+    internal string? GatewayTunnelAddressProblem(TunnelFacts tunnel, SessionInfo session)
+    {
+        if (session.TunnelAddressProblem() is { } problem)
+        {
+            return problem;
+        }
+
+        var address = Ipv4.Parse(session.Address);
+        var text = Ipv4.Format(address);
+        if (Facts.Primary is { } primary)
+        {
+            if (primary.DefaultGateway == address)
+            {
+                return $"шлюз выдал адрес туннеля {text}, совпадающий с адресом маршрутизатора локальной сети";
+            }
+
+            if (primary.Addresses.Contains(address)
+                || primary.OnLinkPrefixes.Any(p => p.PrefixLength >= PolicyCompiler.MinOnLinkPrefix && p.Contains(address)))
+            {
+                return $"шлюз выдал адрес туннеля {text} из локальной сети основного адаптера «{primary.Name}»";
+            }
+        }
+
+        if (ServiceDnsAddresses().Contains(address))
+        {
+            return $"шлюз выдал адрес туннеля {text}, совпадающий с адресом DNS-сервера сети";
+        }
+
+        if (AllServerAddresses().Contains(address))
+        {
+            return $"шлюз выдал адрес туннеля {text}, совпадающий с адресом сервера VPN";
+        }
+
+        foreach (var other in Facts.Tunnels.Values.Where(t => !ReferenceEquals(t, tunnel)))
+        {
+            var otherAddress = other.Session is { } otherSession && Ipv4.TryParse(otherSession.Address ?? "", out var parsed) ? parsed : (uint?)null;
+            if (otherAddress == address || other.Adapter?.Addresses.Contains(address) == true)
+            {
+                return $"шлюз выдал адрес туннеля {text}, который уже занят подключением «{other.Name}»";
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Сеанс шлюза отклонён из-за его данных (адрес туннеля, адрес страницы входа): помощник останавливается с BYE,
+    /// а туннель получает блокирующую ошибку — повтор с тем же шлюзом дал бы то же самое.
+    /// </summary>
+    private async Task RejectGatewaySessionAsync(TunnelFacts tunnel, AnyConnectLink link, string reason, CancellationToken cancellationToken)
+    {
+        var wasUp = link.Established;
+        StopAnyConnect(tunnel);
+        Facts.SignInApproved.Remove(tunnel.ProfileId);
+        if (wasUp)
+        {
+            tunnel.ResetConnection(_deps.Time.GetUtcNow());
+        }
+
+        tunnel.VpnDns = [];
+        tunnel.DialSettled = true;
+        tunnel.LastErrorCategory = ErrorCategory.Other;
+        tunnel.LastErrorCode = null;
+        tunnel.LastErrorText = $"«{tunnel.Name}»: {reason}. Подключение остановлено.";
+        tunnel.BlockingError = ErrorCategory.Other;
+        tunnel.PasswordRequired = false;
+        Journal("Ошибка", tunnel.LastErrorText + " Повторы остановлены до действия пользователя.");
+        Facts.AppliedFilters.Remove(FilterGroup.Runtime);
+        await ReconcileAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Адреса узла шлюза, на который перенаправил шлюз, без недопустимых: каждый получает маршрут /32 мимо туннеля
+    /// и разрешение в фильтрах защиты. Что отброшено — в журнал.
+    /// </summary>
+    private List<uint> FilterGatewayNodeAddresses(TunnelFacts tunnel, string host, IEnumerable<uint> candidates)
+    {
+        var serviceDns = ServiceDnsAddresses();
+        var (rules, _) = ParsedRules();
+        var kept = new List<uint>();
+        var dropped = new List<string>();
+        foreach (var address in candidates.Distinct())
+        {
+            if (GatewayNodeAddressProblem(address, Facts.Primary, serviceDns, rules) is { } reason)
+            {
+                dropped.Add($"{Ipv4.Format(address)} ({reason})");
+            }
+            else
+            {
+                kept.Add(address);
+            }
+        }
+
+        if (dropped.Count > 0)
+        {
+            Journal("Предупреждение", $"«{tunnel.Name}»: у узла шлюза {host} отброшены адреса {string.Join(", ", dropped)} — прямой путь к ним открыл бы шлюз.");
+        }
+
+        return kept;
+    }
+
+    /// <summary>Почему адрес узла шлюза нельзя открыть напрямую; null — можно.</summary>
+    internal static string? GatewayNodeAddressProblem(uint address, AdapterCandidate? primary, IReadOnlyCollection<uint> serviceDns, IReadOnlyList<UserRule> rules)
+    {
+        if (SpecialRanges.GatewayUnusable.Contains(address))
+        {
+            return "служебный диапазон";
+        }
+
+        if (primary is not null)
+        {
+            if (primary.DefaultGateway == address)
+            {
+                return "маршрутизатор локальной сети";
+            }
+
+            if (primary.Addresses.Contains(address)
+                || primary.OnLinkPrefixes.Any(p => p.PrefixLength >= PolicyCompiler.MinOnLinkPrefix && p.Contains(address)))
+            {
+                return "локальная сеть";
+            }
+        }
+
+        if (serviceDns.Contains(address))
+        {
+            return "DNS-сервер сети";
+        }
+
+        // Действует то правило, что ложится в политике последним: по приоритету, затем самое узкое.
+        var rule = rules.Where(r => r.Cidr.Contains(address))
+            .OrderBy(r => r.Priority).ThenBy(r => r.Cidr.PrefixLength).LastOrDefault();
+        return rule?.Target.Kind == TargetKind.Block ? "запрещён правилом пользователя" : null;
     }
 
     private async Task OnAnyConnectTerminatedAsync(TunnelFacts tunnel, AnyConnectLink link, TerminatedEvent terminated, CancellationToken cancellationToken)
@@ -829,7 +1062,7 @@ public sealed partial class Coordinator
             }
 
             var target = AppSettings.ServerNetworksTarget(profile);
-            foreach (var suffix in GatewayDnsNames(tunnel.Session!).Where(s => routes.TrueForAll(r =>
+            foreach (var suffix in GatewayDnsNames(tunnel.Session!, profile.AnyConnect.ApplyServerProxy).Where(s => routes.TrueForAll(r =>
                 !string.Equals(r.Suffix, s, StringComparison.OrdinalIgnoreCase)
                 && (!r.PinAddresses || r.ExactName || !s.EndsWith("." + r.Suffix, StringComparison.OrdinalIgnoreCase)))))
             {
@@ -839,14 +1072,19 @@ public sealed partial class Coordinator
         }
     }
 
-    /// <summary>Имена, которые разрешает DNS шлюза: суффиксы split DNS (или домен по умолчанию) и хост PAC.</summary>
-    private static List<string> GatewayDnsNames(SessionInfo session)
+    /// <summary>
+    /// Имена, которые разрешает DNS шлюза: суффиксы split DNS (или домен по умолчанию) и хост PAC. Хост PAC — только
+    /// когда прокси шлюза применяется (<paramref name="includePac"/>) и только годное имя: иначе шлюз, назвав PAC на
+    /// публичной зоне или на чужом имени, увёл бы его разрешение к своему DNS.
+    /// </summary>
+    internal static List<string> GatewayDnsNames(SessionInfo session, bool includePac)
     {
         // Однословные суффиксы («local») не берём: они совпали бы с mDNS и именами локальной сети.
         var names = session.DnsSuffixes().Select(SettingsSerializer.NormalizeSuffix).Where(IsGatewayDnsName);
-        if (Uri.TryCreate(session.ProxyPac, UriKind.Absolute, out var pac) && pac.HostNameType == UriHostNameType.Dns)
+        if (includePac && Uri.TryCreate(session.ProxyPac, UriKind.Absolute, out var pac) && pac.HostNameType == UriHostNameType.Dns
+            && SettingsSerializer.NormalizeSuffix(pac.IdnHost) is { } pacHost && IsGatewayDnsName(pacHost))
         {
-            names = names.Append(pac.IdnHost.ToLowerInvariant());
+            names = names.Append(pacHost);
         }
 
         return names.Distinct(StringComparer.Ordinal).ToList();

@@ -9,7 +9,11 @@ namespace SplitVpn.OpenConnect;
 /// <summary>Куда помощник отправляет события для службы.</summary>
 internal interface IHelperOutput
 {
-    void Send(HelperEvent helperEvent);
+    /// <summary>
+    /// Отправляет событие; false — не доставлено (канал закрыт или событие больше кадра канала). Кому важна
+    /// доставка (параметры сеанса), тот проверяет результат: служба без них считала бы сеанс прежним.
+    /// </summary>
+    bool Send(HelperEvent helperEvent);
 }
 
 /// <summary>Системные действия помощника, которые в тестах подменяются.</summary>
@@ -88,6 +92,9 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
     /// <summary>Туннель поднят (службе отправлено Established): дальнейшие сбои с сертификатом клиента не связаны.</summary>
     private bool _established;
     private bool _signInCancelled;
+
+    /// <summary>Шлюз прислал адрес SSO длиннее <see cref="HelperLimits.MaxSsoUri"/>: причина завершения входа.</summary>
+    private string? _ssoRejected;
     private volatile bool _commandPipeReady;
 
     public OcSession(IOcLib lib, IHelperOutput output, IHelperSystem system)
@@ -270,7 +277,14 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
         ulong luid;
         try
         {
-            session = _lib.ReadSession();
+            session = ReadSession();
+            if (session.TunnelAddressProblem() is { } problem)
+            {
+                // Адрес из служебного диапазона не назначается адаптеру вовсе: /32 с Preferred перехватил бы его у всей машины.
+                CloseGatewaySession();
+                return (TerminationKind.Internal, char.ToUpperInvariant(problem[0]) + problem[1..] + ".");
+            }
+
             luid = _system.ConfigureInterface(start.InterfaceName, session);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -280,8 +294,26 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
         }
 
         _established = true;
-        _output.Send(new EstablishedEvent(luid, start.InterfaceName, session));
+        if (!_output.Send(new EstablishedEvent(luid, start.InterfaceName, session)))
+        {
+            // Служба не узнала о сеансе (канал закрыт или событие не влезло в кадр): держать его на шлюзе незачем.
+            CloseGatewaySession();
+            return (TerminationKind.Internal, "Параметры сеанса не переданы службе.");
+        }
+
         return RunMainloop();
+    }
+
+    /// <summary>Параметры сеанса в пределах <see cref="HelperLimits"/>; что урезано — в журнал.</summary>
+    private SessionInfo ReadSession()
+    {
+        var session = _lib.ReadSession().Capped();
+        foreach (var item in session.Truncated)
+        {
+            Log(OcCodes.PrgInfo, "Шлюз прислал слишком много данных сеанса, лишнее отброшено: " + item + ".");
+        }
+
+        return session;
     }
 
     /// <summary>
@@ -353,6 +385,11 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
 
     private (TerminationKind, string) ClassifyAuthFailure(int code)
     {
+        if (_ssoRejected is { } rejected)
+        {
+            return (TerminationKind.Internal, rejected);
+        }
+
         if (_signInCancelled)
         {
             return (TerminationKind.Cancelled, "Вход отменён пользователем или истекло время входа.");
@@ -427,6 +464,14 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
     public int OpenWebview(string uri)
     {
         _browserLoginStarted = true;
+        if (uri.Length > HelperLimits.MaxSsoUri)
+        {
+            // Обрезанный адрес вход не откроет, а целиком он раздул бы каждый ответ службы о состоянии.
+            _ssoRejected = string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"Шлюз прислал слишком длинный адрес страницы входа ({uri.Length} символов при пределе {HelperLimits.MaxSsoUri}).");
+            return -OcCodes.Einval;
+        }
+
         var requestId = Guid.NewGuid();
         // После перенаправления на другой узел кластера cookie SSO принадлежат новому узлу, а не узлу из профиля.
         _output.Send(new SsoOpenEvent(requestId, uri, CurrentGatewayHost()));
@@ -544,20 +589,35 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
         // Шлюз мог выдать другой адрес или MTU: адаптер настраивается заново, иначе он остался бы с прежними.
         try
         {
-            session = _lib.ReadSession();
+            session = ReadSession();
+            if (session.TunnelAddressProblem() is { } problem)
+            {
+                throw new InvalidOperationException(problem);
+            }
+
             _system.ConfigureInterface(_start!.InterfaceName, session);
         }
         catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
         {
             // Адаптер остался с прежним адресом: сообщить службе «сеанс жив, адрес новый» нельзя - она сочла бы
             // туннель рабочим. Сеанс завершается как обрыв связи, и служба поднимает его заново.
-            Log(OcCodes.PrgErr, "Не удалось перенастроить адаптер после переподключения: " + ex.Message);
-            _interfaceFailure = "Не удалось перенастроить адаптер после переподключения: " + ex.Message;
-            _lib.SendCommand(Native.OcNative.CmdCancel);
+            FailInterface("Не удалось перенастроить адаптер после переподключения: " + ex.Message);
             return;
         }
 
-        _output.Send(new IpInfoChangedEvent(session));
+        if (!_output.Send(new IpInfoChangedEvent(session)))
+        {
+            // Служба осталась бы с прежними параметрами (сети, DNS, адрес), а адаптер уже с новыми.
+            FailInterface("Новые параметры сеанса после переподключения не переданы службе.");
+        }
+    }
+
+    /// <summary>Адаптер и служба разошлись с сеансом: mainloop отменяется (с BYE), итог - обрыв связи.</summary>
+    private void FailInterface(string reason)
+    {
+        Log(OcCodes.PrgErr, reason);
+        _interfaceFailure = reason;
+        _lib.SendCommand(Native.OcNative.CmdCancel);
     }
 
     public void Stats(ulong bytesSent, ulong bytesReceived) => _output.Send(new StatsEvent(bytesSent, bytesReceived, _lib.DtlsActive));
@@ -662,7 +722,8 @@ internal sealed partial class OcSession : IOcCallbacks, IDisposable
             OcFieldKind.Select => AuthFieldKind.Select,
             _ => AuthFieldKind.Text,
         }, f.Choices, DefaultValue(form, f))).ToList();
-        _output.Send(new AuthFormEvent(requestId, form.Banner, form.Message, form.Error, fields));
+        // Тексты и поля шлюза - в пределах HelperLimits: служба показывает форму в каждом ответе о состоянии.
+        _output.Send(new AuthFormEvent(requestId, form.Banner, form.Message, form.Error, fields).Capped());
 
         var deadline = Stopwatch.GetTimestamp() + (long)(SignInTimeout.TotalSeconds * Stopwatch.Frequency);
         while (Wait(deadline) is { } command)

@@ -34,12 +34,16 @@ internal sealed class WindowsHelperSystem : IHelperSystem
 
     public ulong ConfigureInterface(string interfaceName, SessionInfo session)
     {
+        // Сеанс проверяет адрес раньше; проверка здесь - последний рубеж перед назначением /32 с принудительным Preferred.
+        if (session.TunnelAddressProblem() is { } problem)
+        {
+            throw new InvalidOperationException(problem);
+        }
+
+        var address = Ipv4.Parse(session.Address);
+
         var luid = TunnelInterfaceConfig.FindLuid(interfaceName)
             ?? throw new InvalidOperationException($"Адаптер «{interfaceName}» не найден после создания.");
-        if (!Ipv4.TryParse(session.Address, out var address))
-        {
-            throw new InvalidOperationException("Шлюз не выдал IPv4-адрес туннеля.");
-        }
 
         TunnelInterfaceConfig.Configure(luid, address, session.Mtu);
         return luid;
