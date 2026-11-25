@@ -277,9 +277,11 @@ public sealed partial class Coordinator
     /// <summary>
     /// Запуск помощника сорвался не по вине настроек (файл паролей занят, хранилище недоступно). Вход, одобренный
     /// пользователем (<see cref="CoordinatorFacts.SignInApproved"/>), не снимается: следующая сверка попробует снова.
+    /// Попытка завершилась, не начавшись: при подъёме по очереди следующие туннели её не ждут (как и у SSH и RAS).
     /// </summary>
     private void ReportAnyConnectStartFailure(TunnelFacts tunnel, string text)
     {
+        tunnel.DialSettled = true;
         tunnel.LastErrorCategory = ErrorCategory.Other;
         tunnel.LastErrorCode = null;
         if (tunnel.LastErrorText != text)
@@ -427,6 +429,13 @@ public sealed partial class Coordinator
         var isLiteral = Ipv4.TryParse(host, out var literal);
         var isGateway = string.Equals(host, gatewayHost, StringComparison.OrdinalIgnoreCase)
             || (isLiteral && tunnel.ServerAddresses.Contains(literal));
+        if (!isGateway && !isLiteral)
+        {
+            // Имя узла попадает в журнал и тогда, когда узел отклонён (предел узлов или портов): маскированный отчёт
+            // должен скрыть его до первой записи.
+            RememberGatewayNodeHost(host);
+        }
+
         if (!isGateway && !link.NodeHosts.Contains(host))
         {
             if (link.NodeHosts.Count >= MaxGatewayNodes)

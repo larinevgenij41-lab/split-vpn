@@ -1084,8 +1084,10 @@ public sealed class DnsProxyServer : IAsyncDisposable
         if (response is null)
         {
             Interlocked.Increment(ref _failures);
-            // Путь не ответил: просроченный ответ того же пути лучше отказа, но не старше предельного
-            // возраста. Ответ чужого пути здесь не годится — он может быть про другую сеть.
+            // Путь не ответил (молчание, SERVFAIL): просроченный ответ того же пути лучше отказа, но не старше
+            // предельного возраста. Ответ чужого пути здесь не годится — он может быть про другую сеть. REFUSED
+            // от всех серверов пути сюда не попадает: это окончательный ответ (DnsForwarder.ForwardAsync), и
+            // просроченный адрес не обходит свежую блокировку корпоративного DNS или фильтра.
             var stale = _cache.TryGet(question, context, id, offline: true, flags);
             trace?.Outcome = stale is null ? "серверы не ответили" : "серверы не ответили, просроченный кеш";
             return stale is null ? DnsMessage.BuildServerFailure(query)

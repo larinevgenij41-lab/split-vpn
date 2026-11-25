@@ -312,6 +312,12 @@ internal sealed class FakeInventory : INetInventory
     /// <summary>Метрика маршрута по умолчанию Radmin: меньше, чем у Wi-Fi, — Windows выберет его.</summary>
     public uint RadminDefaultRouteMetric { get; set; } = 9257;
 
+    /// <summary>DNS адаптера Radmin; пусто — адаптер без DNS, служба его DNS не трогает.</summary>
+    public IReadOnlyList<uint> RadminDnsServers { get; set; } = [];
+
+    /// <summary>GUID адаптера Radmin; null — новый в каждом снимке.</summary>
+    public Guid? RadminGuid { get; set; }
+
     private NetSnapshot BuildSnapshot()
     {
         var adapters = new List<AdapterCandidate>
@@ -324,9 +330,10 @@ internal sealed class FakeInventory : INetInventory
             },
             new()
             {
-                InterfaceGuid = Guid.NewGuid(), Luid = FakeWorld.RadminLuid, InterfaceIndex = 19, Name = "Radmin VPN", IfType = 6,
+                InterfaceGuid = RadminGuid ?? Guid.NewGuid(), Luid = FakeWorld.RadminLuid, InterfaceIndex = 19, Name = "Radmin VPN", IfType = 6,
                 Description = RadminDescription, IsUp = true, DefaultGateway = RadminHasAddress ? Ipv4.Parse("26.0.0.1") : null, DefaultRouteMetric = RadminDefaultRouteMetric,
                 OnLinkPrefixes = RadminHasAddress ? [Ipv4Cidr.Parse("26.0.0.0/8")] : [], Addresses = RadminHasAddress ? [Ipv4.Parse("26.185.67.105")] : [],
+                DnsServers = RadminDnsServers,
             },
         };
         List<int> hidden;
@@ -519,19 +526,22 @@ internal sealed class FakeDns : IDnsOps
     /// <summary>Адаптеры, на которых подмена DNS на loopback падает (нет прав, адаптер пропал).</summary>
     public HashSet<Guid> FailLoopback { get; } = [];
 
+    /// <summary>Адаптеры, у которых чтение IPv6-настроек DNS временно не удаётся (как RPC 1722): IPv6-часть копии неизвестна.</summary>
+    public HashSet<Guid> Ipv6ReadFails { get; } = [];
+
     /// <summary>Как InterfaceDnsOps.Capture: loopback считается нашим, только если по интерфейсу уже есть копия.</summary>
-    public InterfaceDnsBackup Capture(Guid interfaceGuid, InterfaceDnsBackup? previous)
-    {
-        var v6 = NameServersV6.GetValueOrDefault(interfaceGuid, "");
-        return new InterfaceDnsBackup(interfaceGuid, InterfaceDnsOps.Original(ReadNameServer(interfaceGuid), previous?.NameServerV4),
-            InterfaceDnsOps.Original(v6, previous?.NameServerV6), "", 0, DateTimeOffset.UnixEpoch, ReadSearchList(interfaceGuid));
-    }
+    public InterfaceDnsBackup Capture(Guid interfaceGuid, InterfaceDnsBackup? previous) =>
+        InterfaceDnsOps.Capture(interfaceGuid, previous, DateTimeOffset.UnixEpoch, ownsIpv6Loopback: false, (guid, ipv6) => ipv6
+            ? Ipv6ReadFails.Contains(guid)
+                ? throw new NativeCallException("GetInterfaceDnsSettings", 1722)
+                : new InterfaceDnsState(NameServersV6.GetValueOrDefault(guid, ""), "", 0)
+            : new InterfaceDnsState(ReadNameServer(guid), "", 0, ReadSearchList(guid))) with { AppliedSearchList = null };
 
     /// <summary>
     /// Как InterfaceDnsOps.ApplyLoopback: ::1 — только при занятом [::1]:53, иначе снимается лишь наш прежний ::1
-    /// (исходный IPv6-список известен и сам не loopback) — он возвращается к исходному.
+    /// (исходный IPv6-список известен и сам не loopback) — он возвращается к исходному. Исходный IPv6 неизвестен — IPv6 не трогается.
     /// </summary>
-    public void ApplyLoopback(Guid interfaceGuid, string? originalV6 = null, string? nameServerV4 = null)
+    public void ApplyLoopback(Guid interfaceGuid, string? originalV6 = null, string? nameServerV4 = null, bool ipv6Known = true)
     {
         if (FailLoopback.Contains(interfaceGuid))
         {
@@ -540,6 +550,11 @@ internal sealed class FakeDns : IDnsOps
 
         LoopbackApplies++;
         NameServers[interfaceGuid] = nameServerV4 ?? "127.0.0.1";
+        if (!ipv6Known)
+        {
+            return;
+        }
+
         if (Ipv6Loopback)
         {
             NameServersV6[interfaceGuid] = "::1";
@@ -579,7 +594,8 @@ internal sealed class FakeDns : IDnsOps
         }
 
         var v4 = InterfaceDnsOps.IsProxySet(ReadNameServer(interfaceGuid));
-        var v6 = InterfaceDnsOps.IsLoopback(NameServersV6.GetValueOrDefault(interfaceGuid, ""));
+        // Как InterfaceDnsOps.Restore: исходный IPv6 неизвестен — IPv6 не трогается.
+        var v6 = backup?.Ipv6Unknown != true && InterfaceDnsOps.IsLoopback(NameServersV6.GetValueOrDefault(interfaceGuid, ""));
         if (!v4 && !v6)
         {
             return DnsRestoreOutcome.ChangedByUser;

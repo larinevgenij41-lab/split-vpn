@@ -29,7 +29,7 @@ public static class SettingsSerializer
     public static string Serialize(AppSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
-        if (settings.Profiles?.Any(UnknownSettingValues.HasPreservedValues) != true)
+        if (!UnknownSettingValues.HasServiceSections(settings))
         {
             return JsonSerializer.Serialize(settings, JsonDefaults.Options);
         }

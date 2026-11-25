@@ -151,6 +151,7 @@ public sealed partial class Coordinator
         // которым RAS не нужен (AnyConnect, SSH): иначе после смены сети защита не перестраивалась бы под новый
         // адаптер и весь трафик стоял бы заблокированным. Ошибка запоминается и уходит наружу в конце сверки.
         _rasConnectionsUnknown = false;
+        _rasLeftoverNotHungUp.Clear();
         SetProgress("Подготовка подключений", 5);
         var rasFailure = await SyncTunnelsAsync(cancellationToken);
         timing.Mark("туннели");
@@ -251,6 +252,12 @@ public sealed partial class Coordinator
     /// RAS-туннели без известного соединения не дозваниваются до следующей сверки.
     /// </summary>
     private bool _rasConnectionsUnknown;
+
+    /// <summary>
+    /// Туннели, чей сеанс с прежними параметрами входа на этом проходе не разорван: запись ещё занята, и дозвон
+    /// именно этого туннеля ждёт следующей сверки. Остальные RAS-туннели (свои соединения перечислены) поднимаются.
+    /// </summary>
+    private readonly HashSet<Guid> _rasLeftoverNotHungUp = [];
 
     /// <summary>
     /// Свои RAS-соединения, о которых служба не знает: дозвон закончился после «Отключить, сохранить защиту», а его
@@ -1600,16 +1607,25 @@ public sealed partial class Coordinator
         // занял порт на нём эксклюзивно, иначе этот порт мог бы держать чужой процесс (аудит 24.11.2026). Неудачный
         // захват повторяется на каждой сверке (не реже раза в минуту), и при успехе список DNS адаптера обновляется.
         var claimed = _deps.DnsProxy.ClaimAdapterAddresses([.. adapters.Where(IsPrimaryAdapter).Select(a => a.Addresses[0])]).ToHashSet();
+        // Занятые адреса, которые ещё нельзя отпускать: нужные сейчас и те, что могли остаться DNS-сервером на адаптере,
+        // где запись DNS не удалась. null - список такого адаптера не прочитан, и не отпускается ничего.
+        HashSet<uint>? keep = [.. claimed];
         foreach (var adapter in adapters)
         {
+            var dnsWritten = false;
             try
             {
                 EnsureAdapterLoopback(adapter.InterfaceGuid, ProxyNameServersFor(adapter, claimed));
+                dnsWritten = true;
                 suffixChanged |= EnsureSearchList(adapter.InterfaceGuid);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 failure ??= ExceptionDispatchInfo.Capture(ex);
+                if (!dnsWritten && keep is not null && !KeepListedAddresses(adapter.InterfaceGuid, keep))
+                {
+                    keep = null;
+                }
             }
         }
 
@@ -1635,14 +1651,34 @@ public sealed partial class Coordinator
 
         SetProxyConfiguration(BuildProxyConfiguration(), suffixChanged);
 
-        // Ушедшие адреса (адаптер перестал быть основным, адрес сменился) освобождаются только после того, как DNS
-        // всех адаптеров записан: при сбое записи прежний адрес ещё может стоять DNS-сервером и остаётся занятым.
-        if (failure is null)
+        // Ушедшие адреса (адаптер перестал быть основным, адрес сменился) освобождаются только после записи DNS
+        // адаптеров. Адрес, который после сбоя записи ещё стоит DNS-сервером на сбойном адаптере, остаётся занятым;
+        // сбой на постороннем адаптере (или туннеле, которому свой адрес не ставится) прочие адреса не держит - иначе
+        // прежний адрес был бы занят бессрочно, пока тот адаптер сбоит.
+        if (keep is not null)
         {
-            _deps.DnsProxy.ReleaseAdapterAddresses(claimed);
+            _deps.DnsProxy.ReleaseAdapterAddresses(keep);
         }
 
         failure?.Throw();
+    }
+
+    /// <summary>
+    /// Запись DNS адаптера не удалась: адреса из его текущего IPv4-списка DNS добавляются к удерживаемым. false - список
+    /// не прочитан, и что на адаптере осталось, неизвестно.
+    /// </summary>
+    private bool KeepListedAddresses(Guid interfaceGuid, HashSet<uint> keep)
+    {
+        try
+        {
+            keep.UnionWith(ParseAddresses(_deps.Dns.ReadNameServer(interfaceGuid)));
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _deps.Logger.LogDebug(ex, "DNS адаптера {Interface} не прочитан после сбоя записи: занятые адреса не освобождаются", interfaceGuid);
+            return false;
+        }
     }
 
     private void EnsureProxyRunning()
@@ -1686,11 +1722,17 @@ public sealed partial class Coordinator
             // быть основным), а ::1 мог не встать, если слушатель на [::1]:53 появился позже, или
             // остаться от прежнего запуска, если слушателя больше нет: наш ::1 от пользовательского отличает
             // исходный IPv6-список из копии. Без копии это собственный резолвер пользователя: адаптер не трогаем.
-            if (_deps.DnsBackups.Load().GetValueOrDefault(interfaceGuid) is { } backup
-                && (!InterfaceDnsOps.SameServers(current, nameServerV4) || !_deps.Dns.Ipv6LoopbackMatches(interfaceGuid, backup.NameServerV6)))
+            if (_deps.DnsBackups.Load().GetValueOrDefault(interfaceGuid) is { } stored)
             {
-                _wifiRecorder?.Note($"Служба: DNS адаптера {interfaceGuid} - было «{current}», ставится «{nameServerV4}»");
-                _deps.Dns.ApplyLoopback(interfaceGuid, backup.NameServerV6, nameServerV4);
+                var backup = CompleteIpv6Backup(interfaceGuid, stored);
+                var originalV6 = InterfaceDnsOps.KnownOriginalV6(backup);
+                // Исходный IPv6 неизвестен — IPv6 не сверяется: ::1 тогда не ставится (вернуть исходный было бы нечем).
+                if (!InterfaceDnsOps.SameServers(current, nameServerV4)
+                    || (originalV6 is not null && !_deps.Dns.Ipv6LoopbackMatches(interfaceGuid, originalV6)))
+                {
+                    _wifiRecorder?.Note($"Служба: DNS адаптера {interfaceGuid} - было «{current}», ставится «{nameServerV4}»");
+                    _deps.Dns.ApplyLoopback(interfaceGuid, originalV6, nameServerV4, ipv6Known: originalV6 is not null);
+                }
             }
 
             return;
@@ -1701,6 +1743,7 @@ public sealed partial class Coordinator
         {
             // Исходный DNS уже сохранён: внешнее изменение — дрейф, а не новый исходный DNS.
             Journal("Предупреждение", "DNS адаптера изменён извне: возвращён локальный посредник.");
+            existing = CompleteIpv6Backup(interfaceGuid, existing);
         }
         else
         {
@@ -1709,7 +1752,30 @@ public sealed partial class Coordinator
         }
 
         _wifiRecorder?.Note($"Служба: DNS адаптера {interfaceGuid} - было «{current}», ставится «{nameServerV4}»");
-        _deps.Dns.ApplyLoopback(interfaceGuid, existing.NameServerV6, nameServerV4);
+        var known = InterfaceDnsOps.KnownOriginalV6(existing);
+        _deps.Dns.ApplyLoopback(interfaceGuid, known, nameServerV4, ipv6Known: known is not null);
+    }
+
+    /// <summary>
+    /// IPv6-часть копии неизвестна (при снимке чтение временно не удалось): чтение повторяется на каждой сверке,
+    /// и при успехе копия дополняется исходным IPv6-списком. IPv4-часть копии не меняется.
+    /// </summary>
+    private InterfaceDnsBackup CompleteIpv6Backup(Guid interfaceGuid, InterfaceDnsBackup backup)
+    {
+        if (!backup.Ipv6Unknown)
+        {
+            return backup;
+        }
+
+        var fresh = _deps.Dns.Capture(interfaceGuid, backup);
+        if (fresh.Ipv6Unknown)
+        {
+            return backup;
+        }
+
+        var completed = backup with { NameServerV6 = fresh.NameServerV6, Ipv6Unknown = false };
+        _deps.DnsBackups.Upsert(completed);
+        return completed;
     }
 
     /// <summary>
@@ -2180,7 +2246,8 @@ public sealed partial class Coordinator
     /// Подхват соединений своей телефонной книги по именам записей. Соединение, поднятое с другими
     /// параметрами безопасности, чем в профиле сейчас, не подхватывается: оно разрывается, чтобы
     /// следующий дозвон прошёл по актуальным настройкам. Возвращает сбой (перечисления или разрыва), который
-    /// сверка сообщит в конце; при сбое RAS-туннели на этом проходе не дозваниваются (<see cref="_rasConnectionsUnknown"/>).
+    /// сверка сообщит в конце. При сбое перечисления RAS-туннели на этом проходе не дозваниваются
+    /// (<see cref="_rasConnectionsUnknown"/>), при сбое разрыва - только туннель этой записи (<see cref="_rasLeftoverNotHungUp"/>).
     /// </summary>
     private async Task<ExceptionDispatchInfo?> AdoptConnectionsAsync(CancellationToken cancellationToken)
     {
@@ -2230,8 +2297,9 @@ public sealed partial class Coordinator
                 }
                 catch (Exception ex) when (ex is NativeCallException or InvalidOperationException or IOException or TimeoutException)
                 {
-                    // Сеанс со старыми параметрами ещё держит запись: дозвон поверх него не начинается.
-                    _rasConnectionsUnknown = true;
+                    // Сеанс со старыми параметрами ещё держит запись: дозвон поверх него не начинается. Остальные записи
+                    // перечислены и известны - их туннели этот сбой не держит.
+                    _rasLeftoverNotHungUp.Add(tunnel.ProfileId);
                     failure ??= ExceptionDispatchInfo.Capture(ex);
                     _deps.Logger.LogWarning(ex, "Соединение {Name} с другими параметрами входа не разорвано: повтор на следующей сверке", tunnel.Name);
                 }
@@ -2317,6 +2385,10 @@ public sealed partial class Coordinator
     {
         var now = _deps.Time.GetUtcNow();
         var stable = tunnel.WasStableSession(now);
+        // Сеанс уже решено было разорвать (HangUpPending): неудача засчитана, пауза до дозвона назначена. Его падение
+        // само по себе - тот же разрыв, а не новая неудача: срок сохраняется, и пауза не растёт на лишний шаг.
+        var deferred = tunnel.HangUpPending;
+        var scheduled = tunnel.NextDialAt;
         tunnel.ResetConnection(now);
         if (unclean)
         {
@@ -2324,8 +2396,18 @@ public sealed partial class Coordinator
             // Чистый разрыв прежнюю отметку не снимает: сервер может ещё держать сеанс, оборванный до него.
             tunnel.UncleanDropUtc = now;
         }
-        var next = stable ? "" : string.Create(CultureInfo.InvariantCulture,
-            $" Следующая попытка через {ScheduleRetry(tunnel, now).TotalSeconds:F0} с.");
+        string next;
+        if (deferred)
+        {
+            tunnel.NextDialAt = scheduled;
+            var wait = scheduled > now ? scheduled - now : TimeSpan.Zero;
+            next = string.Create(CultureInfo.InvariantCulture, $" Следующая попытка через {wait.TotalSeconds:F0} с.");
+        }
+        else
+        {
+            next = stable ? "" : string.Create(CultureInfo.InvariantCulture,
+                $" Следующая попытка через {ScheduleRetry(tunnel, now).TotalSeconds:F0} с.");
+        }
         Journal("Ошибка", $"Обрыв «{tunnel.Name}»: {reason}. Оставшиеся пути определяются действующими правилами.{next}");
     }
 

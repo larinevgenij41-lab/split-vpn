@@ -25,10 +25,40 @@ function Get-WritableTreeGrants([string]$path) {
     }
 }
 
-try { $writableGrants = @(Get-WritableTreeGrants $root) }
-catch { $writableGrants = @(); Write-Warning "Не удалось проверить разрешения ${root}: $($_.Exception.Message)" }
+# Каталоги и файлы git (hooks, config, core.hooksPath): в git worktree общий каталог git лежит вне дерева.
+# Копия функции из publish-release.ps1.
+function Get-GitControlPaths([string]$path) {
+    $ErrorActionPreference = 'Continue'
+    $found = [Collections.Generic.List[string]]::new()
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return @() }
+    function Resolve-GitPath([string]$value) {
+        $value = $value.Trim()
+        if (-not [IO.Path]::IsPathRooted($value)) { $value = Join-Path $path $value }
+        return [IO.Path]::GetFullPath($value)
+    }
+    foreach ($option in '--git-common-dir', '--git-dir') {
+        $dir = @(& git -C $path rev-parse $option 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $dir.Count -and $dir[0]) {
+            $full = Resolve-GitPath $dir[0]
+            $found.Add($full)
+            foreach ($inner in 'hooks', 'config', 'config.worktree') { $found.Add((Join-Path $full $inner)) }
+        }
+    }
+    $hooks = @(& git -C $path config --get core.hooksPath 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $hooks.Count -and $hooks[0]) {
+        $value = [Environment]::ExpandEnvironmentVariables($hooks[0].Trim())
+        if ($value.StartsWith('~')) { $value = Join-Path $HOME $value.Substring(1).TrimStart('/', '\') }
+        $found.Add((Resolve-GitPath $value))
+    }
+    return @($found | Where-Object { Test-Path -LiteralPath $_ } | Sort-Object -Unique)
+}
+
+$writableGrants = @(foreach ($checked in @(@($root) + @(Get-GitControlPaths $root) | Select-Object -Unique)) {
+    try { Get-WritableTreeGrants $checked | ForEach-Object { "${checked}: $_" } }
+    catch { Write-Warning "Не удалось проверить разрешения ${checked}: $($_.Exception.Message)" }
+})
 if ($writableGrants.Count) {
-    Write-Warning "Корень репозитория $root доступен на запись обычным пользователям — собранный MSI может содержать подменённый ими код:`n  $($writableGrants -join "`n  ")`nКак закрыть доступ — см. scripts\publish-release.ps1 (проверка ACL) или docs\RELEASE.md."
+    Write-Warning "Корень репозитория $root или его каталог git доступны на запись обычным пользователям — собранный MSI может содержать подменённый ими код (в git worktree каталог git лежит в основной копии):`n  $($writableGrants -join "`n  ")`nКак закрыть доступ — см. scripts\publish-release.ps1 (проверка ACL) или docs\RELEASE.md."
 }
 
 $publish =Join-Path $root 'artifacts\publish\install'

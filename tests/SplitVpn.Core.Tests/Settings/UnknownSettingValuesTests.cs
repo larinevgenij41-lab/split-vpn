@@ -189,6 +189,185 @@ public sealed class UnknownSettingValuesTests
         Assert.True(SettingsValidator.Validate(settings).IsValid, string.Join(" ", SettingsValidator.Validate(settings).Errors));
     }
 
+    private static JsonElement Element(string json) => JsonDocument.Parse(json).RootElement.Clone();
+
+    private static AppSettings IpcRoundTrip(AppSettings settings) =>
+        JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(settings, JsonDefaults.Compact), JsonDefaults.Compact)!;
+
+    /// <summary>Клиент подложил раздел в обычное подключение: раздел снят, подключение проверено полностью, в файле — роль «Выключено».</summary>
+    [Fact]
+    public void ForgedSection_FromClient_IsDropped_AndProfileIsFullyValidated()
+    {
+        var plain = new ConnectionProfile { Id = Office, Name = "Офис", Server = "vpn.example.org", UserName = "user" };
+        var current = new AppSettings { Profiles = [plain] };
+        var forged = plain with
+        {
+            Server = "",
+            Extra = new Dictionary<string, JsonElement> { [UnknownSettingValues.PreservedKey] = Element("""{"role":"Primary","authMethod":"Pap"}""") },
+        };
+        var incoming = IpcRoundTrip(current with { Profiles = [forged] });
+        Assert.True(UnknownSettingValues.HasPreservedValues(incoming.Profiles[0]));
+
+        var trusted = UnknownSettingValues.KeepOnlyTrusted(incoming, current);
+
+        Assert.False(UnknownSettingValues.HasPreservedValues(trusted.Profiles[0]));
+        // Полная проверка: пустой адрес сервера теперь замечен.
+        Assert.Contains(SettingsValidator.Validate(trusted).Errors, e => e.Contains("адрес сервера", StringComparison.Ordinal));
+        var fixedServer = trusted with { Profiles = [trusted.Profiles[0] with { Server = "vpn.example.org" }] };
+        var reread = SettingsSerializer.Deserialize(SettingsSerializer.Serialize(fixedServer)).Settings!;
+        Assert.Equal(ProfileRole.Off, reread.Profiles[0].Role);
+        Assert.Equal(AuthMethod.MsChapV2, reread.Profiles[0].AuthMethod);
+    }
+
+    /// <summary>Раздел в другом регистре имени тоже снимается и в файл не попадает.</summary>
+    [Fact]
+    public void ForgedSection_WithOtherCase_IsDropped()
+    {
+        var plain = new ConnectionProfile { Id = Office, Name = "Офис", Server = "vpn.example.org", UserName = "user" };
+        var forged = plain with { Extra = new Dictionary<string, JsonElement> { ["PreservedUnknownValues"] = Element("""{"role":"Primary"}""") } };
+
+        var trusted = UnknownSettingValues.KeepOnlyTrusted(new AppSettings { Profiles = [forged] }, new AppSettings { Profiles = [plain] });
+
+        Assert.Null(trusted.Profiles[0].Extra);
+        Assert.DoesNotContain("preservedunknownvalues", SettingsSerializer.Serialize(trusted), StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Подмена способа входа в настоящем разделе: раздел не совпал со своим — снят, PAP в файл не уходит.</summary>
+    [Fact]
+    public void TamperedSection_IsDropped_AndForgedValueIsNotWritten()
+    {
+        var current = SettingsSerializer.Deserialize(TwoProfiles()).Settings!;
+        var received = IpcRoundTrip(current);
+        var tampered = received.Profiles[0] with
+        {
+            Extra = new Dictionary<string, JsonElement> { [UnknownSettingValues.PreservedKey] = Element("""{"protocol":"WireGuard","role":"Primary","authMethod":"Pap"}""") },
+        };
+
+        var trusted = UnknownSettingValues.KeepOnlyTrusted(received with { Profiles = [tampered, received.Profiles[1]] }, current);
+
+        Assert.False(UnknownSettingValues.HasPreservedValues(trusted.Profiles[0]));
+        var written = SettingsSerializer.Serialize(trusted);
+        Assert.DoesNotContain("Pap", written, StringComparison.Ordinal);
+        Assert.Equal("Off", JsonNode.Parse(written)!["profiles"]![0]!["role"]!.GetValue<string>());
+    }
+
+    /// <summary>Раздел другого подключения (перенос по идентификатору) не принимается.</summary>
+    [Fact]
+    public void SectionMovedToAnotherProfile_IsDropped()
+    {
+        var current = SettingsSerializer.Deserialize(TwoProfiles()).Settings!;
+        var received = IpcRoundTrip(current);
+        var moved = received.Profiles[1] with { Extra = received.Profiles[0].Extra };
+
+        var trusted = UnknownSettingValues.KeepOnlyTrusted(received with { Profiles = [received.Profiles[0], moved] }, current);
+
+        Assert.True(UnknownSettingValues.HasPreservedValues(trusted.Profiles[0]));
+        Assert.False(UnknownSettingValues.HasPreservedValues(trusted.Profiles[1]));
+    }
+
+    /// <summary>
+    /// Честный путь: файл новой версии → загрузка службой → приложение получает и возвращает настройки как есть →
+    /// запись. Разделы приняты, исходные значения, цели и группы вернулись на свои места.
+    /// </summary>
+    [Fact]
+    public void HonestRoundTrip_RestoresOriginalValuesTargetsAndGroups()
+    {
+        var json = JsonNode.Parse(TwoProfiles())!.AsObject();
+        var mixed = new Guid("cccccccc-3333-0000-0000-000000000003");
+        var only = new Guid("dddddddd-4444-0000-0000-000000000004");
+        json["groups"] = JsonNode.Parse($$"""
+            [ { "id": "{{mixed}}", "name": "Смешанная", "members": [ "{{Future}}", "{{Office}}" ] },
+              { "id": "{{only}}", "name": "Только новое", "members": [ "{{Future}}" ] } ]
+            """);
+        json["geoTarget"] = JsonNode.Parse($$"""{ "kind": "Group", "id": "{{only}}" }""");
+        var original = SettingsSerializer.Serialize(SettingsSerializer.Deserialize(json.ToJsonString()).Settings!);
+        var current = SettingsSerializer.Deserialize(json.ToJsonString()).Settings!;
+        Assert.Single(current.Groups);
+        Assert.Equal(RouteTarget.Blocked, current.GeoTarget);
+
+        var trusted = UnknownSettingValues.KeepOnlyTrusted(IpcRoundTrip(current), current);
+        var written = JsonNode.Parse(SettingsSerializer.Serialize(trusted))!.AsObject();
+
+        Assert.Equal(original, written.ToJsonString(JsonDefaults.Options));
+        Assert.False(written.ContainsKey(UnknownSettingValues.BlockedTargetsKey));
+        Assert.Equal("Primary", written["profiles"]![0]!["role"]!.GetValue<string>());
+        Assert.Equal("WireGuard", written["profiles"]![0]!["protocol"]!.GetValue<string>());
+        Assert.Equal(Future.ToString(), written["defaultTarget"]!["id"]!.GetValue<string>());
+        Assert.Equal(Future.ToString(), written["rules"]![1]!["target"]!["id"]!.GetValue<string>());
+        Assert.Equal("Group", written["geoTarget"]!["kind"]!.GetValue<string>());
+        var groups = written["groups"]!.AsArray();
+        Assert.Equal(2, groups.Count);
+        Assert.Equal(2, groups.Single(g => g!["id"]!.GetValue<string>() == mixed.ToString())!["members"]!.AsArray().Count);
+    }
+
+    /// <summary>Цель, которую пользователь сменил после загрузки, остаётся его выбором; несменённые возвращаются.</summary>
+    [Fact]
+    public void ChangedTarget_IsNotRestored()
+    {
+        var current = SettingsSerializer.Deserialize(TwoProfiles()).Settings!;
+        var edited = current with { DefaultTarget = RouteTarget.Direct };
+
+        var written = JsonNode.Parse(SettingsSerializer.Serialize(UnknownSettingValues.KeepOnlyTrusted(IpcRoundTrip(edited), current)))!;
+
+        Assert.Equal("Direct", written["defaultTarget"]!["kind"]!.GetValue<string>());
+        Assert.Equal(Future.ToString(), written["rules"]![1]!["target"]!["id"]!.GetValue<string>());
+    }
+
+    /// <summary>Подключение удалено: цели на него не возвращаются, файл не ссылается на несуществующее подключение.</summary>
+    [Fact]
+    public void DeletedProfile_TargetsAreNotRestored()
+    {
+        var current = SettingsSerializer.Deserialize(TwoProfiles()).Settings!;
+        var edited = current with { Profiles = [current.Profiles[1]] };
+
+        var written = SettingsSerializer.Serialize(UnknownSettingValues.KeepOnlyTrusted(IpcRoundTrip(edited), current));
+
+        Assert.DoesNotContain(Future.ToString(), written, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(UnknownSettingValues.BlockedTargetsKey, written, StringComparison.Ordinal);
+    }
+
+    /// <summary>Подложенный раздел целей настроек снимается: блокировка не превращается в чужую цель.</summary>
+    [Fact]
+    public void ForgedTargetsSection_IsDropped()
+    {
+        var current = SettingsSerializer.Deserialize(TwoProfiles()).Settings!;
+        var received = IpcRoundTrip(current);
+        var forged = received with
+        {
+            Rules = [.. received.Rules, new UserRuleSetting { Cidr = "10.9.0.0/16", Target = RouteTarget.Blocked }],
+            Extra = new Dictionary<string, JsonElement>
+            {
+                [UnknownSettingValues.BlockedTargetsKey] = Element($$$"""{"targets":[{"where":"rules","index":2,"key":"10.9.0.0/16","target":{"kind":"Tunnel","id":"{{{Future}}}"}}],"groups":[]}"""),
+            },
+        };
+
+        var written = JsonNode.Parse(SettingsSerializer.Serialize(UnknownSettingValues.KeepOnlyTrusted(forged, current)))!;
+
+        Assert.Equal("Block", written["rules"]![2]!["target"]!["kind"]!.GetValue<string>());
+    }
+
+    /// <summary>Restore снимает служебный раздел любого вида и не ставит на место роли объект или массив.</summary>
+    [Fact]
+    public void Restore_RemovesMalformedSection_AndSkipsNonPlainValues()
+    {
+        var root = JsonNode.Parse($$"""
+            { "profiles": [
+                { "id": "{{Future}}", "role": "Off", "preservedUnknownValues": "мусор" },
+                { "id": "{{Office}}", "role": "Off", "authMethod": "MsChapV2",
+                  "preservedUnknownValues": { "role": { "nested": 1 }, "authMethod": [1, 2], "protocol": "Wire Guard", "primaryAdapter": 7 } }
+              ], "preservedBlockedTargets": 5 }
+            """)!.AsObject();
+
+        UnknownSettingValues.Restore(root);
+
+        Assert.DoesNotContain("preserved", root.ToJsonString(), StringComparison.OrdinalIgnoreCase);
+        var office = root["profiles"]![1]!;
+        Assert.Equal("Off", office["role"]!.GetValue<string>());
+        Assert.Equal("MsChapV2", office["authMethod"]!.GetValue<string>());
+        Assert.Null(office["protocol"]);
+        Assert.Equal(7, office["primaryAdapter"]!.GetValue<int>());
+    }
+
     [Fact]
     public void UnknownTargetNumber_IsBlockedOnLoadRepair()
     {

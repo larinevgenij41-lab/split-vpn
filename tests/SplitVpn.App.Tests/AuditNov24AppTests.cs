@@ -81,8 +81,12 @@ public sealed class AuditNov24AppTests
         }
     }
 
+    /// <summary>
+    /// Обе блокировки; мьютекс занят посторонним — под одной файловой. Файловую держит живая копия того же
+    /// пользователя — «занято»: действие не выполняется (прежде оно шло без блокировки параллельно с ней).
+    /// </summary>
     [Fact]
-    public void GateTakesBothLocks_FallsBackToFileLockAndThenRunsWithout()
+    public void GateTakesBothLocks_FallsBackToFileLock_AndReportsBusyFile()
     {
         var directory = Path.Combine(Path.GetTempPath(), "splitvpn-test-" + Guid.NewGuid().ToString("N"));
         var mutexName = @"Local\SplitVpn.Test.Gate." + Guid.NewGuid().ToString("N");
@@ -98,13 +102,95 @@ public sealed class AuditNov24AppTests
             {
                 using var first = UserGate.Enter(mutexName, lockFile, TimeSpan.FromMilliseconds(50), "Test");
                 Assert.Equal((true, false), UserGate.Parts(first));
-                // Заняты и мьютекс, и файл: действие всё равно выполняется, без блокировки.
-                Assert.Null(UserGate.Enter(mutexName, lockFile, TimeSpan.FromMilliseconds(50), "Test"));
+                // Файл держит первая копия: вторая не выполняет действие без блокировки, а получает «занято».
+                Assert.Throws<UserGateBusyException>(() => UserGate.Enter(mutexName, lockFile, TimeSpan.FromMilliseconds(50), "Test"));
             }
 
             // Мьютекс и файл освобождены (в том числе при Dispose занятой только файловой).
             using var free = UserGate.Enter(mutexName, lockFile, TimeSpan.FromMilliseconds(50), "Test");
             Assert.Equal((true, true), UserGate.Parts(free));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// Автозапуск после обновления из другого каталога: запись на удалённый SplitVpn.exe переписывается на текущий путь
+    /// с теми же аргументами; существующий файл, чужое имя и уже верный путь не трогаются.
+    /// </summary>
+    [Theory]
+    [InlineData("\"C:\\Program Files\\Old\\SplitVpn.exe\" --tray", "\"C:\\Program Files\\SplitVpn\\SplitVpn.exe\" --tray")]
+    [InlineData("C:\\Old\\SplitVpn.exe --tray --x", "\"C:\\Program Files\\SplitVpn\\SplitVpn.exe\" --tray --x")]
+    [InlineData("\"C:\\Old\\splitvpn.EXE\"", "\"C:\\Program Files\\SplitVpn\\SplitVpn.exe\"")]
+    [InlineData("\"C:\\Old\\Other.exe\" --tray", null)]
+    [InlineData("\"C:\\Program Files\\SplitVpn\\SplitVpn.exe\" --tray", null)]
+    [InlineData("\"C:\\Old\\SplitVpn.exe --tray", null)]
+    [InlineData("C:\\Old\\SplitVpn.exefile --tray", null)]
+    public void AutostartRepair_RewritesOnlyMissingOwnExecutable(string command, string? expected)
+    {
+        const string current = "C:\\Program Files\\SplitVpn\\SplitVpn.exe";
+
+        Assert.Equal(expected, Autostart.RepairedCommand(command, current, _ => false));
+    }
+
+    [Fact]
+    public void AutostartRepair_KeepsExistingFile()
+    {
+        Assert.Null(Autostart.RepairedCommand("\"D:\\Dev\\SplitVpn.exe\" --tray", "C:\\Program Files\\SplitVpn\\SplitVpn.exe", _ => true));
+    }
+
+    /// <summary>Файловая блокировка недоступна (ошибка создания), а не занята: действие выполняется под одним мьютексом.</summary>
+    [Fact]
+    public void GateWithUnavailableLockFile_RunsUnderMutexOrWithout()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "splitvpn-test-" + Guid.NewGuid().ToString("N"));
+        var mutexName = @"Local\SplitVpn.Test.Gate." + Guid.NewGuid().ToString("N");
+        Directory.CreateDirectory(directory);
+        // Каталог блокировки — на месте обычного файла: создать его нельзя.
+        var blocker = Path.Combine(directory, "blocker");
+        File.WriteAllText(blocker, "");
+        var lockFile = Path.Combine(blocker, "gate.lock");
+        try
+        {
+            using (var mutexOnly = UserGate.Enter(mutexName, lockFile, TimeSpan.FromMilliseconds(50), "Test"))
+            {
+                Assert.Equal((false, true), UserGate.Parts(mutexOnly));
+            }
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    /// <summary>Пока файловую блокировку держит другая копия, прокси не трогается и ошибки нет; после её освобождения — применяется.</summary>
+    [Fact]
+    public async Task ProxyWaitsWhileAnotherCopyHoldsFileLock()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "splitvpn-test-" + Guid.NewGuid().ToString("N"));
+        var mutexName = @"Local\SplitVpn.Test.Proxy." + Guid.NewGuid().ToString("N");
+        var settings = new MemoryProxy(new ProxyState(1, null));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            using var proxy = new ProxyService(settings, directory) { MutexName = mutexName };
+            var connected = new StatusDto
+            {
+                Tunnels =
+                [
+                    new TunnelStatusDto { State = ConnectionState.Connected, ServerNetworks = new ServerNetworksDto { ApplyProxy = true, ProxyPac = "http://gateway.test/proxy.pac" } },
+                ],
+            };
+            using (new FileStream(Path.Combine(directory, "proxy-sync.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+            {
+                Assert.Null(await proxy.UpdateAsync(connected, stopped: false));
+                Assert.Null(settings.State.AutoConfigUrl);
+            }
+
+            Assert.Null(await proxy.UpdateAsync(connected, stopped: false));
+            Assert.Equal("http://gateway.test/proxy.pac", settings.State.AutoConfigUrl);
         }
         finally
         {

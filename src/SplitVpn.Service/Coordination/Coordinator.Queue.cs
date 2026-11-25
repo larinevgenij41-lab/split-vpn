@@ -246,6 +246,9 @@ public sealed partial class Coordinator
         var source = "работа:" + work.Kind;
         try
         {
+            // Перевод часов назад замечается до любой работы, а не только на тике: иначе сроки, назначенные этой
+            // работой уже по новым часам, следующий тик сдвинул бы второй раз.
+            DetectClockJumpBack();
             await work.Run();
             _failures.Recovered(source, $"Очередь службы: работа {work.Kind} снова выполняется без ошибок");
         }
@@ -515,6 +518,7 @@ public sealed partial class Coordinator
     {
         while (_queue.Reader.TryRead(out var work))
         {
+            DetectClockJumpBack();
             await work.Run();
         }
     }

@@ -78,6 +78,43 @@ public sealed class GatewayNetworkLayerLimitsTests
         Assert.NotNull(session.RejectedIncludes());
     }
 
+    /// <summary>Большой законный split-include (2000 несмежных /24) принимается, политика собирается быстро.</summary>
+    [Fact]
+    public void LargeCorporateSplitInclude_IsAccepted_AndBuildsQuickly()
+    {
+        var networks = Enumerable.Range(0, 2000).Select(i => Ipv4.Format(0x0A000000u + ((uint)i << 9)) + "/24").ToList();
+        var session = new SessionInfo { SplitIncludes = [.. networks] };
+
+        var includes = session.IncludeCidrs();
+        Assert.Null(session.RejectedIncludes());
+        Assert.Equal(2000, includes.Count);
+
+        var input = new PolicyInput
+        {
+            DefaultTarget = RouteTarget.Tunnel(Sstp),
+            ServerNetworks = [new ServerNetworks(RouteTarget.Tunnel(Gateway), [.. includes])],
+        };
+        var watch = Stopwatch.StartNew();
+        var policy = PolicyCompiler.Compile(input);
+        watch.Stop();
+
+        Assert.Empty(policy.Warnings);
+        Assert.Equal(Gateway, policy.Classify(0x0A000000u + (1999u << 9) + 7).Tunnel);
+        // Промежуток между сетями шлюза ему не достаётся.
+        Assert.NotEqual(DecisionSource.ServerNetwork, policy.Classify(0x0A000000u + 256).Source);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5), $"сборка заняла {watch.Elapsed}");
+    }
+
+    /// <summary>17 сетей /8 — больше 1/16 IPv4: слой по-прежнему отклоняется, хотя маршрутов всего 17.</summary>
+    [Fact]
+    public void SeventeenEights_AreStillRejected()
+    {
+        var session = new SessionInfo { SplitIncludes = [.. AllPublicEights().Skip(10).Take(17)] };
+
+        Assert.Empty(session.IncludeCidrs());
+        Assert.Contains("1/16", session.RejectedIncludes(), StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Session_KeepsOrdinaryLayer()
     {

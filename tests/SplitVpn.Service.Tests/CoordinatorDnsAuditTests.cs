@@ -8,6 +8,52 @@ namespace SplitVpn.Service.Tests;
 /// <summary>Исправления аудита 2026-11-01 на стороне координатора: DNS-кеш, суффиксы и восстановление DNS.</summary>
 public sealed partial class CoordinatorTests
 {
+    /// <summary>
+    /// Первый снимок поймал временный сбой чтения IPv6 (RPC 1722): IPv6-часть копии неизвестна, ::1 не ставится,
+    /// восстановление IPv6 пользователя не трогает.
+    /// </summary>
+    [Fact]
+    public async Task UnknownIpv6Backup_DoesNotSetLoopback_AndRestoreKeepsUserIpv6()
+    {
+        _world.Dns.NameServers[FakeWorld.WiFiGuid] = "192.168.1.1";
+        _world.Dns.NameServersV6[FakeWorld.WiFiGuid] = "2001:db8::53";
+        _world.Dns.Ipv6ReadFails.Add(FakeWorld.WiFiGuid);
+        var coordinator = await StartAsync();
+        await ConnectAsync(coordinator);
+
+        Assert.Equal("127.0.0.1", _world.Dns.NameServers[FakeWorld.WiFiGuid]);
+        Assert.Equal("2001:db8::53", _world.Dns.NameServersV6[FakeWorld.WiFiGuid]);
+        Assert.True(new DnsBackupStore(_world.Paths.DnsBackup).Load()[FakeWorld.WiFiGuid].Ipv6Unknown);
+
+        await coordinator.HandleRequestAsync(new Core.Ipc.DisconnectRequest(KeepProtection: false), CancellationToken.None);
+
+        Assert.Equal("192.168.1.1", _world.Dns.NameServers[FakeWorld.WiFiGuid]);
+        Assert.Equal("2001:db8::53", _world.Dns.NameServersV6[FakeWorld.WiFiGuid]);
+    }
+
+    /// <summary>Чтение IPv6 снова удалось: копия дополняется исходным списком, и только тогда ставится ::1.</summary>
+    [Fact]
+    public async Task UnknownIpv6Backup_IsCompletedOnNextReconcile()
+    {
+        _world.Dns.NameServers[FakeWorld.WiFiGuid] = "192.168.1.1";
+        _world.Dns.NameServersV6[FakeWorld.WiFiGuid] = "2001:db8::53";
+        _world.Dns.Ipv6ReadFails.Add(FakeWorld.WiFiGuid);
+        var coordinator = await StartAsync();
+        await ConnectAsync(coordinator);
+        Assert.Equal("2001:db8::53", _world.Dns.NameServersV6[FakeWorld.WiFiGuid]);
+
+        _world.Dns.Ipv6ReadFails.Clear();
+        await coordinator.ReconcileAsync(CancellationToken.None);
+
+        var backup = new DnsBackupStore(_world.Paths.DnsBackup).Load()[FakeWorld.WiFiGuid];
+        Assert.False(backup.Ipv6Unknown);
+        Assert.Equal("2001:db8::53", backup.NameServerV6);
+        Assert.Equal("::1", _world.Dns.NameServersV6[FakeWorld.WiFiGuid]);
+
+        await coordinator.HandleRequestAsync(new Core.Ipc.DisconnectRequest(KeepProtection: false), CancellationToken.None);
+        Assert.Equal("2001:db8::53", _world.Dns.NameServersV6[FakeWorld.WiFiGuid]);
+    }
+
     [Fact]
     public async Task FailedIpv6DnsRestore_KeepsBackup()
     {

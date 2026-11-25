@@ -9,22 +9,35 @@ namespace SplitVpn.App.Services;
 /// именованный мьютекс Global\…&lt;SID&gt;. Имя мьютекса может заранее занять другой локальный пользователь с
 /// запрещающим DACL или удерживать его - тогда копии этого пользователя всё равно исключают друг друга по файлу:
 /// прежде при таймауте мьютекса переход на файл не давал исключения, ведь законная вторая копия, державшая мьютекс,
-/// файл не держала. Недоступен мьютекс - работа под одной файловой, недоступна и она - без блокировки; оба случая с
-/// предупреждением в журнале: критичные действия (снятие прокси шлюза, запись настроек) не должны срываться.
+/// файл не держала. Мьютекс занят или недоступен при взятой файловой - работа под одной файловой (это защита от
+/// чужого захвата имени). Без блокировки действие выполняется, только когда блокировки НЕДОСТУПНЫ (ошибка доступа
+/// или создания), - с предупреждением в журнале: критичные действия (снятие прокси шлюза, запись настроек) не должны
+/// срываться из-за чужого DACL. Файловую же блокировку держит только другая копия того же пользователя: если она
+/// держит её дольше ожидания, действие НЕ выполняется (<see cref="UserGateBusyException"/>) - иначе две копии писали бы
+/// одну копию исходного прокси параллельно; вызывающий повторит на следующем опросе.
 /// </summary>
 internal static class UserGate
 {
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(50);
 
-    /// <summary>Захватить блокировку; null — выполнять без неё (предупреждение уже записано).</summary>
+    /// <summary>
+    /// Захватить блокировку; null — выполнять без неё (предупреждение уже записано). Файловую или (без файловой)
+    /// мьютекс держит живая копия дольше <paramref name="timeout"/> — <see cref="UserGateBusyException"/>.
+    /// </summary>
     public static IDisposable? Enter(string mutexName, string lockFile, TimeSpan timeout, string area)
     {
-        var file = TryFile(lockFile, timeout, out var fileProblem);
+        var file = TryFile(lockFile, timeout, out var fileProblem, out var fileBusy);
+        if (fileBusy)
+        {
+            throw new UserGateBusyException($"блокировку {lockFile} держит другая копия приложения дольше {Seconds(timeout)} с");
+        }
+
         IDisposable? mutex;
         string? problem;
+        bool mutexBusy;
         try
         {
-            mutex = TryMutex(mutexName, timeout, out problem);
+            mutex = TryMutex(mutexName, timeout, out problem, out mutexBusy);
         }
         catch
         {
@@ -33,6 +46,13 @@ internal static class UserGate
         }
 
         var key = area + "|" + mutexName + "|" + lockFile;
+        if (file is null && mutexBusy)
+        {
+            // Файловая недоступна (ошибка доступа), а мьютекс держат: это, скорее всего, другая копия того же
+            // пользователя, которой файловая тоже недоступна, - параллельно с ней не работаем.
+            throw new UserGateBusyException($"файловая блокировка {lockFile} недоступна ({fileProblem}), а блокировку {mutexName} держат дольше {Seconds(timeout)} с");
+        }
+
         if (file is null && mutex is null)
         {
             Report(key, area, Degraded.Both, $"файловая блокировка {lockFile} ({fileProblem}) и блокировка {mutexName} ({problem}) недоступны; " +
@@ -96,9 +116,13 @@ internal static class UserGate
     internal static (bool File, bool Mutex) Parts(IDisposable? gate) =>
         gate is Held held ? (held.File is not null, held.Mutex is not null) : (false, false);
 
-    internal static IDisposable? TryMutex(string name, TimeSpan timeout, out string? problem)
+    private static string Seconds(TimeSpan timeout) => timeout.TotalSeconds.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <param name="busy">Мьютекс занят дольше ожидания (а не недоступен).</param>
+    internal static IDisposable? TryMutex(string name, TimeSpan timeout, out string? problem, out bool busy)
     {
         Mutex? mutex = null;
+        busy = false;
         try
         {
             mutex = new Mutex(false, name);
@@ -121,7 +145,8 @@ internal static class UserGate
                 return held;
             }
 
-            problem = "занята дольше " + timeout.TotalSeconds.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " с";
+            problem = "занята дольше " + Seconds(timeout) + " с";
+            busy = true;
             return null;
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or WaitHandleCannotBeOpenedException or IOException)
@@ -135,9 +160,11 @@ internal static class UserGate
         }
     }
 
-    internal static FileStream? TryFile(string path, TimeSpan timeout, out string? problem)
+    /// <param name="busy">Файл держит другая копия дольше ожидания (нарушение совместного доступа), а не ошибка доступа.</param>
+    internal static FileStream? TryFile(string path, TimeSpan timeout, out string? problem, out bool busy)
     {
         var deadline = DateTime.UtcNow + timeout;
+        busy = false;
         while (true)
         {
             try
@@ -146,8 +173,16 @@ internal static class UserGate
                 problem = null;
                 return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
             }
-            catch (IOException ex) when ((ex.HResult & 0xffff) is 32 or 33 && DateTime.UtcNow < deadline)
+            catch (IOException ex) when ((ex.HResult & 0xffff) is 32 or 33)
             {
+                if (DateTime.UtcNow >= deadline)
+                {
+                    // Файл держит живая копия интерфейса того же пользователя: это «занято», а не «недоступно».
+                    problem = ex.Message;
+                    busy = true;
+                    return null;
+                }
+
                 // Файл держит другая копия интерфейса: ждём.
                 Thread.Sleep(RetryDelay);
             }
@@ -208,3 +243,9 @@ internal static class UserGate
         }
     }
 }
+
+/// <summary>
+/// Блокировку держит другая копия приложения того же пользователя дольше ожидания: действие не выполняется,
+/// вызывающий повторит его позже. Наследует <see cref="IOException"/>: для вызывающих это сбой ввода-вывода.
+/// </summary>
+internal sealed class UserGateBusyException(string message) : IOException(message);

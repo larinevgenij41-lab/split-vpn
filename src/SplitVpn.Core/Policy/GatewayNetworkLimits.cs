@@ -15,8 +15,12 @@ public static class GatewayNetworkLimits
     /// <summary>Суммарное покрытие слоя: 1/16 пространства IPv4, как предел RU-базы (GeoValidationOptions.MaxV4Addresses).</summary>
     public const ulong MaxAddresses = 1UL << 28;
 
-    /// <summary>Число маршрутов (CIDR-блоков) после свёртки слоя.</summary>
-    public const int MaxRoutes = 1024;
+    /// <summary>
+    /// Число маршрутов (CIDR-блоков) после свёртки слоя. Предел защищает таблицу маршрутов и сборку политики
+    /// от десятков тысяч /32; покраска слоя линейна, так что законный большой split-include корпоративного шлюза
+    /// (тысячи несмежных /24) в него укладывается. Прежний предел 1024 отбрасывал такой слой целиком.
+    /// </summary>
+    public const int MaxRoutes = 16384;
 
     /// <summary>Годные сети слоя (не шире /8) одним множеством.</summary>
     public static RangeSet Union(IEnumerable<Ipv4Cidr> cidrs)

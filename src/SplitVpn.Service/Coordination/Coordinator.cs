@@ -46,6 +46,7 @@ public sealed partial class Coordinator
     public Coordinator(ServiceDependencies deps)
     {
         _deps = deps;
+        StartClockWatch();
         _failures = new RepeatedFailureLog(deps.Logger, deps.Time);
         _wifiRecorder = new WifiIncidentRecorder(deps.WifiIncidentDirectory, deps.Time, deps.Logger);
         // Повреждённый служебный файл не мешает запуску: хранилище откладывает его копию и работает со
@@ -124,9 +125,9 @@ public sealed partial class Coordinator
 
     internal async Task TickAsync(CancellationToken cancellationToken)
     {
-        var now = _deps.Time.GetUtcNow();
         // Часы перевели назад: сроки, заданные по прежним часам, сдвигаются раньше всех проверок этого тика.
-        DetectClockJumpBack(now);
+        DetectClockJumpBack();
+        var now = _deps.Time.GetUtcNow();
         // Каждый шаг тика изолирован: исключение в одном (сбой опроса RAS, чтения адаптеров) не отменяет
         // остальные, иначе одна ошибка останавливала бы и сверку, и обновление списков, и проверку выпусков.
         // Сбой шага - не изменение сети: сверка, которая проверит фактическое состояние, идёт по своей нарастающей
@@ -165,7 +166,7 @@ public sealed partial class Coordinator
         networkChanged |= notified;
         var bfeRestarted = TickStep("перезапуск BFE", DetectBfeRestart, cancellationToken);
         var changed = connectionsChanged | networkChanged | bfeRestarted
-            | TickStep("истёкшие закрепления", () => DropExpiredPins(now), cancellationToken);
+            | TickStep("истёкшие закрепления", DropExpiredPins, cancellationToken);
         TickStep("проверка конфликтов", () => { CheckConflictsAfterNetworkChange(now); return false; }, cancellationToken);
         if (networkChanged | bfeRestarted)
         {

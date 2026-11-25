@@ -154,7 +154,7 @@ public sealed partial class Coordinator
                 return [];
             }
 
-            var now = _deps.Time.GetUtcNow();
+            var now = ClockNowLocked();
             var open = Facts.RevocationPins
                 .Where(pin => pin.Value.Contains(ConnectivityCheckWebHost) && !SpecialRanges.AllNonPublic.Contains(pin.Key))
                 .Select(pin => pin.Key)
@@ -398,7 +398,7 @@ public sealed partial class Coordinator
             return Task.CompletedTask;
         }
 
-        if (!PinDirect(ConnectivityCheckWebHost, usable, _deps.Time.GetUtcNow() + RevocationPinTtl))
+        if (!PinDirect(ConnectivityCheckWebHost, usable, RevocationPinTtl))
         {
             return Task.CompletedTask;
         }

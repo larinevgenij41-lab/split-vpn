@@ -61,8 +61,9 @@ public sealed class ProxyService : IDisposable
             lock (_gate)
             {
                 if (_closed || version != Interlocked.Read(ref _version) || UpToDate(pac)) { return null; }
-                var error = Sync(pac, exiting: false);
-                _synced = error is null;
+                var error = Sync(pac, exiting: false, out var busy);
+                // Занято другой копией: не ошибка для пользователя, но и не синхронизировано — повтор на следующем опросе.
+                _synced = error is null && !busy;
                 _syncedPac = pac;
                 return error;
             }
@@ -75,7 +76,8 @@ public sealed class ProxyService : IDisposable
         {
             if (_closed) { return; }
             _closed = true;
-            if (_lease is not null) { Sync(null, exiting: true); }
+            // Занято другой копией: снимать не будем — оставшаяся копия снимет прокси сама (как до аудита блокировок).
+            if (_lease is not null) { Sync(null, exiting: true, out _); }
             _lease?.Dispose();
         }
     }
@@ -89,13 +91,16 @@ public sealed class ProxyService : IDisposable
         return @"Global\SplitVpn.Proxy." + identity.User!.Value;
     }
 
-    private string? Sync(string? pac, bool exiting)
+    /// <param name="busy">Блокировку держит другая копия интерфейса: ничего не сделано, ошибки нет, повторить позже.</param>
+    private string? Sync(string? pac, bool exiting, out bool busy)
     {
+        busy = false;
         try
         {
             // Снятие прокси при отключении и выходе не должно зависеть от мьютекса: его имя может занять
             // другой пользователь компьютера. Берутся файловая блокировка в профиле и мьютекс; без мьютекса -
-            // под одной файловой, без обеих - без блокировки (UserGate).
+            // под одной файловой, без обеих (обе недоступны) - без блокировки (UserGate). Файловую держит другая
+            // копия этого пользователя - «занято»: параллельно с ней копию исходного прокси не пишем.
             using var gate = UserGate.Enter(MutexName ?? DefaultMutexName(), Path.Combine(_directoryPath, "proxy-sync.lock"), TimeSpan.FromSeconds(2), "Proxy");
             Directory.CreateDirectory(_directoryPath);
             if (exiting)
@@ -111,6 +116,12 @@ public sealed class ProxyService : IDisposable
             }
             _applier.Sync(pac);
             if (_settings is WinInetProxySettings windows) { windows.NotifyChanges(); }
+            return null;
+        }
+        catch (UserGateBusyException ex)
+        {
+            Verbose.Write("Proxy", "Прокси не обновлён, повтор позже: " + ex.Message);
+            busy = true;
             return null;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)

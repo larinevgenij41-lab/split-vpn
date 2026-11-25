@@ -54,11 +54,13 @@ public sealed partial class Coordinator
     internal async ValueTask<bool> ObservePinnedAsync(PinnedRouteNotice notice, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(notice);
-        var now = _deps.Time.GetUtcNow();
-        var expires = now + notice.Ttl;
         long version;
         lock (_pinGate)
         {
+            // Срок - по часам, проверенным на скачок под тем же замком: перевод назад между этим ответом и ближайшей
+            // работой актора не сдвинет его второй раз (и не снимет маршрут, едва поставленный).
+            var now = ClockNowLocked();
+            var expires = now + notice.Ttl;
             // Общий IP нельзя переназначить домену, если через него работает сам DNS-посредник.
             // Проверка всего ответа до записи не оставляет частичных закреплений.
             if (notice.IsCurrent?.Invoke() == false || !PinContextMatches(notice)
@@ -165,7 +167,7 @@ public sealed partial class Coordinator
         // Пока ответ ждал очередь, правило могло исчезнуть, а набор — успешно примениться уже без него.
         lock (_pinGate)
         {
-            var checkedAt = _deps.Time.GetUtcNow();
+            var checkedAt = ClockNowLocked();
             if (!PinContextMatches(notice))
             {
                 return false;
@@ -265,7 +267,7 @@ public sealed partial class Coordinator
         bool connectivity;
         lock (_pinGate)
         {
-            var now = _deps.Time.GetUtcNow();
+            var now = ClockNowLocked();
             connectivity = notice.Suffix == ConnectivityCheckWebHost && IsRevocationPin(notice.Suffix, notice.Target);
             accepted &= notice.IsCurrent?.Invoke() != false && PinContextMatches(notice)
                 && notice.Addresses.All(a => _desiredPins.TryGetValue(a, out var owners)
@@ -325,13 +327,14 @@ public sealed partial class Coordinator
                 {
                     // Набор уже не применился. Повторный ответ по тому же адресу номер не меняет, и без
                     // нового применения отказы шли бы до полной сверки. Одна попытка на ответ, не чаще паузы.
-                    if (retried || _deps.Time.GetUtcNow() - _lastPinFailureUtc < PinRetryPause)
+                    var now = ClockNowLocked();
+                    if (retried || now - _lastPinFailureUtc < PinRetryPause)
                     {
                         return false;
                     }
 
                     retried = true;
-                    _lastPinFailureUtc = _deps.Time.GetUtcNow();
+                    _lastPinFailureUtc = now;
                 }
 
                 _pinApplied ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -408,7 +411,7 @@ public sealed partial class Coordinator
             else
             {
                 _failedPinVersion = Math.Max(_failedPinVersion, _pinVersion);
-                _lastPinFailureUtc = _deps.Time.GetUtcNow();
+                _lastPinFailureUtc = ClockNowLocked();
             }
 
             var waiters = _pinApplied;
@@ -428,13 +431,13 @@ public sealed partial class Coordinator
     private void PromotePins()
     {
         RefreshConnectivityCheckContext();
-        var now = _deps.Time.GetUtcNow();
         var rules = DomainTargets(out var revocation, out var priorities);
         var dns = ServiceDnsAddresses().Concat(UpstreamDnsAddresses())
             .Concat(Facts.Tunnels.Values.SelectMany(t => TunnelDnsRoute(t)?.Servers.Select(s => Ipv4.ToUInt(s.Address)) ?? []))
             .ToHashSet();
         lock (_pinGate)
         {
+            var now = ClockNowLocked();
             _manualPriorities = priorities;
             _dnsTransportAddresses = dns;
             _revocationPinSuffixes = new HashSet<string>(revocation, StringComparer.Ordinal);
@@ -468,6 +471,9 @@ public sealed partial class Coordinator
             }
 
             _promotedPinVersion = _pinVersion;
+
+            // Применённый набор собран заново из желаемого, сроки которого уже по текущим часам.
+            _pendingAppliedPinShift = TimeSpan.Zero;
 
             // Набор ещё не применён: до успешного применения ответы DNS по нему не подтверждаются.
             _promotedPinsApplied = false;
@@ -555,11 +561,12 @@ public sealed partial class Coordinator
     /// конфликтует (см. <see cref="PinConflicts"/>). Адреса DNS-посредника запрещены; для проверки интернета Windows
     /// дополнительно проверяется лимит публичных адресов.
     /// </summary>
-    private bool PinDirect(string suffix, IReadOnlyList<uint> addresses, DateTimeOffset expires)
+    private bool PinDirect(string suffix, IReadOnlyList<uint> addresses, TimeSpan ttl)
     {
         lock (_pinGate)
         {
-            var now = _deps.Time.GetUtcNow();
+            var now = ClockNowLocked();
+            var expires = now + ttl;
             if (addresses.Any(_dnsTransportAddresses.Contains))
             {
                 return false;
@@ -589,10 +596,11 @@ public sealed partial class Coordinator
     }
 
     /// <summary>Снимает закрепления с истёкшим сроком. true — набор изменился и нужна сверка.</summary>
-    private bool DropExpiredPins(DateTimeOffset now)
+    private bool DropExpiredPins()
     {
         lock (_pinGate)
         {
+            var now = ClockNowLocked();
             if (now < _nextPinExpiry) return false;
             _nextPinExpiry = DateTimeOffset.MaxValue;
             var changed = false;
@@ -625,6 +633,7 @@ public sealed partial class Coordinator
             _nextPinExpiry = DateTimeOffset.MaxValue;
             Facts.Pinned.Clear();
             Facts.RevocationPins.Clear();
+            _pendingAppliedPinShift = TimeSpan.Zero;
             _revocationPinSuffixes = new(StringComparer.Ordinal);
             _promotedPinVersion = _pinVersion;
             _appliedPinVersion = _pinVersion;

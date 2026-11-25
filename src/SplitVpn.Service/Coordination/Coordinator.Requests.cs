@@ -85,6 +85,10 @@ public sealed partial class Coordinator
 
         // Проверяется и сохраняется одна и та же нормализованная модель: «null» из канала управления не попадает в файл.
         settings = SettingsSerializer.Normalize(settings);
+        // Служебные разделы исходных значений (файл более новой версии) принимаются только такими, какими служба
+        // прочитала их из своего файла: подложенный клиентом раздел записал бы в файл непроверенные роль, протокол
+        // или способ входа, а подключение с ним миновало бы полную проверку.
+        settings = UnknownSettingValues.KeepOnlyTrusted(settings, _settings);
         var validation = SettingsValidator.Validate(settings);
         if (!validation.IsValid)
         {

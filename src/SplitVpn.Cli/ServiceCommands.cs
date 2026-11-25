@@ -154,8 +154,9 @@ internal static class ServiceCommands
                 var loaded = SettingsSerializer.Deserialize(await ReadInputFileAsync(file));
                 if (loaded.Settings is null)
                 {
+                    // Ошибка входного файла — код использования 2, как у прочих ошибок входных файлов (docs/README.md).
                     Console.WriteLine("Файл настроек не разобран: " + loaded.Error);
-                    return 1;
+                    return 2;
                 }
 
                 var saved = await SendAsync(client, new SaveSettingsRequest(loaded.Settings, expected));
@@ -167,9 +168,7 @@ internal static class ServiceCommands
                 var result = PrintWarnings(saved);
                 if (saved.Ok && File.Exists(RevisionPath(file)))
                 {
-                    // Следующая правка того же файла сверяется уже с записанными настройками, а не с исходными.
-                    var stored = Expect<AppSettings>(await SendAsync(client, new GetSettingsRequest()));
-                    File.WriteAllText(RevisionPath(file), SettingsSerializer.Revision(stored));
+                    UpdateRevisionFile(file, loaded.Settings, Expect<AppSettings>(await SendAsync(client, new GetSettingsRequest())));
                 }
 
                 return result;
@@ -181,6 +180,28 @@ internal static class ServiceCommands
 
     /// <summary>Файл ревизии рядом с файлом настроек: «settings.json» → «settings.json.revision».</summary>
     internal static string RevisionPath(string settingsFile) => settingsFile + ".revision";
+
+    /// <summary>
+    /// После «settings set»: следующая правка того же файла сверяется с записанными настройками. Ответ службы на
+    /// сохранение ревизии не несёт, а между записью и чтением настройки мог изменить другой клиент — поэтому ревизия
+    /// считается по отправленному, и только если прочитанное после записи с ним совпало. Не совпало (изменил другой
+    /// клиент, служба дополнила или сняла недоверенное) — файл ревизии удаляется: ревизия чужого состояния позволила
+    /// бы следующей правке молча затереть чужие изменения.
+    /// </summary>
+    internal static bool UpdateRevisionFile(string settingsFile, AppSettings sent, AppSettings stored)
+    {
+        var revision = SettingsSerializer.Revision(sent);
+        if (string.Equals(revision, SettingsSerializer.Revision(stored), StringComparison.Ordinal))
+        {
+            File.WriteAllText(RevisionPath(settingsFile), revision);
+            return true;
+        }
+
+        File.Delete(RevisionPath(settingsFile));
+        Console.WriteLine($"Настройки службы после записи отличаются от отправленных (их изменил другой клиент или дополнила служба): {Path.GetFileName(RevisionPath(settingsFile))} удалён, "
+            + $"выполните «settings get --out {settingsFile}» заново перед следующей правкой.");
+        return false;
+    }
 
     /// <summary>
     /// Ревизия, с которой сверяется запись: --revision, иначе файл «.revision» от «settings get --out».

@@ -445,7 +445,7 @@ public sealed partial class Coordinator
             foreach (var (host, addresses) in resolved)
             {
                 if (addresses.Count == 0 || !current.Contains(host) || MatchingDomainRule(host) is not null) { continue; }
-                PinDirect(SettingsSerializer.NormalizeSuffix(host), addresses, _deps.Time.GetUtcNow() + RevocationPinTtl);
+                PinDirect(SettingsSerializer.NormalizeSuffix(host), addresses, RevocationPinTtl);
                 pinned = true;
             }
 

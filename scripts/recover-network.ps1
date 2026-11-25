@@ -21,6 +21,8 @@ function Restore-SavedDns($dns, $saved) {
         $ours = ($servers.Count -eq 1 -and $servers[0] -eq $loopback) -or
             (-not $v6 -and $servers.Count -eq 2 -and $servers[1] -eq $loopback -and $servers[0] -match '^\d+\.\d+\.\d+\.\d+$')
         if (-not $ours) { continue }
+        # Исходный IPv6-список в копии неизвестен (ipv6Unknown): ::1 программа тогда не ставила, это ::1 пользователя.
+        if ($v6 -and $saved.PSObject.Properties['ipv6Unknown'] -and $saved.ipv6Unknown) { continue }
         $property = if ($v6) { 'NameServerV6' } else { 'NameServerV4' }
         if (-not $saved.PSObject.Properties[$property]) { throw "Нет поля $property в копии DNS" }
         $addresses = @($saved.$property -split '[,;\s]+' | Where-Object { $_ })

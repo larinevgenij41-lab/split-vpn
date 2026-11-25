@@ -97,7 +97,9 @@ public static class ConnectionEdits
         // Занятые названия сравниваются так же, как в проверке настроек: без пробелов по краям и без учёта регистра.
         var names = existingNames.Select(n => (n ?? "").Trim()).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var result = new List<ConnectionProfile>();
-        var profiles = imported.OfType<ConnectionProfile>().Select(SettingsSerializer.NormalizeProfile).ToList();
+        // Служебный раздел исходных значений (UnknownSettingValues.PreservedKey) из чужого файла не принимается:
+        // при записи файла настроек он вернул бы на место непроверенные роль, протокол и способ входа.
+        var profiles = imported.OfType<ConnectionProfile>().Select(p => UnknownSettingValues.WithoutPreserved(SettingsSerializer.NormalizeProfile(p))).ToList();
         // Прежний идентификатор из файла -> новый: ссылки между подключениями файла (цель сетей шлюза) переносятся вместе с ними.
         var newIds = new Dictionary<Guid, Guid>();
         foreach (var profile in profiles)
@@ -132,7 +134,8 @@ public static class ConnectionEdits
 
     /// <summary>
     /// Готовит профили к записи в файл экспорта: новые идентификаторы, чтобы файл не нёс идентификаторов установки,
-    /// и перенос цели сетей шлюза AnyConnect на новые идентификаторы (иначе при импорте ссылка на другое подключение теряется).
+    /// перенос цели сетей шлюза AnyConnect на новые идентификаторы (иначе при импорте ссылка на другое подключение теряется)
+    /// и без служебного раздела исходных значений.
     /// </summary>
     public static List<ConnectionProfile> PrepareExport(IEnumerable<ConnectionProfile> profiles)
     {
@@ -144,7 +147,8 @@ public static class ConnectionEdits
             newIds.TryAdd(profile.Id, Guid.NewGuid());
         }
 
-        return list.Select(p => p with
+        // Служебный раздел исходных значений в файл экспорта не пишется: подключение уходит таким, каким его видит эта версия.
+        return list.Select(p => UnknownSettingValues.WithoutPreserved(p) with
         {
             Id = newIds[p.Id],
             AnyConnect = p.AnyConnect with { ServerNetworksTarget = Remap(p.AnyConnect.ServerNetworksTarget, newIds) },

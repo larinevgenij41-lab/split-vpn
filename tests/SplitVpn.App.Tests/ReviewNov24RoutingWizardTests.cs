@@ -167,6 +167,91 @@ public sealed class ReviewNov24RoutingWizardTests
         Assert.Single(store.Settings.Profiles);
     });
 
+    /// <summary>
+    /// Подключение A работает, мастер из «Настроек» добавляет B, B не подключилось. «Отмена» не шлёт глобальное
+    /// отключение (оно разорвало бы и A), а возвращает прежние настройки: A снова опорное, «Остальной интернет» —
+    /// в A, RU-база как была; B остаётся в списке выключенным.
+    /// </summary>
+    [Fact]
+    public Task WizardCancelWithOtherConnections_RestoresSettingsWithoutDisconnect() => RunStaAsync(async () =>
+    {
+        var existing = new ConnectionProfile { Name = "Работа", Server = "work.example", UserName = "user", Role = ProfileRole.Primary };
+        var store = new BoardService
+        {
+            Settings = new AppSettings { Profiles = [existing], DefaultTarget = RouteTarget.Tunnel(existing.Id), GeoTarget = RouteTarget.Tunnel(existing.Id) },
+        };
+        var disconnects = 0;
+        Task<IpcResponse> Send(IpcRequest request, CancellationToken token)
+        {
+            switch (request)
+            {
+                case DisconnectRequest:
+                    disconnects++;
+                    return Task.FromResult(IpcResponse.Success());
+                case ConnectRequest:
+                    return Task.FromResult(IpcResponse.Success());
+                case GetStatusRequest:
+                    return Task.FromResult(IpcResponse.Success(new StatusDto { State = ConnectionState.Error, Intent = Intent.Connected }));
+                default:
+                    return store.SendAsync(request, token);
+            }
+        }
+
+        using var service = new ServiceConnection(Send);
+        using var main = new MainViewModel(service, new UiPreferences());
+        var wizard = new WizardViewModel(main, false) { Name = "Новое", Server = "vpn.example", UserName = "user", Password = "draft", RussiaDirect = true, GeoOption = GeoStartOption.ViaTunnel, Step = WizardViewModel.LastStep - 1 };
+        await wizard.NextCommand.ExecuteAsync(null);
+        Assert.Equal(0, wizard.Step);
+        Assert.Contains("прежние настройки", wizard.Error, StringComparison.Ordinal);
+        var added = store.Settings.Profiles.Single(p => p.Name == "Новое");
+        Assert.Equal(ProfileRole.Primary, added.Role);
+        Assert.Equal(ProfileRole.Secondary, store.Settings.Profile(existing.Id)!.Role);
+
+        await wizard.CancelCommand.ExecuteAsync(null);
+
+        Assert.Equal(0, disconnects);
+        var restored = store.LastSaved!;
+        Assert.Equal(ProfileRole.Primary, restored.Profile(existing.Id)!.Role);
+        Assert.Equal(ProfileRole.Off, restored.Profile(added.Id)!.Role);
+        Assert.Equal(RouteTarget.Tunnel(existing.Id), restored.DefaultTarget);
+        Assert.Equal(RouteTarget.Tunnel(existing.Id), restored.GeoTarget);
+        Assert.Equal(2, restored.Profiles.Count);
+    });
+
+    /// <summary>Служба недоступна на шаге «Сервер и вход»: проверка названия не запирает мастер, окончательная — при сохранении.</summary>
+    [Fact]
+    public Task WizardNameCheck_ServiceUnavailable_GoesToNextStep() => RunStaAsync(async () =>
+    {
+        Task<IpcResponse> Send(IpcRequest request, CancellationToken token) =>
+            Task.FromException<IpcResponse>(new ServiceUnavailableException("Служба не запущена."));
+
+        using var service = new ServiceConnection(Send);
+        using var main = new MainViewModel(service, new UiPreferences());
+        var wizard = new WizardViewModel(main, false) { Server = "vpn.example", UserName = "user", Password = "draft", Step = 0 };
+
+        await wizard.NextCommand.ExecuteAsync(null);
+
+        Assert.Equal(1, wizard.Step);
+    });
+
+    /// <summary>Название с пробелами по краям у существующего подключения тоже считается занятым.</summary>
+    [Fact]
+    public Task WizardNameCheck_ComparesTrimmedNames() => RunStaAsync(async () =>
+    {
+        var store = new BoardService
+        {
+            Settings = new AppSettings { Profiles = [new ConnectionProfile { Name = " Основное ", Server = "other.example", UserName = "user" }] },
+        };
+        using var service = new ServiceConnection(store.SendAsync);
+        using var main = new MainViewModel(service, new UiPreferences());
+        var wizard = new WizardViewModel(main, false) { Server = "vpn.example", UserName = "user", Password = "draft", Step = 0 };
+
+        await wizard.NextCommand.ExecuteAsync(null);
+
+        Assert.Equal(0, wizard.Step);
+        Assert.Contains("Название уже занято", wizard.Error, StringComparison.Ordinal);
+    });
+
     /// <summary>Занятое название выясняется на шаге «Сервер и вход», а после «Готово» возвращает на него.</summary>
     [Theory]
     [InlineData(0)]

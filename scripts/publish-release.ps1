@@ -140,23 +140,62 @@ function Get-WritableTreeGrants([string]$path) {
     }
 }
 
+# Каталоги и файлы git, из которых git исполняет код при сборке: hooks, config (core.fsmonitor, core.hooksPath),
+# каталог core.hooksPath. В git worktree общий каталог git (--git-common-dir) лежит вне рабочего дерева — в
+# основной копии, — и проверка одного корня его не видит. Абсолютные пути; без git или не в репозитории — пусто.
+# Та же функция есть в build-installer.ps1, elevated.ps1 и install-dev-service.ps1.
+function Get-GitControlPaths([string]$path) {
+    $ErrorActionPreference = 'Continue'
+    $found = [Collections.Generic.List[string]]::new()
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return @() }
+    function Resolve-GitPath([string]$value) {
+        $value = $value.Trim()
+        if (-not [IO.Path]::IsPathRooted($value)) { $value = Join-Path $path $value }
+        return [IO.Path]::GetFullPath($value)
+    }
+    foreach ($option in '--git-common-dir', '--git-dir') {
+        $dir = @(& git -C $path rev-parse $option 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $dir.Count -and $dir[0]) {
+            $full = Resolve-GitPath $dir[0]
+            $found.Add($full)
+            foreach ($inner in 'hooks', 'config', 'config.worktree') { $found.Add((Join-Path $full $inner)) }
+        }
+    }
+    $hooks = @(& git -C $path config --get core.hooksPath 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $hooks.Count -and $hooks[0]) {
+        $value = [Environment]::ExpandEnvironmentVariables($hooks[0].Trim())
+        if ($value.StartsWith('~')) { $value = Join-Path $HOME $value.Substring(1).TrimStart('/', '\') }
+        $found.Add((Resolve-GitPath $value))
+    }
+    return @($found | Where-Object { Test-Path -LiteralPath $_ } | Sort-Object -Unique)
+}
+
 # ---------------------------------------------------------------- проверки
 Step 'проверки'
 # Скрипт исполняет код из дерева (сборка, тесты, установщик) и подписывает результат ключом выпуска:
-# запись в дерево для обычных пользователей — это подмена выпуска без прав выпускающего.
-$writableGrants = @(Get-WritableTreeGrants $root)
-if ($writableGrants.Count) {
-    $grantList = ($writableGrants | ForEach-Object {
-        "  $($_.Name) ($($_.Sid)): $($_.Rights)$(if ($_.Inherited) { ', унаследовано' } else { ', задано явно' })"
+# запись в дерево для обычных пользователей — это подмена выпуска без прав выпускающего. То же — запись
+# в каталог git: подложенный hook или core.fsmonitor исполнится при первой же команде git с вашими правами.
+$checkedPaths = @(@($root) + @(Get-GitControlPaths $root) | Select-Object -Unique)
+$writable = @(foreach ($path in $checkedPaths) {
+    $grants = @(Get-WritableTreeGrants $path)
+    if ($grants.Count) { [pscustomobject]@{ Path = $path; Grants = $grants } }
+})
+if ($writable.Count) {
+    $grantList = ($writable | ForEach-Object {
+        "  $($_.Path):"
+        $_.Grants | ForEach-Object { "    $($_.Name) ($($_.Sid)): $($_.Rights)$(if ($_.Inherited) { ', унаследовано' } else { ', задано явно' })" }
     }) -join "`n"
     $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $fix = "icacls `"$root`" /inheritance:r /grant:r `"*${userSid}:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`" `"*S-1-5-32-544:(OI)(CI)F`""
-    $explicitSids = @($writableGrants | Where-Object { -not $_.Inherited } | ForEach-Object Sid | Sort-Object -Unique)
-    foreach ($sid in $explicitSids) { $fix += "`nicacls `"$root`" /remove:g *$sid" }
+    $fix = ($writable | ForEach-Object {
+        $target = $_.Path
+        $inherit = if (Test-Path -LiteralPath $target -PathType Container) { '(OI)(CI)' } else { '' }
+        "icacls `"$target`" /inheritance:r /grant:r `"*${userSid}:${inherit}F`" `"*S-1-5-18:${inherit}F`" `"*S-1-5-32-544:${inherit}F`""
+        foreach ($sid in @($_.Grants | Where-Object { -not $_.Inherited } | ForEach-Object Sid | Sort-Object -Unique)) { "icacls `"$target`" /remove:g *$sid" }
+    }) -join "`n"
     if (-not $AllowWritableTree) {
-        throw "Корень репозитория $root доступен на запись обычным пользователям:`n$grantList`nЛюбой из них может подменить скрипт или исходник, который исполнится с вашими правами и попадёт в подписанный выпуск. Оставьте доступ только себе, SYSTEM и Администраторам (из консоли администратора):`n$fix`nОсознанно выпустить из такого дерева: -AllowWritableTree."
+        throw "Корень репозитория или каталог git доступны на запись обычным пользователям:`n$grantList`nЛюбой из них может подменить скрипт, исходник, hook или настройку git (core.fsmonitor, core.hooksPath), которые исполнятся с вашими правами и попадут в подписанный выпуск. В git worktree каталог git лежит в основной копии репозитория. Оставьте доступ только себе, SYSTEM и Администраторам (из консоли администратора):`n$fix`nОсознанно выпустить из такого дерева: -AllowWritableTree."
     }
-    Write-Warning "Корень репозитория доступен на запись обычным пользователям (-AllowWritableTree):`n$grantList"
+    Write-Warning "Корень репозитория или каталог git доступны на запись обычным пользователям (-AllowWritableTree):`n$grantList"
 }
 
 $declared = ([xml](Get-Content (Join-Path $root 'Directory.Build.props'))).Project.PropertyGroup.Version

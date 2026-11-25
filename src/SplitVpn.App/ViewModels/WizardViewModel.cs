@@ -35,6 +35,16 @@ public sealed partial class WizardViewModel : ObservableObject
     /// <summary>«Готово» отправило службе ConnectRequest: намерение «подключено» и защита уже у службы.</summary>
     private bool _connectSent;
 
+    /// <summary>Снимок настроек сделан (при первом сохранении профиля мастером).</summary>
+    private bool _settingsCaptured;
+
+    /// <summary>
+    /// Настройки до первого сохранения профиля мастером, если в них были другие включённые подключения; иначе null.
+    /// Мастер делает новое подключение опорным, понижает прежнее опорное и забирает «Остальной интернет»: после
+    /// неудачи «Отмена» возвращает этот снимок (новое подключение остаётся выключенным), а не рвёт все туннели.
+    /// </summary>
+    private AppSettings? _settingsBefore;
+
     /// <param name="main">Главная модель.</param>
     /// <param name="loadAdapters">Запросить адаптеры у службы; самопроверка разметки обходится без службы.</param>
     public WizardViewModel(MainViewModel main, bool loadAdapters = true)
@@ -193,14 +203,45 @@ public sealed partial class WizardViewModel : ObservableObject
 
     /// <summary>
     /// «Отмена». Если «Готово» уже отправило службе подключение, а оно не удалось, служба держит намерение
-    /// «подключено» и защиту — трафик заблокирован. Тогда VPN отключается со снятием защиты; профиль остаётся,
-    /// его можно исправить в «Подключениях». Пока отключение не прошло, мастер не закрывается.
+    /// «подключено» и защиту — трафик заблокирован. Были до мастера другие включённые подключения — возвращаются
+    /// прежние настройки (роли, «Остальной интернет», RU-база), новое подключение остаётся в них выключенным, и
+    /// работающие туннели не рвутся: глобальное отключение разорвало бы и их. Других подключений не было — VPN
+    /// отключается со снятием защиты. Профиль в обоих случаях остаётся, его можно исправить в «Подключениях».
+    /// Пока возврат или отключение не прошли, мастер не закрывается.
     /// </summary>
     [RelayCommand]
     private async Task CancelAsync()
     {
         Password = "";
         Security.ClearSecrets();
+        if (_connectSent && _settingsBefore is { } before)
+        {
+            IsBusy = true;
+            Progress = "Возврат прежних настроек подключений…";
+            try
+            {
+                var fresh = await _main.Service.RequestAsync<AppSettings>(new GetSettingsRequest());
+                var added = fresh.Profiles.FirstOrDefault(p => p.Id == _profileId) is { } profile
+                    && before.Profiles.All(p => p.Id != _profileId) ? new[] { profile with { Role = ProfileRole.Off } } : [];
+                // Ревизия свежих настроек: если их успели изменить в другом месте, служба откажет, и «Отмена» повторится.
+                await _main.Service.CommandAsync(new SaveSettingsRequest(before with { Profiles = [.. before.Profiles, .. added] }, SettingsSerializer.Revision(fresh)));
+                _connectSent = false;
+            }
+            catch (Exception ex) when (ex is ServiceUnavailableException or Services.ServiceCommandException)
+            {
+                Error = "Не удалось вернуть прежние настройки подключений: " + ex.Message
+                    + " Повторите «Отмена» или верните роли подключений в «Подключениях».";
+                return;
+            }
+            finally
+            {
+                IsBusy = false;
+            }
+
+            _main.CloseWizard(dismissForever: false);
+            return;
+        }
+
         if (_connectSent)
         {
             IsBusy = true;
@@ -262,10 +303,14 @@ public sealed partial class WizardViewModel : ObservableObject
 
     private const string NameTaken = "Название уже занято. Укажите другое название подключения.";
 
+    /// <summary>Названия сравниваются как в проверке настроек службы: без пробелов по краям и без учёта регистра.</summary>
     private static bool IsNameTaken(AppSettings settings, Guid profileId, string name) =>
-        settings.Profiles.Any(p => p.Id != profileId && string.Equals(p.Name, name.Trim(), StringComparison.OrdinalIgnoreCase));
+        settings.Profiles.Any(p => p.Id != profileId && string.Equals(p.Name.Trim(), name.Trim(), StringComparison.OrdinalIgnoreCase));
 
-    /// <summary>Проверка названия на шаге «Сервер и вход»: null — название свободно.</summary>
+    /// <summary>
+    /// Проверка названия на шаге «Сервер и вход»: null — название свободно или служба сейчас недоступна (окончательная
+    /// проверка — при сохранении профиля, недоступная служба не должна запирать мастер на первом шаге).
+    /// </summary>
     private async Task<string?> NameProblemAsync()
     {
         IsBusy = true;
@@ -274,7 +319,11 @@ public sealed partial class WizardViewModel : ObservableObject
             var settings = await _main.Service.RequestAsync<AppSettings>(new GetSettingsRequest());
             return IsNameTaken(settings, _profileId, Name) ? NameTaken : null;
         }
-        catch (Exception ex) when (ex is ServiceUnavailableException or Services.ServiceCommandException)
+        catch (ServiceUnavailableException)
+        {
+            return null;
+        }
+        catch (Services.ServiceCommandException ex)
         {
             return ex.Message;
         }
@@ -344,7 +393,9 @@ public sealed partial class WizardViewModel : ObservableObject
                         _acceptedProfile = null;
                     }
                     Error = $"Подключение не завершено: {StatusText.StateName(status?.State ?? ConnectionState.Error)}. {status?.ErrorText} "
-                        + "Исправьте данные и нажмите «Далее» — или «Отмена»: VPN отключится, защита снимется, подключение останется в «Подключениях».";
+                        + (_settingsBefore is null
+                            ? "Исправьте данные и нажмите «Далее» — или «Отмена»: VPN отключится, защита снимется, подключение останется в «Подключениях»."
+                            : "Исправьте данные и нажмите «Далее» — или «Отмена»: вернутся прежние настройки подключений, работающие подключения не разорвутся, а новое останется выключенным в «Подключениях».");
                     Step = 0;
                     return;
                 }
@@ -400,6 +451,13 @@ public sealed partial class WizardViewModel : ObservableObject
             Step = 0;
             return false;
         }
+        if (!_settingsCaptured)
+        {
+            // Снимок — до первого сохранения: повторное «Готово» видит настройки уже с новым подключением опорным.
+            _settingsCaptured = true;
+            _settingsBefore = settings.Profiles.Any(p => p.Id != _profileId && p.Role != ProfileRole.Off) ? settings : null;
+        }
+
         var updated = ConnectionEdits.SaveProfile(settings, profile) with
         {
             DefaultTarget = RouteTarget.Tunnel(profile.Id),

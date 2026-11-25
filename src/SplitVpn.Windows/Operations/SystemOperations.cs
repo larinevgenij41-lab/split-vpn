@@ -315,8 +315,8 @@ public sealed class SystemDnsOps : IDnsOps
     public InterfaceDnsBackup Capture(Guid interfaceGuid, InterfaceDnsBackup? previous) =>
         InterfaceDnsOps.Capture(interfaceGuid, previous, DateTimeOffset.UtcNow, SystemDnsProxy.ListensIpv6Loopback);
 
-    public void ApplyLoopback(Guid interfaceGuid, string? originalV6 = null, string? nameServerV4 = null) =>
-        InterfaceDnsOps.ApplyLoopback(interfaceGuid, SystemDnsProxy.ListensIpv6Loopback, originalV6, nameServerV4);
+    public void ApplyLoopback(Guid interfaceGuid, string? originalV6 = null, string? nameServerV4 = null, bool ipv6Known = true) =>
+        InterfaceDnsOps.ApplyLoopback(interfaceGuid, SystemDnsProxy.ListensIpv6Loopback, originalV6, nameServerV4, ipv6Known);
 
     /// <summary>
     /// Без слушателя на [::1]:53 сверяется только наш устаревший ::1 (исходный IPv6-список известен и не

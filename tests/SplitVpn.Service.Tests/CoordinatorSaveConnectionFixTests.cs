@@ -33,6 +33,46 @@ public sealed partial class CoordinatorTests
         _world.Ras.HangUpFailure = null;
     }
 
+    private static Dictionary<string, System.Text.Json.JsonElement> ForgedSection() => new()
+    {
+        [UnknownSettingValues.PreservedKey] = System.Text.Json.JsonDocument.Parse("""{"role":"Primary","authMethod":"Pap"}""").RootElement.Clone(),
+    };
+
+    /// <summary>
+    /// Клиент подложил раздел исходных значений: служба его снимает, подключение проходит полную проверку,
+    /// а в файл не попадают ни опорная роль, ни PAP.
+    /// </summary>
+    [Fact]
+    public async Task SaveSettings_ForgedPreservedSection_IsDroppedAndNotWritten()
+    {
+        var coordinator = await StartAsync();
+        var forged = new ConnectionProfile { Name = "Чужое", Server = "203.0.113.30:4443", UserName = "u", Extra = ForgedSection() };
+        var changed = coordinator.Settings with { Profiles = [.. coordinator.Settings.Profiles, forged] };
+
+        var response = await coordinator.HandleRequestAsync(new SaveSettingsRequest(changed), CancellationToken.None);
+
+        Assert.True(response.Ok, response.ErrorMessage);
+        Assert.False(UnknownSettingValues.HasPreservedValues(coordinator.Settings.Profile(forged.Id)));
+        var stored = new ServiceStores(_world.Paths).LoadSettings(out _).Profile(forged.Id)!;
+        Assert.Equal(ProfileRole.Off, stored.Role);
+        Assert.Equal(AuthMethod.MsChapV2, stored.AuthMethod);
+        Assert.Equal(ProfileRole.Primary, coordinator.Settings.Profile(_profile.Id)!.Role);
+    }
+
+    /// <summary>Подложенный раздел не даёт пропустить проверку: подключение без адреса сервера отклоняется.</summary>
+    [Fact]
+    public async Task SaveSettings_ForgedPreservedSection_DoesNotSkipValidation()
+    {
+        var coordinator = await StartAsync();
+        var forged = new ConnectionProfile { Name = "Чужое", Server = "", UserName = "u", Extra = ForgedSection() };
+
+        var response = await coordinator.HandleRequestAsync(
+            new SaveSettingsRequest(coordinator.Settings with { Profiles = [.. coordinator.Settings.Profiles, forged] }), CancellationToken.None);
+
+        Assert.False(response.Ok);
+        Assert.Null(coordinator.Settings.Profile(forged.Id));
+    }
+
     /// <summary>Пароль записан, но сейчас не расшифровывается: без копии он не удаляется, настройки не меняются.</summary>
     [Fact]
     public async Task SaveSettings_UnreadableStoredPassword_IsNotDeletedWithoutBackup()

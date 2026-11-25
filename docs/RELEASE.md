@@ -16,8 +16,8 @@ scripts\publish-release.ps1 -NotesFile docs\notes-0.8.0.md
 
 Что делает скрипт:
 
-1. **Проверки.** Корень репозитория не доступен на запись Everyone, Authenticated Users и Users
-   (см. [ниже](#права-на-рабочее-дерево)). Версия совпадает с `Directory.Build.props`, рабочее дерево чистое, тега ещё нет,
+1. **Проверки.** Корень репозитория и каталог git (в git worktree — общий каталог основной копии) не доступны
+   на запись Everyone, Authenticated Users и Users (см. [ниже](#права-на-рабочее-дерево)). Версия совпадает с `Directory.Build.props`, рабочее дерево чистое, тега ещё нет,
    `gh` авторизован, файл заметок и ключ подписи на месте. Файл вне git среди входов сборки (`src\`,
    `tests\`, `installer\`, `Directory.*`, `global.json`, `nuget.config`) — ошибка выпуска, в том числе
    скрытый `.gitignore` (`*.csproj.user`, `*.dll`): он попал бы в MSI, но не в снимок исходников. Каталоги
@@ -68,6 +68,13 @@ icacls D:\VPN /inheritance:r /grant:r "*<SID>:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "
 ```
 
 Правило, заданное на корне явно (не унаследованное), снимается отдельно: `icacls D:\VPN /remove:g *S-1-5-11`.
+
+Проверяется не только корень рабочего дерева, но и каталог git: `git rev-parse --git-common-dir` и
+`--git-dir` (с их `hooks`, `config`, `config.worktree`) и каталог `core.hooksPath`, если он задан. Git
+исполняет оттуда код при каждой команде — hooks, `core.fsmonitor`, `core.hooksPath`. В **git worktree**
+(например, `D:\VPN\.claude\worktrees\<имя>`) общий каталог git лежит вне рабочего дерева — в основной
+копии (`D:\VPN\.git`), — и закрыть права на одном каталоге worktree мало. `publish-release.ps1` печатает
+команды `icacls` для каждого проблемного пути; для файла (`config`) — без `(OI)(CI)`.
 
 ## Ключ подписи выпусков
 

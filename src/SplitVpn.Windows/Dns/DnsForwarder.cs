@@ -28,10 +28,16 @@ public static class DnsForwarder
     /// <summary>
     /// Окончательный ответ первого сервера пути или null — «ответа нет». Окончательный ответ — любой полный
     /// (без бита TC) ответ, кроме SERVFAIL (2) и REFUSED (5): NOERROR, NODATA и NXDOMAIN говорят об имени и
-    /// возвращаются сразу. SERVFAIL и REFUSED — отказ сервера, а не ответ об имени: пробуется следующий сервер, а
-    /// если отказали все, возвращается null, и посредник отдаёт просроченный ответ из кеша или строит SERVFAIL сам.
-    /// Усечённый ответ UDP, который не удалось добрать по TCP, тоже не окончательный: адресов в нём нет, а
-    /// TCP-клиент посредника получил бы ответ с битом TC. Ответ с TC эта функция не возвращает никогда.
+    /// возвращаются сразу. На SERVFAIL, REFUSED и молчание пробуется следующий сервер. Когда серверы кончились:
+    /// <list type="bullet">
+    /// <item>все серверы пути ответили REFUSED — это и есть окончательный ответ (отказ корпоративного DNS или
+    /// фильтра — его решение об имени): возвращается REFUSED, и посредник не подменяет его просроченным ответом
+    /// из кеша, который обошёл бы свежую блокировку;</item>
+    /// <item>иначе, если был усечённый ответ UDP, который не удалось добрать по TCP, — он (как до разделения
+    /// «окончательных» ответов): UDP-клиент получит бит TC и повторит запрос по TCP, а TCP-клиенту посредник
+    /// вместо ответа с TC отдаёт SERVFAIL;</item>
+    /// <item>иначе (молчание, SERVFAIL) — null: посредник отдаёт просроченный ответ из кеша или строит SERVFAIL сам.</item>
+    /// </list>
     /// </summary>
     /// <param name="tcpOnly">
     /// Не пробовать UDP вовсе. Без этого запрос через путь без UDP ждал бы весь срок и кончался отказом:
@@ -46,6 +52,8 @@ public static class DnsForwarder
         ArgumentNullException.ThrowIfNull(query);
         ArgumentNullException.ThrowIfNull(upstreams);
         byte[]? fallback = null;
+        byte[]? refused = null;
+        var allRefused = upstreams.Count > 0;
         foreach (var upstream in upstreams)
         {
             var response = tcpOnly
@@ -57,26 +65,35 @@ public static class DnsForwarder
                 response = await TryTcpAsync(query, upstream, interfaceIndex, timeout, cancellationToken);
             }
 
-            if (response is null)
-            {
-                continue;
-            }
-
-            if (acceptServerFailure)
+            if (response is not null && acceptServerFailure)
             {
                 return response;
             }
 
             // Усечённый ответ по TCP (сервер так не отвечает, но байты из сети) и отказ сервера — не ответ об имени.
-            if (DnsMessage.IsTruncated(response) || DnsMessage.GetRcode(response) is 2 or 5)
+            if (response is null || DnsMessage.IsTruncated(response) || DnsMessage.GetRcode(response) is 2 or 5)
             {
+                if (response is not null && !DnsMessage.IsTruncated(response) && DnsMessage.GetRcode(response) == 5)
+                {
+                    refused ??= response;
+                }
+                else
+                {
+                    allRefused = false;
+                }
+
                 continue;
             }
 
             return response;
         }
 
-        return acceptServerFailure ? fallback : null;
+        if (acceptServerFailure)
+        {
+            return fallback;
+        }
+
+        return allRefused ? refused : fallback;
     }
 
     private static async Task<byte[]?> TryUdpAsync(byte[] query, IPEndPoint upstream, uint? interfaceIndex, TimeSpan timeout, CancellationToken cancellationToken)

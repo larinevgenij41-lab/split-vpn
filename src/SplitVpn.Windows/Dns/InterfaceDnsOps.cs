@@ -11,6 +11,11 @@ using Windows.Win32.NetworkManagement.IpHelper;
 namespace SplitVpn.Windows.Dns;
 
 /// <summary>Исходные DNS-настройки интерфейса до установки loopback.</summary>
+/// <param name="Ipv6Unknown">
+/// Исходный IPv6-список неизвестен: при снимке его чтение не удалось временно (не «IPv6 нет»), а прежней копии не было.
+/// Пока так, ::1 на адаптер не ставится и восстановление IPv6 не трогает; сверка повторяет чтение и дополняет копию.
+/// Копии прежних версий этого поля не имеют — для них IPv6-список известен.
+/// </param>
 public sealed record InterfaceDnsBackup(
     Guid InterfaceGuid,
     string NameServerV4,
@@ -18,7 +23,8 @@ public sealed record InterfaceDnsBackup(
     string ProfileNameServerV4,
     int DohServerPropertiesV4,
     DateTimeOffset SavedUtc,
-    string SearchList = "", string? AppliedSearchList = null);
+    string SearchList = "", string? AppliedSearchList = null,
+    bool Ipv6Unknown = false);
 
 public sealed record InterfaceDnsState(string NameServer, string ProfileNameServer, int DohServerProperties, string SearchList = "");
 
@@ -41,6 +47,8 @@ public static unsafe class InterfaceDnsOps
     private const uint Version1 = 1;
     private const uint Version3 = 3;
     private const uint ErrorFileNotFound = 2;
+    private const uint ErrorNotSupported = 50;
+    private const uint ErrorNotFound = 1168;
     private const ulong SettingIpv6 = 0x0001;
     private const ulong SettingNameServer = 0x0002;
     private const ulong SettingSearchList = 0x0004;
@@ -199,27 +207,43 @@ public static unsafe class InterfaceDnsOps
     /// Снимок с подменяемым чтением (для тестов). IPv6 читается устойчиво, как в <see cref="TryReadIpv6"/>, но без
     /// предупреждения в журнал: сверка снимает копию часто. Прежде здесь прощались лишь коды 2, 1168 и 50, и адаптер
     /// с отвязанным IPv6, отвечающий другим кодом (например, 87), ронял снимок: адаптер не переводился на посредник,
-    /// а сверка каждый раз была «неполной». Не прочиталось — IPv6-часть берётся из прежней копии или пустая.
+    /// а сверка каждый раз была «неполной». Не прочиталось — IPv6-часть берётся из прежней копии. Без прежней копии
+    /// пустой она считается только при кодах «IPv6 нет» (<see cref="IsIpv6Absent"/>); иной сбой (87, RPC 1722,
+    /// ERROR_NOT_READY) мог быть временным, и тогда IPv6-часть неизвестна (<see cref="InterfaceDnsBackup.Ipv6Unknown"/>):
+    /// записать в копию пусто значило бы при восстановлении затереть статический IPv6 DNS пользователя.
     /// </summary>
     internal static InterfaceDnsBackup Capture(Guid interfaceGuid, InterfaceDnsBackup? previous, DateTimeOffset now, bool ownsIpv6Loopback, Func<Guid, bool, InterfaceDnsState> read)
     {
         ArgumentNullException.ThrowIfNull(read);
         var v4 = read(interfaceGuid, false);
-        InterfaceDnsState? ipv6;
+        // Копия с неизвестной IPv6-частью прежнего IPv6-списка не знает: он читается так, будто копии нет.
+        var previousV6 = previous is { Ipv6Unknown: false } ? previous.NameServerV6 : null;
+        string v6;
+        var unknown = false;
         try
         {
-            ipv6 = read(interfaceGuid, true);
+            v6 = OriginalV6(read(interfaceGuid, true).NameServer, previousV6, ownsIpv6Loopback);
         }
-        catch (NativeCallException)
+        catch (NativeCallException ex)
         {
-            ipv6 = null;
+            v6 = previousV6 ?? "";
+            unknown = previousV6 is null && !IsIpv6Absent(ex.Code);
         }
 
-        var v6 = ipv6?.NameServer ?? previous?.NameServerV6 ?? "";
         var originalSearchList = previous?.AppliedSearchList is { } applied && string.Equals(v4.SearchList, applied, StringComparison.OrdinalIgnoreCase)
             ? previous.SearchList : v4.SearchList;
-        return new InterfaceDnsBackup(interfaceGuid, Original(v4.NameServer, previous?.NameServerV4), OriginalV6(v6, previous?.NameServerV6, ownsIpv6Loopback),
-            v4.ProfileNameServer, v4.DohServerProperties, now, originalSearchList, v4.SearchList);
+        return new InterfaceDnsBackup(interfaceGuid, Original(v4.NameServer, previous?.NameServerV4), v6,
+            v4.ProfileNameServer, v4.DohServerProperties, now, originalSearchList, v4.SearchList, unknown);
+    }
+
+    /// <summary>Код чтения IPv6-настроек означает «у адаптера IPv6 нет»: ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED.</summary>
+    internal static bool IsIpv6Absent(uint code) => code is ErrorFileNotFound or ErrorNotFound or ErrorNotSupported;
+
+    /// <summary>Исходный IPv6-список из копии; null — неизвестен (см. <see cref="InterfaceDnsBackup.Ipv6Unknown"/>).</summary>
+    public static string? KnownOriginalV6(InterfaceDnsBackup backup)
+    {
+        ArgumentNullException.ThrowIfNull(backup);
+        return backup.Ipv6Unknown ? null : backup.NameServerV6;
     }
 
     internal static string Original(string current, string? previous) =>
@@ -233,11 +257,18 @@ public static unsafe class InterfaceDnsOps
     /// отвечать чужой процесс. Без ::1 IPv6-список трогается, только если на нём наш ::1 от прежнего запуска
     /// (<see cref="IsStaleIpv6Loopback"/>): он возвращается к исходному <paramref name="originalV6"/>.
     /// Исходный неизвестен (null) — список не трогается: там может стоять собственный ::1 пользователя.
-    /// Адаптер без IPv6 пропускается.
+    /// Адаптер без IPv6 пропускается. <paramref name="ipv6Known"/> = false — исходный IPv6-список в копии неизвестен
+    /// (<see cref="InterfaceDnsBackup.Ipv6Unknown"/>): IPv6 не трогается вовсе, ::1 тоже не ставится — вернуть
+    /// исходный список потом было бы нечем.
     /// </summary>
-    public static void ApplyLoopback(Guid interfaceGuid, bool ipv6Loopback = true, string? originalV6 = null, string? nameServerV4 = null)
+    public static void ApplyLoopback(Guid interfaceGuid, bool ipv6Loopback = true, string? originalV6 = null, string? nameServerV4 = null, bool ipv6Known = true)
     {
         SetNameServer(interfaceGuid, nameServerV4 ?? LoopbackV4, ipv6: false);
+        if (!ipv6Known)
+        {
+            return;
+        }
+
         if (ipv6Loopback)
         {
             TrySetIpv6NameServer(interfaceGuid, LoopbackV6);
@@ -259,18 +290,62 @@ public static unsafe class InterfaceDnsOps
     /// <summary>
     /// Возвращает исходные серверы, только если на интерфейсе всё ещё наш loopback. IPv6 из копии
     /// возвращается и тогда, когда там сейчас пусто, а IPv4 — наш loopback: посредник без [::1]:53 IPv6 не
-    /// ставил, но прежний запуск мог снять ::1 пользователя.
+    /// ставил, но прежний запуск мог снять ::1 пользователя. Исходный IPv6-список в копии неизвестен
+    /// (<see cref="InterfaceDnsBackup.Ipv6Unknown"/>) — IPv6 не трогается: ::1 посредник тогда не ставил.
     /// </summary>
-    public static DnsRestoreOutcome Restore(Guid interfaceGuid, InterfaceDnsBackup? backup)
+    public static DnsRestoreOutcome Restore(Guid interfaceGuid, InterfaceDnsBackup? backup) =>
+        Restore(interfaceGuid, backup, Read, SetNameServer, SetSearchList);
+
+    /// <summary>Восстановление с подменяемыми чтением и записью (для тестов); см. <see cref="Restore(Guid, InterfaceDnsBackup?)"/>.</summary>
+    internal static DnsRestoreOutcome Restore(Guid interfaceGuid, InterfaceDnsBackup? backup, Func<Guid, bool, InterfaceDnsState> read,
+        Action<Guid, string, bool> setNameServer, Action<Guid, string> setSearchList)
     {
-        var v4 = Read(interfaceGuid, ipv6: false);
-        var v6 = TryReadIpv6(interfaceGuid);
+        ArgumentNullException.ThrowIfNull(read);
+        ArgumentNullException.ThrowIfNull(setNameServer);
+        ArgumentNullException.ThrowIfNull(setSearchList);
+        var v4 = read(interfaceGuid, false);
         if (backup is not null && ShouldRestoreSearchList(v4, backup))
         {
-            SetSearchList(interfaceGuid, backup.SearchList);
+            setSearchList(interfaceGuid, backup.SearchList);
         }
 
         var v4Ours = IsProxySet(v4.NameServer);
+        if (backup is { Ipv6Unknown: true })
+        {
+            if (!v4Ours)
+            {
+                return string.IsNullOrEmpty(v4.NameServer) ? DnsRestoreOutcome.NothingToRestore : DnsRestoreOutcome.ChangedByUser;
+            }
+
+            setNameServer(interfaceGuid, backup.NameServerV4, false);
+            return DnsRestoreOutcome.Restored;
+        }
+
+        InterfaceDnsState? v6;
+        try
+        {
+            v6 = read(interfaceGuid, true);
+        }
+        catch (NativeCallException ex)
+        {
+            WarnIpv6Once(interfaceGuid, ex);
+            v6 = null;
+        }
+
+        bool TrySetIpv6(string nameServers)
+        {
+            try
+            {
+                setNameServer(interfaceGuid, nameServers, true);
+                return true;
+            }
+            catch (NativeCallException ex)
+            {
+                WarnIpv6Once(interfaceGuid, ex);
+                return false;
+            }
+        }
+
         var v6Current = v6?.NameServer ?? "";
         if (!v4Ours && v6 is null && !string.IsNullOrEmpty(backup?.NameServerV6))
         {
@@ -285,7 +360,7 @@ public static unsafe class InterfaceDnsOps
 
         if (v4Ours)
         {
-            SetNameServer(interfaceGuid, backup?.NameServerV4 ?? "", ipv6: false);
+            setNameServer(interfaceGuid, backup?.NameServerV4 ?? "", false);
         }
 
         var v6Original = backup?.NameServerV6 ?? "";
@@ -298,7 +373,7 @@ public static unsafe class InterfaceDnsOps
 
         if (v6 is not null && (IsLoopback(v6Current) || (v4Ours && v6Current.Length == 0))
             && !string.Equals(v6Current, v6Original, StringComparison.OrdinalIgnoreCase)
-            && !TrySetIpv6NameServer(interfaceGuid, v6Original))
+            && !TrySetIpv6(v6Original))
         {
             // IPv6 у адаптера есть (прочитался), а запись не прошла: ::1 остался без посредника, и копия
             // с исходными серверами ещё нужна для повторной попытки.

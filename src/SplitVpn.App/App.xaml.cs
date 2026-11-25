@@ -78,6 +78,9 @@ public partial class App : Application
         var preferences = UiPreferences.Load();
         ThemeService.Apply(preferences.Theme);
 
+        // Обновление из другого каталога установки оставляет автозапуск на удалённый файл: путь переписывается.
+        Autostart.RepairStalePath();
+
         var connection = new ServiceConnection();
         _main = new MainViewModel(connection, preferences) { Confirm = ConfirmAsync };
         var window = new MainWindow { DataContext = _main };

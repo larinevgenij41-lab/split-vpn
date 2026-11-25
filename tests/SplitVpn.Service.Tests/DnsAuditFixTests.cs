@@ -188,11 +188,13 @@ public sealed class DnsAuditFixTests : IAsyncDisposable
 
         var response = await DnsForwarder.ForwardAsync(query, [_rule.EndPoint], null, TimeSpan.FromSeconds(2), CancellationToken.None);
 
-        // Чужой ответ по TCP отброшен. Усечённый ответ UDP без адресов окончательным не считается: «ответа нет»,
-        // и посредник возьмёт просроченный кеш или ответит SERVFAIL, а не отдаст клиенту TC.
+        // Чужой ответ по TCP отброшен: остаётся усечённый ответ UDP (с TC и без адресов). UDP-клиент посредника
+        // повторит запрос по TCP, TCP-клиенту посредник вместо него ответит SERVFAIL.
         if (foreignId)
         {
-            Assert.Null(response);
+            Assert.NotNull(response);
+            Assert.True(DnsMessage.IsTruncated(response));
+            Assert.Empty(DnsMessage.ReadAddresses(response));
             return;
         }
 

@@ -31,6 +31,33 @@ public class ConnectionEditsTests
         Assert.All(imported, p => Assert.Equal(RouteTarget.Tunnel(p.Id), p.AnyConnect.ServerNetworksTarget));
     }
 
+    /// <summary>Служебный раздел исходных значений из файла импорта и в файл экспорта не переносится; прочие неизвестные поля остаются.</summary>
+    [Fact]
+    public void ImportAndExport_DropPreservedSection()
+    {
+        using var section = System.Text.Json.JsonDocument.Parse("""{"role":"Primary","authMethod":"Pap"}""");
+        using var other = System.Text.Json.JsonDocument.Parse("true");
+        var input = Extra with
+        {
+            Extra = new Dictionary<string, System.Text.Json.JsonElement>
+            {
+                [UnknownSettingValues.PreservedKey] = section.RootElement.Clone(),
+                ["futureField"] = other.RootElement.Clone(),
+            },
+        };
+
+        var imported = Assert.Single(ConnectionEdits.PrepareImport([], [input]));
+        var exported = Assert.Single(ConnectionEdits.PrepareExport([input]));
+
+        foreach (var profile in new[] { imported, exported })
+        {
+            Assert.False(UnknownSettingValues.HasPreservedValues(profile));
+            Assert.True(profile.Extra!.ContainsKey("futureField"));
+        }
+
+        Assert.Equal(ProfileRole.Off, imported.Role);
+    }
+
     [Fact]
     public void ImportNormalizesNullSectionsAndFitsDuplicateNamesWithinLimit()
     {

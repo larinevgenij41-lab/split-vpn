@@ -42,6 +42,24 @@ public sealed class CliAuditNov24Tests : IDisposable
         Assert.Equal("set", new CliArgs(["--force", "set"]).Positional(0));
     }
 
+    /// <summary>
+    /// Ревизия после «settings set» — по отправленному, если прочитанное после записи с ним совпало; иначе (настройки
+    /// успел изменить другой клиент) файл ревизии удаляется, а не получает ревизию чужого состояния.
+    /// </summary>
+    [Fact]
+    public void RevisionFileFollowsWhatWasActuallySaved()
+    {
+        var file = Path.Combine(_directory, "settings.json");
+        File.WriteAllText(ServiceCommands.RevisionPath(file), "OLD");
+        var sent = new Core.Settings.AppSettings { AutoConnect = true };
+
+        Assert.True(ServiceCommands.UpdateRevisionFile(file, sent, sent with { }));
+        Assert.Equal(Core.Settings.SettingsSerializer.Revision(sent), File.ReadAllText(ServiceCommands.RevisionPath(file)));
+
+        Assert.False(ServiceCommands.UpdateRevisionFile(file, sent, sent with { AutoConnect = false }));
+        Assert.False(File.Exists(ServiceCommands.RevisionPath(file)));
+    }
+
     [Fact]
     public void PasswordFileIsDeletedOnlyAfterServiceAccepted()
     {

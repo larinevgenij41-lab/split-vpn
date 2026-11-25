@@ -21,6 +21,14 @@
 
 - Служба в ручном запуске (`sc config SplitVpn start= demand`) + перезагрузка: постоянные фильтры провайдера, чья служба не в автозапуске, BFE не загружает.
 - Удаление программы также возвращает сеть: до остановки службы установщик выполняет `SplitVpn.Service.exe recover --uninstall-network`. Данные (`%ProgramData%\SplitVpn`) и ключ `HKLM\Software\SplitVpn` эта команда не трогает: если сеть возвращена полностью, она оставляет в ключе отметку `PurgeData`, и данные удаляет отдельное действие установщика `PurgeData` уже после фиксации удаления. Отменённое или откаченное удаление поэтому возвращает программу с настройками и паролями, а при неполном восстановлении данные (с копией исходных DNS) остаются для повторного `recover`.
+- Если откат Windows Installer отключён — политикой `DisableRollback` (`HKLM\Software\Policies\Microsoft\Windows\Installer`, значение `DisableRollback` = 1) или свойством `DISABLEROLLBACK=1` в командной строке `msiexec`, — действия фиксации (`Execute="commit"`) Windows Installer не выполняет вовсе. Тогда `PurgeData` не запускается, и после удаления программы остаются её данные `%ProgramData%\SplitVpn` (настройки, сохранённые пароли под DPAPI компьютера, копия исходных DNS) и ключ `HKLM\Software\SplitVpn`. Сеть при этом уже возвращена (`recover --uninstall-network`). Удалить остатки вручную — из консоли администратора, после того как программа удалена:
+
+  ```powershell
+  Remove-Item -Recurse -Force "$env:ProgramData\SplitVpn"
+  Remove-Item -Recurse -Force 'HKLM:\Software\SplitVpn'
+  ```
+
+  Если в ключе нет отметки `PurgeData` (восстановление сети было неполным), сначала верните сеть (`recover-network.cmd` или переустановка и «Восстановить сеть»): в данных лежит копия исходных DNS адаптеров.
 - Сбой восстановления удаление не прерывает. Причина пишется новым файлом `%ProgramData%\SplitVpn.Uninstall\uninstall-<время UTC>-<guid>.log` (каталог только для SYSTEM и Administrators, переживает удаление; прежние журналы не перезаписываются).
 - `recover --uninstall` (сеть, затем сразу данные и ключ реестра) остался для скриптов разработки (`scripts\cleanup-dev.ps1`); установщик его больше не вызывает.
 

@@ -55,8 +55,10 @@ public interface IDnsOps
     /// у туннеля DNS целиком наш — пустая строка): по нему наш ::1, оставшийся от прежнего запуска, когда
     /// посредник занимал [::1]:53, отличается от ::1 пользователя и снимается. null — исходный неизвестен.
     /// <paramref name="nameServerV4"/> — IPv4-список (InterfaceDnsOps.ProxyNameServers); null — только 127.0.0.1.
+    /// <paramref name="ipv6Known"/> = false — исходный IPv6-список в копии неизвестен (InterfaceDnsBackup.Ipv6Unknown):
+    /// IPv6 не трогается, ::1 не ставится.
     /// </summary>
-    void ApplyLoopback(Guid interfaceGuid, string? originalV6 = null, string? nameServerV4 = null);
+    void ApplyLoopback(Guid interfaceGuid, string? originalV6 = null, string? nameServerV4 = null, bool ipv6Known = true);
 
     /// <summary>
     /// IPv6-список DNS адаптера соответствует посреднику: если посредник занял [::1]:53, там стоит ::1; если
