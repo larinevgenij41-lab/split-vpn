@@ -290,9 +290,9 @@ public sealed partial class CoordinatorTests
     public async Task AnyConnect_TruncatedSession_IsJournaledAndWarned()
     {
         var coordinator = await StartWithAnyConnectAsync();
-        await EstablishSessionAsync(coordinator, GatewaySession() with { Truncated = ["сети шлюза (split-include): взято 4096 из 70000"] });
+        await EstablishSessionAsync(coordinator, GatewaySession() with { Truncated = ["сети шлюза (split-include): взято 16384 из 70000"] });
 
-        Assert.Contains(_world.Journal.Since(0), e => e.Level == "Предупреждение" && e.Text.Contains("взято 4096 из 70000", StringComparison.Ordinal));
+        Assert.Contains(_world.Journal.Since(0), e => e.Level == "Предупреждение" && e.Text.Contains("взято 16384 из 70000", StringComparison.Ordinal));
         Assert.Contains(coordinator.BuildStatus().Warnings, w => w.Code == "gateway-session-truncated");
     }
 }

@@ -58,11 +58,69 @@ public sealed class GatewayDataLimitsTests
         Assert.Equal(HelperLimits.MaxSessionText, capped.Domain!.Length);
         Assert.Null(capped.ProxyPac);
         Assert.Equal(5, capped.Truncated.Count);
-        Assert.Contains(capped.Truncated, t => t.Contains("взято 4096 из 70000", StringComparison.Ordinal));
+        Assert.Contains(capped.Truncated, t => t.Contains("взято 16384 из 70000", StringComparison.Ordinal));
         Assert.True(JsonSize(capped) < FrameCodec.MaxFrameBytes);
 
         var again = capped.Capped();
         Assert.Same(capped, again);
+    }
+
+    /// <summary>
+    /// Худший случай после урезания: полные таблицы split-include и split-exclude записями наибольшей длины, все
+    /// остальные поля на пределе и в символах, которые JSON экранирует, — событие всё равно меньше кадра канала.
+    /// </summary>
+    [Fact]
+    public void Capped_WorstCaseSession_FitsFrame()
+    {
+        const string longest = "255.255.255.255/255.255.255.255";
+        Assert.Equal(HelperLimits.MaxRouteLength, longest.Length);
+        Assert.Equal(GatewayNetworkLimits.MaxRoutes, HelperLimits.MaxSplitRoutes);
+        var escaped = new string('я', HelperLimits.MaxSessionText);
+        var session = new SessionInfo
+        {
+            Address = "255.255.255.255",
+            Netmask = "255.255.255.255",
+            Dns = Enumerable.Repeat("255.255.255.255", 100).ToList(),
+            SplitIncludes = Enumerable.Repeat(longest, HelperLimits.MaxSplitRoutes + 10).ToList(),
+            SplitExcludes = Enumerable.Repeat(longest, HelperLimits.MaxSplitRoutes + 10).ToList(),
+            SplitDns = Enumerable.Repeat(new string('я', HelperLimits.MaxDnsNameLength), 100).ToList(),
+            Domain = escaped + "x",
+            ProxyPac = escaped,
+            Truncated = Enumerable.Repeat(escaped[..200], 8).ToList(),
+        };
+
+        var capped = session.Capped();
+        var size = JsonSize(capped);
+
+        Assert.Equal(HelperLimits.MaxSplitRoutes, capped.SplitIncludes.Count);
+        Assert.Equal(HelperLimits.MaxSplitRoutes, capped.SplitExcludes.Count);
+        Assert.True(size < FrameCodec.MaxFrameBytes, $"{size} байт");
+    }
+
+    /// <summary>Шлюз, присылавший 16384 сетей (предел службы после свёртки), не урезается.</summary>
+    [Fact]
+    public void Capped_FullRouteTableOfWorkingGateway_IsKept()
+    {
+        var includes = Enumerable.Range(0, GatewayNetworkLimits.MaxRoutes).Select(i => $"10.{i / 256 % 256}.{i % 256}.0/255.255.255.0").ToList();
+        var session = new SessionInfo { Address = "10.0.7.190", SplitIncludes = includes, SplitExcludes = includes };
+
+        Assert.Same(session, session.Capped());
+    }
+
+    /// <summary>
+    /// Запись не из цифр, точек и косой черты (её JSON экранировал бы) отбрасывается с отметкой; сеть IPv6 — молча:
+    /// туннель только IPv4.
+    /// </summary>
+    [Fact]
+    public void Capped_DropsNonRouteEntries_AndIpv6Silently()
+    {
+        var ipv6Only = new SessionInfo { SplitIncludes = ["10.0.0.0/255.0.0.0", "fd00::/64"] }.Capped();
+        Assert.Equal(["10.0.0.0/255.0.0.0"], ipv6Only.SplitIncludes);
+        Assert.Empty(ipv6Only.Truncated);
+
+        var garbage = new SessionInfo { SplitIncludes = ["10.0.0.0/8", "яяя", "10.0.0.0/8 x"] }.Capped();
+        Assert.Equal(["10.0.0.0/8"], garbage.SplitIncludes);
+        Assert.Contains(garbage.Truncated, t => t.Contains("неверного вида или длины 2", StringComparison.Ordinal));
     }
 
     [Fact]

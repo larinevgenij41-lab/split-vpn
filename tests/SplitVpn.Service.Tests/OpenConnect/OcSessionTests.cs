@@ -878,7 +878,7 @@ public sealed class OcSessionTests
         Assert.Equal(HelperLimits.MaxSplitDns, established.Session.SplitDns.Count);
         Assert.Equal(2, established.Session.Truncated.Count);
         Assert.True(HelperContract.Serialize(established).Length < FrameCodec.MaxFrameBytes);
-        Assert.Contains(world.Output.All.OfType<LogEvent>(), e => e.Text.Contains("взято 4096 из 70000", StringComparison.Ordinal));
+        Assert.Contains(world.Output.All.OfType<LogEvent>(), e => e.Text.Contains("взято 16384 из 70000", StringComparison.Ordinal));
     }
 
     /// <summary>Адрес SSO длиннее предела не отправляется службе: вход завершается с понятной причиной.</summary>

@@ -48,14 +48,21 @@ public static class HelperContract
 /// </summary>
 public static class HelperLimits
 {
-    /// <summary>Сетей split-include и, отдельно, split-exclude.</summary>
-    public const int MaxSplitRoutes = 4096;
+    /// <summary>
+    /// Сетей split-include и, отдельно, split-exclude: столько же, сколько служба принимает после свёртки
+    /// (<see cref="Policy.GatewayNetworkLimits.MaxRoutes"/>), — шлюз, работавший раньше, не урезается. Две полные
+    /// таблицы записей наибольшей длины (<see cref="MaxRouteLength"/>, без экранирования) занимают около 1,1 МБ.
+    /// </summary>
+    public const int MaxSplitRoutes = Policy.GatewayNetworkLimits.MaxRoutes;
 
     /// <summary>Суффиксов split DNS (и DNS-серверов).</summary>
     public const int MaxSplitDns = 64;
 
-    /// <summary>Длина записи сети или адреса: «255.255.255.255/255.255.255.255» короче.</summary>
-    public const int MaxRouteLength = 64;
+    /// <summary>
+    /// Длина записи сети или адреса: ровно «255.255.255.255/255.255.255.255». Длиннее запись не разберётся, а
+    /// при 64 символах две таблицы по <see cref="MaxSplitRoutes"/> записей уже не влезли бы в кадр 2 МБ.
+    /// </summary>
+    public const int MaxRouteLength = 31;
 
     /// <summary>Длина имени DNS.</summary>
     public const int MaxDnsNameLength = 255;
@@ -399,10 +406,10 @@ public sealed record SessionInfo
     public SessionInfo Capped()
     {
         var truncated = new List<string>(Truncated ?? []);
-        var includes = CapList(SplitIncludes, HelperLimits.MaxSplitRoutes, HelperLimits.MaxRouteLength, "сети шлюза (split-include)", truncated);
-        var excludes = CapList(SplitExcludes, HelperLimits.MaxSplitRoutes, HelperLimits.MaxRouteLength, "исключения шлюза (split-exclude)", truncated);
+        var includes = CapList(SplitIncludes, HelperLimits.MaxSplitRoutes, HelperLimits.MaxRouteLength, "сети шлюза (split-include)", truncated, routeChars: true);
+        var excludes = CapList(SplitExcludes, HelperLimits.MaxSplitRoutes, HelperLimits.MaxRouteLength, "исключения шлюза (split-exclude)", truncated, routeChars: true);
         var splitDns = CapList(SplitDns, HelperLimits.MaxSplitDns, HelperLimits.MaxDnsNameLength, "суффиксы split DNS", truncated);
-        var dns = CapList(Dns, HelperLimits.MaxSplitDns, HelperLimits.MaxRouteLength, "DNS-серверы шлюза", truncated);
+        var dns = CapList(Dns, HelperLimits.MaxSplitDns, HelperLimits.MaxRouteLength, "DNS-серверы шлюза", truncated, routeChars: true);
         var domain = CapText(Domain, HelperLimits.MaxSessionText, "домен по умолчанию", truncated);
         var pac = ProxyPac is { Length: > HelperLimits.MaxSessionText } ? null : ProxyPac;
         if (!ReferenceEquals(pac, ProxyPac))
@@ -435,16 +442,20 @@ public sealed record SessionInfo
         };
     }
 
-    private static IReadOnlyList<string> CapList(IReadOnlyList<string>? list, int maxCount, int maxLength, string what, List<string> truncated)
+    private static IReadOnlyList<string> CapList(IReadOnlyList<string>? list, int maxCount, int maxLength, string what, List<string> truncated, bool routeChars = false)
     {
         list ??= [];
-        var tooLong = list.Count(item => item is null || item.Length > maxLength);
-        if (list.Count <= maxCount && tooLong == 0)
+        bool Valid(string? item) => item is not null && item.Length <= maxLength && (!routeChars || IsRouteText(item));
+
+        // Сети IPv6 служба не использует (туннель только IPv4): они отбрасываются молча, без отметки об урезании.
+        bool Ipv6(string? item) => routeChars && item is not null && item.Contains(':', StringComparison.Ordinal);
+        var tooLong = list.Count(item => !Valid(item) && !Ipv6(item));
+        if (list.Count <= maxCount && list.All(Valid))
         {
             return list;
         }
 
-        var kept = list.Where(item => item is not null && item.Length <= maxLength).ToList();
+        var kept = list.Where(Valid).ToList();
         if (kept.Count > maxCount)
         {
             truncated.Add(string.Create(CultureInfo.InvariantCulture, $"{what}: взято {maxCount} из {kept.Count}"));
@@ -453,10 +464,28 @@ public sealed record SessionInfo
 
         if (tooLong > 0)
         {
-            truncated.Add(string.Create(CultureInfo.InvariantCulture, $"{what}: отброшено слишком длинных записей {tooLong}"));
+            truncated.Add(string.Create(CultureInfo.InvariantCulture, $"{what}: отброшено записей неверного вида или длины {tooLong}"));
         }
 
         return kept;
+    }
+
+    /// <summary>
+    /// Запись сети или адреса из одних цифр, точек и косой черты. Такие символы JSON не экранирует, и предел
+    /// <see cref="HelperLimits.MaxSplitRoutes"/> записей по <see cref="HelperLimits.MaxRouteLength"/> символов
+    /// гарантированно укладывается в кадр канала; иная запись всё равно не разобралась бы как маршрут.
+    /// </summary>
+    private static bool IsRouteText(string item)
+    {
+        foreach (var c in item)
+        {
+            if (c is not (>= '0' and <= '9' or '.' or '/'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static string? CapText(string? text, int maxLength, string what, List<string>? truncated)
