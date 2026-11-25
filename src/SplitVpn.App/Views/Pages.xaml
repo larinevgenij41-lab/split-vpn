@@ -1009,7 +1009,7 @@
             <ui:Card Style="{StaticResource PageCard}">
                 <StackPanel>
                     <TextBlock Style="{StaticResource Body}" FontWeight="SemiBold" Text="Доверенные адаптеры" />
-                    <TextBlock Style="{StaticResource Hint}" Text="Защита пропускает весь трафик отмеченного адаптера, кроме DNS и ваших блокировок; основным он не выбирается. Распознанные виртуальные сети доверены и без отметки, пока включён переключатель выше." />
+                    <TextBlock Style="{StaticResource Hint}" Text="Через отмеченный адаптер защита пропускает только его собственные сети и маршруты (не шире /8). Остальной интернет через него не идёт, DNS и ваши блокировки действуют; основным он не выбирается. Распознанные виртуальные сети доверены и без отметки, пока включён переключатель выше, — но только в частных адресах и адресах своего поставщика." />
                     <ItemsControl ItemsSource="{Binding Adapters}" Margin="0,8,0,0">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate DataType="{x:Type vm:TrustedAdapterItem}">
