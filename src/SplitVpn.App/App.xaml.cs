@@ -158,7 +158,14 @@ public partial class App : Application
     /// Выход по команде пользователя (меню трея): несохранённые черновики подключений, доска, «Защита» и «Настройки»
     /// молча не теряются — сначала подтверждение. Завершение сеанса Windows и установщик закрывают сразу.
     /// </summary>
-    public async Task RequestExitAsync()
+    /// <remarks>Повторный выход из трея, пока открыт вопрос, второй диалог не открывает: возвращается тот же запрос.</remarks>
+    public Task RequestExitAsync() =>
+        _exitRequest is { IsCompleted: false } pending ? pending : _exitRequest = RunExitRequestAsync();
+
+    /// <summary>Последний запрос выхода; пока он не завершён (открыт вопрос о несохранённом), повтор к нему присоединяется.</summary>
+    private Task? _exitRequest;
+
+    private async Task RunExitRequestAsync()
     {
         if (_main is null || await _main.ConfirmDiscardUnsavedAsync())
         {
@@ -202,6 +209,12 @@ public partial class App : Application
 
         return ErrorLog.Record(exception);
     }
+
+    /// <summary>
+    /// Ошибка, которую окно уже обработало и показало пользователю, — в постоянный журнал ошибок интерфейса
+    /// (подробный журнал по умолчанию выключен). Лавина здесь не завершает приложение: окно продолжает работать.
+    /// </summary>
+    public static void RecordHandled(Exception exception) => _ = ErrorLog.Record(exception);
 
     /// <summary>Диалог подтверждения поверх главного окна (или без владельца, если окно скрыто в трее).</summary>
     private async Task<bool> ConfirmAsync(string title, string text, string action)

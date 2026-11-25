@@ -180,20 +180,58 @@ public static class LiveRegion
 
 /// <summary>
 /// Запрос фокуса из модели представления: при каждой смене привязанного счётчика элемент получает фокус и
-/// прокручивается в видимую область. Первое значение привязки запросом не считается.
+/// прокручивается в видимую область. Первое значение привязки запросом считается, только если счётчик уже
+/// сдвинут с нуля и этот же счётчик модели ещё не обслужен: так не теряется запрос, сделанный до создания элемента
+/// (щелчок по уведомлению «нужен пароль», когда окно ещё ни разу не показывалось), а пересозданный элемент
+/// не забирает фокус по давнему запросу.
 /// </summary>
 public static class FocusRequest
 {
     public static readonly DependencyProperty TokenProperty = DependencyProperty.RegisterAttached(
         "Token", typeof(object), typeof(FocusRequest), new PropertyMetadata(null, OnTokenChanged));
 
+    /// <summary>Последнее обслуженное значение счётчика для каждой модели и свойства.</summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, Dictionary<string, object?>> Handled = new();
+
     public static object? GetToken(DependencyObject element) => element.GetValue(TokenProperty);
 
     public static void SetToken(DependencyObject element, object? value) => element.SetValue(TokenProperty, value);
 
+    /// <summary>
+    /// Первое значение привязки — запрос? Нулевой или пустой счётчик — нет; иначе — если для той же модели и свойства
+    /// это значение ещё не обслуживалось. Источник привязки неизвестен — как раньше, не запрос.
+    /// </summary>
+    internal static bool IsPendingRequest(object? source, string? property, object? value)
+    {
+        if (value is null or 0 || source is null || property is null)
+        {
+            return false;
+        }
+
+        return !Handled.TryGetValue(source, out var seen) || !seen.TryGetValue(property, out var last) || !Equals(last, value);
+    }
+
+    internal static void Remember(object? source, string? property, object? value)
+    {
+        if (source is not null && property is not null)
+        {
+            Handled.GetOrCreateValue(source)[property] = value;
+        }
+    }
+
     private static void OnTokenChanged(DependencyObject element, DependencyPropertyChangedEventArgs e)
     {
-        if (element is not UIElement ui || e.OldValue is null || Equals(e.OldValue, e.NewValue))
+        if (element is not UIElement ui || Equals(e.OldValue, e.NewValue))
+        {
+            return;
+        }
+
+        var binding = System.Windows.Data.BindingOperations.GetBindingExpression(element, TokenProperty);
+        var source = binding?.ResolvedSource;
+        var property = binding?.ResolvedSourcePropertyName;
+        var request = e.OldValue is not null || IsPendingRequest(source, property, e.NewValue);
+        Remember(source, property, e.NewValue);
+        if (!request)
         {
             return;
         }

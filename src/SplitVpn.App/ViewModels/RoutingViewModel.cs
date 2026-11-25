@@ -177,6 +177,27 @@ public sealed partial class RoutingViewModel : PageViewModel
 
     private bool CanReload => _saving == 0;
 
+    /// <summary>
+    /// Кнопка «Отменить изменения» доступна при правках и, без них, пока доска ни разу не загружена: если при открытии
+    /// служба не отвечала, это единственный способ перечитать доску вручную.
+    /// </summary>
+    public bool CanReloadBoard => Dirty || !_loaded;
+
+    /// <summary>Хотя бы одна загрузка доски уже начиналась (страницу открывали).</summary>
+    private bool _loadAttempted;
+
+    /// <summary>Последнее обновление состояния — без службы (или ещё не приходило).</summary>
+    private bool _serviceWasMissing = true;
+
+    protected override void OnPropertyChanged(System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        base.OnPropertyChanged(e);
+        if (e.PropertyName == nameof(Dirty))
+        {
+            OnPropertyChanged(nameof(CanReloadBoard));
+        }
+    }
+
     private void RefreshBoardCommands()
     {
         SaveCommand.NotifyCanExecuteChanged();
@@ -243,9 +264,18 @@ public sealed partial class RoutingViewModel : PageViewModel
             }
         }
 
+        var becameAvailable = status is not null && _serviceWasMissing;
+        _serviceWasMissing = status is null;
         if (status is null)
         {
             return;
+        }
+
+        // Доску открывали, когда служба не отвечала: она пустая и без загрузки не сохраняется. Служба появилась —
+        // доска догружается сама. Несохранённые правки не трогаются: перечитать их можно только осознанно.
+        if (becameAvailable && _loadAttempted && !_loaded && !Dirty && _loading == 0 && _saving == 0)
+        {
+            _ = RunAsync(LoadAsync);
         }
 
         GeoSummary = status.GeoRevision is null
@@ -281,6 +311,7 @@ public sealed partial class RoutingViewModel : PageViewModel
         var edits = EditGeneration;
         var saves = _saveGeneration;
         AppSettings settings;
+        _loadAttempted = true;
         _loading++;
         RefreshBoardCommands();
         try
@@ -297,7 +328,9 @@ public sealed partial class RoutingViewModel : PageViewModel
         {
             // Служба могла ответить ещё прежними настройками: такой ответ вернул бы доску к виду до сохранения,
             // и следующее «Сохранить» молча записало бы его поверх.
-            ShowMessage("Доска не перечитана: одновременно шло сохранение. Нажмите «Отменить изменения» ещё раз, если нужно.", isError: false);
+            // Кнопка «Отменить изменения» без правок недоступна: после удачного сохранения на доске и так сохранённый вид.
+            ShowMessage("Доска не перечитана: одновременно шло сохранение. Чтобы загрузить сохранённый вид, откройте страницу заново"
+                + " (если остались несохранённые правки — нажмите «Отменить изменения»).", isError: false);
             return false;
         }
 
@@ -309,6 +342,7 @@ public sealed partial class RoutingViewModel : PageViewModel
 
         _settings = settings;
         _loaded = true;
+        OnPropertyChanged(nameof(CanReloadBoard));
         AddGroupCommand.NotifyCanExecuteChanged();
         _folders.Clear();
         foreach (var folder in _settings.RoutingFolders)

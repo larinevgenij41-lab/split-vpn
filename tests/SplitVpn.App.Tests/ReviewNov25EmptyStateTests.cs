@@ -159,8 +159,8 @@ public sealed class ReviewNov25EmptyStateTests
         await page.LoadAsync();
 
         Assert.Empty(page.Profiles);
-        Assert.False(page.MoveUpCommand.CanExecute(page.Selected));
-        Assert.False(page.MoveDownCommand.CanExecute(page.Selected));
+        Assert.False(page.MoveUpCommand.CanExecute(null));
+        Assert.False(page.MoveDownCommand.CanExecute(null));
         Assert.False(page.CopyCommand.CanExecute(null));
         Assert.False(page.DeleteCommand.CanExecute(null));
         Assert.False(page.ExportCommand.CanExecute(null));
@@ -183,27 +183,27 @@ public sealed class ReviewNov25EmptyStateTests
 
         // Первая строка: выше некуда.
         Assert.Same(page.Profiles[0], page.Selected);
-        Assert.False(page.MoveUpCommand.CanExecute(page.Selected));
-        Assert.True(page.MoveDownCommand.CanExecute(page.Selected));
+        Assert.False(page.MoveUpCommand.CanExecute(null));
+        Assert.True(page.MoveDownCommand.CanExecute(null));
         Assert.True(page.CopyCommand.CanExecute(null));
         Assert.True(page.DeleteCommand.CanExecute(null));
         Assert.True(page.ExportCommand.CanExecute(null));
 
         page.Selected = page.Profiles[1];
-        Assert.True(page.MoveUpCommand.CanExecute(page.Selected));
-        Assert.True(page.MoveDownCommand.CanExecute(page.Selected));
+        Assert.True(page.MoveUpCommand.CanExecute(null));
+        Assert.True(page.MoveDownCommand.CanExecute(null));
 
         // Последняя строка: ниже некуда.
         page.Selected = page.Profiles[2];
-        Assert.True(page.MoveUpCommand.CanExecute(page.Selected));
-        Assert.False(page.MoveDownCommand.CanExecute(page.Selected));
+        Assert.True(page.MoveUpCommand.CanExecute(null));
+        Assert.False(page.MoveDownCommand.CanExecute(null));
 
         // Выбор снят: кнопки строки недоступны и сообщили об этом кнопкам на экране.
         changed.Clear();
         page.Selected = null;
         Assert.Equal(new HashSet<string> { "up", "copy", "delete" }, changed);
-        Assert.False(page.MoveUpCommand.CanExecute(page.Selected));
-        Assert.False(page.MoveDownCommand.CanExecute(page.Selected));
+        Assert.False(page.MoveUpCommand.CanExecute(null));
+        Assert.False(page.MoveDownCommand.CanExecute(null));
         Assert.False(page.CopyCommand.CanExecute(null));
         Assert.False(page.DeleteCommand.CanExecute(null));
         Assert.True(page.ExportCommand.CanExecute(null));
@@ -213,8 +213,8 @@ public sealed class ReviewNov25EmptyStateTests
         // Перестановка меняет края: бывшая первая строка, сдвинутая вниз, снова может подняться.
         var first = page.Profiles[0];
         await page.MoveAsync(first, +1);
-        Assert.True(page.MoveUpCommand.CanExecute(first));
-        Assert.True(page.MoveDownCommand.CanExecute(first));
+        Assert.True(page.MoveUpCommand.CanExecute(null));
+        Assert.True(page.MoveDownCommand.CanExecute(null));
     });
 
     [Fact]
@@ -235,8 +235,8 @@ public sealed class ReviewNov25EmptyStateTests
         Assert.True(page.CopyCommand.CanExecute(null));
         Assert.True(page.DeleteCommand.CanExecute(null));
         // Единственная строка — сразу оба края.
-        Assert.False(page.MoveUpCommand.CanExecute(page.Selected));
-        Assert.False(page.MoveDownCommand.CanExecute(page.Selected));
+        Assert.False(page.MoveUpCommand.CanExecute(null));
+        Assert.False(page.MoveDownCommand.CanExecute(null));
     });
 
     // ---------- Вспомогательное ----------

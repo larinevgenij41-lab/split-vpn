@@ -380,7 +380,8 @@ public sealed partial class HomeViewModel : PageViewModel
         {
             case HomeSetupAction.AddConnection:
                 Main.NavigateTo(Main.Connections);
-                Main.Connections.AddCommand.Execute(null);
+                // Повторное нажатие не плодит пустые черновики: открывается уже начатый.
+                Main.Connections.AddOrOpenDraft();
                 break;
             case HomeSetupAction.OpenConnections:
                 Main.NavigateTo(Main.Connections);

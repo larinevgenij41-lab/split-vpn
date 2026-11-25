@@ -36,6 +36,20 @@ public static class ScrollAnchor
 
     private static void OnItemsChanged(ItemsControl list, NotifyCollectionChangedEventArgs args)
     {
+        if (args.Action == NotifyCollectionChangedAction.Reset)
+        {
+            // Список пересобран (очистка, смена фильтра): читаемых строк больше нет. Раскладка ещё не прошла, и
+            // VerticalOffset остаётся прежним — без заказа нуля вставки в том же кадре сдвинули бы прокрутку к концу.
+            if (FindScrollViewer(list) is { } reset)
+            {
+                reset.SetValue(PendingOffsetProperty, 0d);
+                reset.ScrollToTop();
+                reset.Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () => reset.ClearValue(PendingOffsetProperty));
+            }
+
+            return;
+        }
+
         if (args.Action != NotifyCollectionChangedAction.Add || args.NewItems is not { Count: > 0 } added
             || FindScrollViewer(list) is not { } viewer)
         {

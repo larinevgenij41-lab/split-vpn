@@ -87,7 +87,9 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            LogError("браузер не запустился", ex);
+            LogError("браузер не запустился", ex, persist: true);
+            ShowProblem($"Встроенный браузер не запустился (код 0x{ex.HResult:X8}). Закройте окно и нажмите «Войти» ещё раз;"
+                + " если не поможет, перезапустите компьютер или переустановите Microsoft Edge WebView2 Runtime.");
             return;
         }
 
@@ -162,7 +164,7 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            LogError("открытие страницы входа", ex);
+            LogError("открытие страницы входа", ex, persist: true);
             ShowProblem("Страница входа не открылась: встроенный браузер не справился с ней. Закройте окно и нажмите «Войти» ещё раз.");
         }
     }
@@ -230,7 +232,11 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             if (popup.IsVisible) { popup.Close(); }
-            LogError("дополнительное окно входа", ex);
+            LogError("дополнительное окно входа", ex, persist: true);
+            if (!_closed)
+            {
+                ShowProblem($"Дополнительное окно входа не открылось (код 0x{ex.HResult:X8}). Закройте окно и нажмите «Войти» ещё раз.");
+            }
         }
     }
 
@@ -272,13 +278,27 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Ошибка браузера (окно уже закрывается, cookie недоступны): вход можно повторить кнопкой «Войти».
-            LogError("передача результата входа", ex);
+            LogError("передача результата входа", ex, persist: true);
+            if (!_closed)
+            {
+                ShowProblem($"Результат входа не передан службе (код 0x{ex.HResult:X8}). Закройте окно и нажмите «Войти» ещё раз.");
+            }
         }
     }
 
-    /// <summary>Сообщение WebView2 и COM английское и техническое: оно — только в журнал, пользователю — фраза по смыслу места.</summary>
-    private static void LogError(string where, Exception ex) =>
+    /// <summary>
+    /// Сообщение WebView2 и COM английское и техническое: оно — только в журнал, пользователю — фраза по смыслу места.
+    /// persist — ещё и в постоянный журнал ошибок интерфейса: подробный журнал обычно выключен, а пустое окно входа
+    /// без записи не разобрать.
+    /// </summary>
+    private static void LogError(string where, Exception ex, bool persist = false)
+    {
         Verbose.Write("SignIn", $"{where}: {ex.GetType().Name} 0x{ex.HResult:X8} «{ex.Message}»");
+        if (persist)
+        {
+            App.RecordHandled(new InvalidOperationException("Окно входа: " + where, ex));
+        }
+    }
 
     private void ShowProblem(string text)
     {

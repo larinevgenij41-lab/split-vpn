@@ -31,7 +31,9 @@ public partial class MainWindow : FluentWindow
             if (DataContext is MainViewModel main)
             {
                 ThemeService.Watch(this, main.Preferences.Theme);
-                Navigation.Navigate(typeof(HomePage));
+                // Страница, выбранная до первого показа (щелчок по уведомлению при запуске в трей), не теряется.
+                Navigation.Navigate(_pages?.PageTypeFor(main.CurrentPage) ?? typeof(HomePage));
+                main.NavigationReady = true;
             }
 
             NameUnlabeledButtons(this);

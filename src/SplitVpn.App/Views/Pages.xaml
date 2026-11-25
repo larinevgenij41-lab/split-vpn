@@ -396,9 +396,9 @@
                     </ui:ListView>
                     <!-- Порядок: подключения поднимаются сверху вниз, если включена очерёдность. -->
                     <WrapPanel Margin="0,10,0,0">
-                        <!-- Параметр задаётся до команды: доступность считается сразу по выбранной строке, а не по пустому параметру. -->
-                        <ui:Button Content="Выше" AutomationProperties.Name="Поднимать раньше" CommandParameter="{Binding Selected}" Command="{Binding MoveUpCommand}" Margin="0,0,8,8" />
-                        <ui:Button Content="Ниже" AutomationProperties.Name="Поднимать позже" CommandParameter="{Binding Selected}" Command="{Binding MoveDownCommand}" Margin="0,0,8,8" />
+                        <!-- Команды без параметра: строку берут из Selected, доступность — по уже выбранной строке. -->
+                        <ui:Button Content="Выше" AutomationProperties.Name="Поднимать раньше" Command="{Binding MoveUpCommand}" Margin="0,0,8,8" />
+                        <ui:Button Content="Ниже" AutomationProperties.Name="Поднимать позже" Command="{Binding MoveDownCommand}" Margin="0,0,8,8" />
                     </WrapPanel>
                     <WrapPanel>
                         <ui:Button Content="Добавить" Icon="{ui:SymbolIcon Add24}" Command="{Binding AddCommand}" Margin="0,0,8,8" />
@@ -770,8 +770,9 @@
 
             <WrapPanel Style="{StaticResource ButtonRow}">
                 <ui:Button Appearance="Primary" Content="Сохранить и применить" Icon="{ui:SymbolIcon Save24}" Command="{Binding SaveCommand}" IsEnabled="{Binding Dirty}" />
-                <!-- Отменять нечего, пока правок нет; с правками — подтверждение: перемещения, правила и папки стираются. -->
-                <ui:Button Content="Отменить изменения" Icon="{ui:SymbolIcon ArrowUndo24}" Command="{Binding ReloadCommand}" IsEnabled="{Binding Dirty}" />
+                <!-- Отменять нечего, пока правок нет; с правками — подтверждение: перемещения, правила и папки стираются.
+                     Доска, не загруженная ни разу (служба не отвечала при открытии), перечитывается этой же кнопкой. -->
+                <ui:Button Content="Отменить изменения" Icon="{ui:SymbolIcon ArrowUndo24}" Command="{Binding ReloadCommand}" IsEnabled="{Binding CanReloadBoard}" />
                 <ui:Badge Appearance="Caution" Content="Есть несохранённые изменения" VerticalAlignment="Center"
                           Visibility="{Binding Dirty, Converter={StaticResource VisibleWhen}}" />
             </WrapPanel>

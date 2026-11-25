@@ -51,9 +51,13 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         ExportCommand.NotifyCanExecuteChanged();
     }
 
-    private bool CanMoveUp(ProfileItem? item) => item is not null && Profiles.IndexOf(item) > 0;
+    /// <summary>
+    /// «Выше» и «Ниже» работают с выбранной строкой, а не с параметром кнопки: доступность пересчитывается в
+    /// OnSelectedChanged, когда поле уже новое, а привязка параметра ещё указывала бы на прежнюю строку.
+    /// </summary>
+    private bool CanMoveUp => Selected is { } item && Profiles.IndexOf(item) > 0;
 
-    private bool CanMoveDown(ProfileItem? item) => item is not null && Profiles.IndexOf(item) is var at && at >= 0 && at < Profiles.Count - 1;
+    private bool CanMoveDown => Selected is { } item && Profiles.IndexOf(item) is var at && at >= 0 && at < Profiles.Count - 1;
 
     private bool CanEditSelected => Selected is not null;
 
@@ -233,10 +237,10 @@ public sealed partial class ConnectionsViewModel : PageViewModel
 
     /// <summary>Поднимать раньше: порядок списка задаёт и вид на экране, и очерёдность подъёма.</summary>
     [RelayCommand(CanExecute = nameof(CanMoveUp))]
-    private Task MoveUpAsync(ProfileItem? item) => MoveAsync(item, -1);
+    private Task MoveUpAsync() => MoveAsync(Selected, -1);
 
     [RelayCommand(CanExecute = nameof(CanMoveDown))]
-    private Task MoveDownAsync(ProfileItem? item) => MoveAsync(item, +1);
+    private Task MoveDownAsync() => MoveAsync(Selected, +1);
 
     /// <summary>
     /// Переставляет строку и сразу сохраняет порядок. Перестановка идёт через <see cref="ObservableCollection{T}.Move"/>:
@@ -320,6 +324,22 @@ public sealed partial class ConnectionsViewModel : PageViewModel
         RenumberProfiles();
         Selected = item;
         EditorFocusToken++;
+    }
+
+    /// <summary>
+    /// «Добавить подключение» с главной: если несохранённое новое подключение уже есть, открывается оно (с фокусом
+    /// в редакторе), а не создаётся ещё один пустой черновик.
+    /// </summary>
+    public void AddOrOpenDraft()
+    {
+        if (Profiles.FirstOrDefault(p => p.IsNew) is { } draft)
+        {
+            Selected = draft;
+            EditorFocusToken++;
+            return;
+        }
+
+        Add();
     }
 
     [RelayCommand(CanExecute = nameof(CanEditSelected))]

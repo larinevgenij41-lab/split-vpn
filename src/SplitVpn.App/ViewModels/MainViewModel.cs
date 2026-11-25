@@ -260,9 +260,15 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Окно загружено и его меню может переходить по страницам. До первого показа (запуск в трей) переход только
+    /// запоминается в <see cref="CurrentPage"/>: окно откроется на ней, а не на главной.
+    /// </summary>
+    public bool NavigationReady { get; set; }
+
     public void NavigateTo(PageViewModel page)
     {
-        if (NavigationRequested is { } handler)
+        if (NavigationReady && NavigationRequested is { } handler)
         {
             handler(page);
         }
@@ -661,9 +667,12 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         // Обрыв затянулся: теперь это сбой, о нём стоит знать.
         if (current.State == ConnectionState.Reconnecting && _outageSince is { } since && !_outageAnnounced && now - since >= OutageNoticeDelay)
         {
-            _outageAnnounced = Emit("outage", new AppNotification("VPN оборвался", current.OutageMode == OutageMode.AllowAll
+            Emit("outage", new AppNotification("VPN оборвался", current.OutageMode == OutageMode.AllowAll
                 ? "До переподключения трафик идёт напрямую, без VPN."
                 : "Трафик через VPN заблокирован до переподключения.", NotificationKind.Warning, Home), now);
+            // Обрыв затянулся, даже если повтор уведомления подавлен пределом: восстановление — «VPN восстановлен»,
+            // а не «ненадолго прерывалась», и попытка не повторяется на каждом опросе.
+            _outageAnnounced = true;
         }
 
         if (previous.State == current.State)
