@@ -1,0 +1,848 @@
+using Microsoft.Extensions.Logging;
+using SplitVpn.Core.Ipc;
+using SplitVpn.Core.Net;
+using SplitVpn.Core.Policy;
+using SplitVpn.Windows.Dns;
+
+namespace SplitVpn.Service.Coordination;
+
+public sealed partial class Coordinator
+{
+    /// <summary>Сколько ответ DNS ждёт применения маршрута, прежде чем стать отказом.</summary>
+    private static readonly TimeSpan PinApplyTimeout = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// То же для веб-проверки интернета Windows. Отказ здесь - это сеть «без интернета» и сброс Wi-Fi через ~30 с,
+    /// а маршрута этот ответ не ставит, поэтому он ждёт дольше обычного, но меньше, чем клиент DNS Windows ждёт ответа.
+    /// </summary>
+    internal static readonly TimeSpan ConnectivityPinApplyTimeout = TimeSpan.FromSeconds(8);
+
+    /// <summary>Предел новых IP из DNS: один домен с меняющимися ответами не должен заполнить память и таблицу маршрутов.</summary>
+    internal const int MaxDomainPins = 10_000;
+
+    private readonly Lock _pinGate = new();
+
+    /// <summary>
+    /// Желаемые закрепления: их пишут потоки DNS-посредника. Применённые лежат в <see cref="CoordinatorFacts.Pinned"/>
+    /// и меняются только в очереди актора — иначе маршруты, фильтры и ответ DNS видят разные наборы.
+    /// </summary>
+    private DateTimeOffset _nextPinExpiry = DateTimeOffset.MaxValue;
+    private readonly HashSet<uint> _warmConnectivityAddresses = [];
+    private readonly Dictionary<uint, List<PinnedRoute>> _desiredPins = [];
+    private Dictionary<string, RoutePriority> _manualPriorities = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<uint> _dnsTransportAddresses = [];
+
+    /// <summary>Номер последнего изменения желаемого набора и номера применённого и неудавшегося.</summary>
+    private long _pinVersion;
+    private long _appliedPinVersion;
+    private long _failedPinVersion;
+
+    /// <summary>Когда применение закреплений последний раз не удалось или повторялось.</summary>
+    private DateTimeOffset _lastPinFailureUtc;
+
+    /// <summary>Пауза между повторными применениями после сбоя: каждый запрос DNS не должен пересобирать политику.</summary>
+    private static readonly TimeSpan PinRetryPause = TimeSpan.FromSeconds(5);
+
+    /// <summary>Общее ожидание одной работы применения: параллельные запросы DNS ждут её вместе.</summary>
+    private TaskCompletionSource? _pinApplied;
+    private bool _pinWorkQueued;
+
+    /// <summary>
+    /// Адреса, полученные по правилу для домена. Маршрут и фильтр ставятся до того, как ответ DNS уйдёт
+    /// клиенту: иначе первое соединение успело бы уйти не по назначенному пути. Возвращает false, если
+    /// применение не подтверждено, — тогда посредник отвечает отказом, а не адресом без защиты.
+    /// </summary>
+    internal async ValueTask<bool> ObservePinnedAsync(PinnedRouteNotice notice, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(notice);
+        long version;
+        lock (_pinGate)
+        {
+            // Срок - по часам, проверенным на скачок под тем же замком: перевод назад между этим ответом и ближайшей
+            // работой актора не сдвинет его второй раз (и не снимет маршрут, едва поставленный).
+            var now = ClockNowLocked();
+            var expires = now + notice.Ttl;
+            // Общий IP нельзя переназначить домену, если через него работает сам DNS-посредник.
+            // Проверка всего ответа до записи не оставляет частичных закреплений.
+            if (notice.IsCurrent?.Invoke() == false || !PinContextMatches(notice)
+                || !MatchesManualRule(notice.Suffix, notice.Name)
+                || notice.Origins?.Any(origin => !MatchesManualRule(notice.Suffix, origin)) == true || notice.Addresses.Any(_dnsTransportAddresses.Contains))
+            {
+                if (notice.Suffix == ConnectivityCheckWebHost)
+                {
+                    LogConnectivityRefusal(!PinContextMatches(notice) ? "ответ относится к прежнему пути DNS" : "политика сменилась или адрес занят DNS", now);
+                }
+
+                return false;
+            }
+
+            if ((long)_desiredPins.Count + notice.Addresses.Count > MaxDomainPins
+                && notice.Addresses.Distinct().Count(a => !_desiredPins.ContainsKey(a)) > Math.Max(0, MaxDomainPins - _desiredPins.Count))
+            {
+                return false;
+            }
+
+            // Таблица маршрутов различает IP, но не домены. Нельзя перенаправлять уже выданный
+            // адрес в другую цель. Проверяем весь ответ до записи, чтобы отказ не оставил часть адресов.
+            var revocation = IsRevocationPin(notice.Suffix, notice.Target);
+
+            // Адрес, который политика не закрепит (запрет пользователя, CIDR-правило с более высоким приоритетом, сеть шлюза,
+            // зарезервированный диапазон), программе не отдаётся: иначе её трафик пошёл бы мимо правила для домена.
+            if (!revocation && RejectedByPolicy(notice, now))
+            {
+                return false;
+            }
+
+            var connectivity = revocation && notice.Suffix == ConnectivityCheckWebHost;
+            if (connectivity && !CanPinConnectivityCheck(notice.Addresses, now))
+            {
+                LogConnectivityRefusal($"выдано уже больше {MaxConnectivityCheckAddresses} адресов или адрес не публичный", now);
+                return false;
+            }
+
+            foreach (var address in notice.Addresses)
+            {
+                if (_desiredPins.TryGetValue(address, out var owners) && owners.Count + (notice.Origins?.Count ?? 1) > 512
+                    && (owners.Count(p => p.ExpiresUtc > now) > 1024 ||
+                        owners.Where(p => p.ExpiresUtc > now)
+                            .Select(p => (p.Suffix, p.Target, p.Name?.ToUpperInvariant(), p.Origin?.ToUpperInvariant()))
+                            .Concat((notice.Origins is { Count: > 0 } origins ? origins.Cast<string?>() : [null]).Select(origin =>
+                                (notice.Suffix, notice.Target, notice.Name?.ToUpperInvariant(), origin?.ToUpperInvariant())))
+                            .Distinct().Take(513).Count() > 512))
+                {
+                    return false;
+                }
+
+                if (PinConflicts(address, notice.Target, revocation, now))
+                {
+                    if (notice.Suffix == ConnectivityCheckWebHost)
+                    {
+                        LogConnectivityRefusal("адрес закреплён правилом за другой целью", now);
+                    }
+
+                    return false;
+                }
+            }
+
+            // Снятие прогрева этот ответ не ждёт: лишний разрешающий фильтр до следующего применения безвреден,
+            // а ответ с уже открытыми адресами уходит сразу.
+            if (connectivity)
+            {
+                DropWarmConnectivityPins(notice.Addresses);
+            }
+
+            foreach (var address in notice.Addresses)
+            {
+                var pin = new PinnedRoute(notice.Target, expires, notice.Suffix, notice.LeaseId, Name: notice.Name);
+                if (notice.Origins is { Count: > 0 } origins)
+                {
+                    foreach (var origin in origins) { RememberPin(address, pin with { Origin = origin }, now); }
+                }
+                else
+                {
+                    RememberPin(address, pin, now);
+                }
+            }
+
+            // Готовность решается по адресам этого ответа, а не по общему номеру набора. Иначе ответ с уже открытыми
+            // адресами ждал чужое закрепление (ответ другой программы при запуске Windows), очередь была занята
+            // дозвоном, и проверка интернета Windows получала отказ DNS - сброс Wi-Fi через ~30 с.
+            if (_promotedPinsApplied && notice.Addresses.All(address => IsPinApplied(address, notice, revocation, now)))
+            {
+                return true;
+            }
+
+            version = _pinVersion;
+        }
+
+        // Защиты нет: маршрут ничего не решает, ответ можно отдать сразу.
+        if (_state.Intent == Core.State.Intent.Off || _state.ProtectionSuspended)
+        {
+            return true;
+        }
+
+        var connectivityCheck = notice.Suffix == ConnectivityCheckWebHost;
+        if (!await WaitForPinsAsync(version, cancellationToken, connectivityCheck ? ConnectivityPinApplyTimeout : PinApplyTimeout))
+        {
+            if (connectivityCheck)
+            {
+                // Отказ ведёт к сбросу Wi-Fi через ~30 с: без этой строки причину в журнале не найти.
+                _deps.Logger.LogWarning("Ответ DNS для проверки интернета Windows отклонён: адрес не открыт вовремя (очередь службы занята или применение не удалось)");
+            }
+
+            return false;
+        }
+
+        // Пока ответ ждал очередь, правило могло исчезнуть, а набор — успешно примениться уже без него.
+        lock (_pinGate)
+        {
+            var checkedAt = ClockNowLocked();
+            if (!PinContextMatches(notice))
+            {
+                return false;
+            }
+
+            if (IsRevocationPin(notice.Suffix, notice.Target) && notice.Suffix == ConnectivityCheckWebHost
+                && !CanPinConnectivityCheck(notice.Addresses, checkedAt))
+            {
+                return false;
+            }
+
+            return notice.Addresses.All(address => _desiredPins.TryGetValue(address, out var owners)
+                && owners.Exists(p => p.Suffix == notice.Suffix && p.Target == notice.Target && p.ExpiresUtc > checkedAt));
+        }
+    }
+
+    // Вызываются под _pinGate. У общего IP может быть несколько правил с одной целью и разными TTL.
+    // Служебное закрепление узла проверки отзыва ни с чем не конфликтует: маршрут оно не ставит и адрес целиком не
+    // выпускает, а лишь открывает TCP на порт ссылки через основной адаптер. Обычное закрепление того же адреса важнее
+    // (см. PromotePins). Иначе адрес сети доставки, закреплённый правилом пользователя за туннелем, отклонял бы ответ
+    // DNS для узла отзыва (дозвон падал бы на проверке отзыва), а служебное закрепление - правило пользователя.
+    // Закрепление, которое политика молча не применяет (служебный адрес, «напрямую» на адресе локальной сети), маршрута
+    // не ставит и потому ни с чем не конфликтует.
+    private bool PinConflicts(uint address, RouteTarget target, bool revocation, DateTimeOffset now) =>
+        !revocation && _desiredPins.TryGetValue(address, out var owners)
+        && owners.Exists(p => p.ExpiresUtc > now && p.Target != target && !IsRevocationPin(p.Suffix, p.Target) && !PinIgnored(address, p.Target));
+
+    /// <summary>
+    /// Последняя собранная политика для проверок под _pinGate: потоки DNS-посредника оценивают по ней закрепления до
+    /// записи (<see cref="CompiledPolicy.EvaluatePin"/>). null - защиты нет, проверять не по чему.
+    /// </summary>
+    private CompiledPolicy? _pinPolicy;
+
+    /// <summary>Политика молча не закрепляет адрес за этой целью (см. <see cref="CompiledPolicy.IgnoredPins"/>). Под _pinGate.</summary>
+    private bool PinIgnored(uint address, RouteTarget target) =>
+        _pinPolicy?.EvaluatePin(new PinnedHost(address, target)) is (false, null);
+
+    /// <summary>Действующий приоритет правила для домена. Под _pinGate.</summary>
+    private RoutePriority PinPriority(string suffix) => _manualPriorities.GetValueOrDefault(suffix, RoutePriority.Normal);
+
+    /// <summary>
+    /// Отказы в закреплении для предупреждения на главной: пара «правило, причина», последний адрес и время. Под _pinGate.
+    /// Записей немного (<see cref="MaxRejectedPinWarnings"/>), каждая живёт час после последнего отказа и снимается раньше,
+    /// если правило исчезло, сменило цель или политика теперь адрес примет.
+    /// </summary>
+    private readonly Dictionary<(string Suffix, string Reason), RejectedPinWarning> _rejectedPinWarnings = [];
+
+    internal const int MaxRejectedPinWarnings = 20;
+
+    private static readonly TimeSpan RejectedPinWarningLifetime = TimeSpan.FromHours(1);
+
+    /// <summary>Отказ, о котором ещё не сказано в журнале. Под _pinGate; журнал пишет очередь актора.</summary>
+    private readonly List<(string Suffix, string Reason)> _rejectedPinJournal = [];
+
+    /// <summary>
+    /// Политика отклонит закрепление хотя бы одного адреса ответа: ответ не отдаётся (SERVFAIL), отказ попадает в
+    /// предупреждения. Вызывается под _pinGate.
+    /// </summary>
+    private bool RejectedByPolicy(PinnedRouteNotice notice, DateTimeOffset now)
+    {
+        if (_pinPolicy is not { } policy)
+        {
+            return false;
+        }
+
+        var priority = PinPriority(notice.Suffix);
+        foreach (var address in notice.Addresses)
+        {
+            if (policy.EvaluatePin(new PinnedHost(address, notice.Target, priority)) is (false, { } reason))
+            {
+                RememberRejectedPin(notice.Suffix, reason, new PinnedHost(address, notice.Target, priority), now);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void RememberRejectedPin(string suffix, string reason, PinnedHost pin, DateTimeOffset now)
+    {
+        var key = (suffix, reason);
+        if (!_rejectedPinWarnings.ContainsKey(key))
+        {
+            if (_rejectedPinWarnings.Count >= MaxRejectedPinWarnings)
+            {
+                _rejectedPinWarnings.Remove(_rejectedPinWarnings.MinBy(p => p.Value.LastSeenUtc).Key);
+            }
+
+            if (_rejectedPinJournal.Count < MaxRejectedPinWarnings)
+            {
+                _rejectedPinJournal.Add(key);
+            }
+        }
+
+        _rejectedPinWarnings[key] = new RejectedPinWarning(pin, now);
+    }
+
+    /// <summary>
+    /// После сборки политики: закрепления, которые она отклонила с причиной, уходят из реестра (желаемого и применённого
+    /// наборов). Иначе ожидающий ответ DNS подтвердился бы по реестру, а не по политике, отклонённый адрес держал бы
+    /// конфликт с другими доменами и не давал служебному закреплению проверки отзыва открыть порт. Ожидающий этот адрес
+    /// ответ получает отказ (SERVFAIL), отказ попадает в предупреждения.
+    /// </summary>
+    private void DropRejectedPins(CompiledPolicy policy)
+    {
+        List<(string Suffix, string Reason)> journal;
+        lock (_pinGate)
+        {
+            var now = ClockNowLocked();
+            _pinPolicy = policy;
+            foreach (var rejected in policy.RejectedPins)
+            {
+                if (_desiredPins.TryGetValue(rejected.Address, out var owners))
+                {
+                    foreach (var owner in owners.Where(p => p.Target == rejected.Target && !IsRevocationPin(p.Suffix, p.Target)).ToList())
+                    {
+                        RememberRejectedPin(owner.Suffix, rejected.Reason, new PinnedHost(rejected.Address, rejected.Target, PinPriority(owner.Suffix)), now);
+                    }
+
+                    owners.RemoveAll(p => p.Target == rejected.Target && !IsRevocationPin(p.Suffix, p.Target));
+                    if (owners.Count == 0)
+                    {
+                        _desiredPins.Remove(rejected.Address);
+                    }
+                    else if (!owners.Exists(p => !IsRevocationPin(p.Suffix, p.Target)))
+                    {
+                        Facts.RevocationPins[rejected.Address] = owners.Select(p => p.Suffix).ToHashSet(StringComparer.Ordinal);
+                    }
+                }
+
+                Facts.Pinned.Remove(rejected.Address);
+            }
+
+            // Отказ, который политика больше не подтверждает (правило изменено), и устаревший - из предупреждений.
+            foreach (var (key, warning) in _rejectedPinWarnings.ToList())
+            {
+                if (now - warning.LastSeenUtc > RejectedPinWarningLifetime || policy.EvaluatePin(warning.Pin) is not (false, { }))
+                {
+                    _rejectedPinWarnings.Remove(key);
+                }
+            }
+
+            journal = [.. _rejectedPinJournal];
+            _rejectedPinJournal.Clear();
+        }
+
+        foreach (var (suffix, reason) in journal)
+        {
+            if (_reportedRejectedPins.Count < 10_000 && _reportedRejectedPins.Add((suffix, reason)))
+            {
+                Journal("Предупреждение", $"Правило для домена «{suffix}»: адрес из ответа DNS не закреплён ({reason}); программа получает ошибку DNS.");
+            }
+        }
+    }
+
+    /// <summary>О каких отказах в закреплении (суффикс правила, причина) уже сказано в журнале.</summary>
+    private readonly HashSet<(string Suffix, string Reason)> _reportedRejectedPins = [];
+
+    /// <summary>Предупреждения об отказах в закреплении: правило и причина, без адресов и запрошенных имён.</summary>
+    private List<StatusWarning> RejectedPinWarnings()
+    {
+        lock (_pinGate)
+        {
+            var now = ClockNowLocked();
+            return _rejectedPinWarnings
+                .Where(p => now - p.Value.LastSeenUtc <= RejectedPinWarningLifetime)
+                .OrderByDescending(p => p.Value.LastSeenUtc)
+                .Take(MaxRejectedPinWarnings)
+                .Select(p => new StatusWarning("domain-pin-rejected",
+                    $"Правило для домена «{p.Key.Suffix}»: адрес из ответа DNS не закреплён ({p.Key.Reason}). Программа получает ошибку DNS: "
+                    + "иначе её трафик пошёл бы мимо правила. Измените правило для домена или адресное правило.", null))
+                .ToList();
+        }
+    }
+
+    /// <summary>
+    /// Применённые наборы (<see cref="CoordinatorFacts.Pinned"/>, <see cref="CoordinatorFacts.RevocationPins"/>) совпадают с
+    /// последним успешно применённым: сборка политики сбрасывает признак, успешное применение ставит. Меняется под _pinGate.
+    /// </summary>
+    private bool _promotedPinsApplied = true;
+
+    /// <summary>
+    /// Адрес уже открыт применённым набором так, как просит ответ: обычное закрепление ведёт в ту же цель, служебное -
+    /// разрешает порт этого имени (или адрес целиком выпущен напрямую обычным закреплением). Вызывается под _pinGate.
+    /// Маршрут различает только IP, поэтому для обычного закрепления важна цель, а не имя: другие цели исключает
+    /// <see cref="PinConflicts"/>.
+    /// </summary>
+    private bool IsPinApplied(uint address, PinnedRouteNotice notice, bool revocation, DateTimeOffset now)
+    {
+        if (Facts.Pinned.TryGetValue(address, out var applied) && applied.ExpiresUtc > now)
+        {
+            return revocation ? applied.Target == RouteTarget.Direct : applied.Target == notice.Target;
+        }
+
+        return revocation && Facts.RevocationPins.TryGetValue(address, out var suffixes) && suffixes.Contains(notice.Suffix);
+    }
+
+    /// <summary>
+    /// Закрепление от служебного правила узла проверки отзыва или веб-проверки интернета Windows
+    /// (<see cref="ConnectivityCheckWebHost"/>): прямой выход по имени из последней сборки политики
+    /// или из начального разрешения узла (<see cref="PinDirect"/>). Правило пользователя с тем же именем служебное
+    /// правило отменяет, поэтому по суффиксу их не спутать. Вызывается под _pinGate.
+    /// </summary>
+    private bool IsRevocationPin(string suffix, RouteTarget target) =>
+        target == RouteTarget.Direct && _revocationPinSuffixes.Contains(suffix);
+
+    private void RememberPin(uint address, PinnedRoute pin, DateTimeOffset now, bool advanceVersion = true)
+    {
+        if (pin.ExpiresUtc < _nextPinExpiry) _nextPinExpiry = pin.ExpiresUtc;
+        if (pin.Warm && pin.Suffix == ConnectivityCheckWebHost) _warmConnectivityAddresses.Add(address);
+        if (!_desiredPins.TryGetValue(address, out var owners))
+        {
+            _desiredPins[address] = owners = [];
+        }
+
+        owners.RemoveAll(p => p.ExpiresUtc <= now);
+        var index = owners.FindIndex(p => p.Suffix == pin.Suffix && p.Target == pin.Target && p.LeaseId == pin.LeaseId && p.Warm == pin.Warm
+            && string.Equals(p.Origin, pin.Origin, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(p.Name, pin.Name, StringComparison.OrdinalIgnoreCase));
+        if (index >= 0)
+        {
+            var previous = owners[index];
+            owners[index] = pin with { ExpiresUtc = previous.ExpiresUtc > pin.ExpiresUtc ? previous.ExpiresUtc : pin.ExpiresUtc };
+            return;
+        }
+
+        // Новый ответ на уже закреплённый адрес ждёт ту же версию маршрута. Отдельный временный
+        // владелец нужен для отмены, но не должен пересобирать политику на каждом попадании в DNS-кеш.
+        var newRoute = !owners.Exists(p => p.Suffix == pin.Suffix && p.Target == pin.Target);
+        owners.Add(pin);
+        if (advanceVersion && newRoute) { _pinVersion++; }
+    }
+
+    /// <summary>
+    /// Ответ становится выданным только после последней проверки конфигурации. Отмена удаляет его
+    /// отдельного владельца: прежний ответ и параллельные запросы того же домена сохраняют свои TTL.
+    /// </summary>
+    internal async ValueTask<bool> CompletePinnedAsync(PinnedRouteNotice notice, bool accepted)
+    {
+        if (notice.LeaseId is not { } leaseId)
+        {
+            return accepted;
+        }
+
+        long version;
+        var changed = false;
+        bool connectivity;
+        lock (_pinGate)
+        {
+            var now = ClockNowLocked();
+            connectivity = notice.Suffix == ConnectivityCheckWebHost && IsRevocationPin(notice.Suffix, notice.Target);
+            accepted &= notice.IsCurrent?.Invoke() != false && PinContextMatches(notice)
+                && notice.Addresses.All(a => _desiredPins.TryGetValue(a, out var owners)
+                    && owners.Exists(p => p.LeaseId == leaseId && p.ExpiresUtc > now));
+            foreach (var address in notice.Addresses.Distinct())
+            {
+                if (!_desiredPins.TryGetValue(address, out var owners)) { continue; }
+                var pending = owners.Where(p => p.LeaseId == leaseId).ToArray();
+                owners.RemoveAll(p => p.LeaseId == leaseId);
+                changed |= pending.Any(p => !owners.Exists(o => o.ExpiresUtc > now && o.Suffix == p.Suffix && o.Target == p.Target));
+                if (accepted)
+                {
+                    foreach (var pin in pending)
+                    {
+                        RememberPin(address, pin with { LeaseId = null }, now, advanceVersion: false);
+                    }
+                }
+
+                if (owners.Count == 0) { _desiredPins.Remove(address); }
+            }
+
+            // Смена временного владельца на постоянного не меняет маршрут. Отмена - меняет.
+            if (changed && !accepted) { _pinVersion++; }
+            version = _pinVersion;
+        }
+
+        // Снятие разрешения порта веб-проверки не ждёт очередь: лишний разрешающий фильтр до следующего применения
+        // безвреден, а ожидание задерживало бы ответ Windows (уже открытыми адресами или отказом) за занятой очередью.
+        if (changed && !accepted && ProtectionActive && !connectivity)
+        {
+            await WaitForPinsAsync(version, CancellationToken.None);
+        }
+
+        return accepted;
+    }
+
+    /// <summary>
+    /// Ждёт, пока очередь применит набор с указанным номером. Все ожидающие делят одну работу: сотня
+    /// ответов DNS подряд не даёт сотню полных пересборок политики.
+    /// </summary>
+    private async Task<bool> WaitForPinsAsync(long version, CancellationToken cancellationToken, TimeSpan? timeout = null)
+    {
+        var started = _deps.Time.GetTimestamp();
+        var retried = false;
+        while (true)
+        {
+            Task wait;
+            var schedule = false;
+            lock (_pinGate)
+            {
+                if (_appliedPinVersion >= version)
+                {
+                    return true;
+                }
+
+                if (_failedPinVersion >= version)
+                {
+                    // Набор уже не применился. Повторный ответ по тому же адресу номер не меняет, и без
+                    // нового применения отказы шли бы до полной сверки. Одна попытка на ответ, не чаще паузы.
+                    var now = ClockNowLocked();
+                    if (retried || now - _lastPinFailureUtc < PinRetryPause)
+                    {
+                        return false;
+                    }
+
+                    retried = true;
+                    _lastPinFailureUtc = now;
+                }
+
+                _pinApplied ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                wait = _pinApplied.Task;
+                schedule = !_pinWorkQueued;
+                _pinWorkQueued |= schedule;
+            }
+
+            if (schedule)
+            {
+                await EnqueueAsync("Pinned", ApplyPinsAsync);
+            }
+
+            try
+            {
+                var remaining = (timeout ?? PinApplyTimeout) - _deps.Time.GetElapsedTime(started);
+                if (remaining <= TimeSpan.Zero) return false;
+                await wait.WaitAsync(remaining, _deps.Time, cancellationToken);
+            }
+            catch (TimeoutException)
+            {
+                // Актор занят дольше, чем клиент готов ждать: маршрута ещё нет, отвечать адресом нельзя.
+                return false;
+            }
+        }
+    }
+
+    /// <summary>Применяет желаемые закрепления. Ошибка применения — отказ ожидающим, а не молчаливый успех.</summary>
+    private Task ApplyPinsAsync()
+    {
+        lock (_pinGate)
+        {
+            _pinWorkQueued = false;
+        }
+
+        var applied = false;
+        try
+        {
+            EnsureRoutesSafe();
+            applied = true;
+        }
+        catch (Exception ex) when (ex is Windows.Native.NativeCallException or InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            // Маршрут или фильтр не применились: ответ DNS уйдёт отказом, а полная сверка проверит всё заново.
+            _deps.Logger.LogWarning(ex, "Закрепления по правилам для доменов не применены");
+            Facts.ForceProtection = true;
+        }
+        finally
+        {
+            if (applied && !ProtectionActive)
+            {
+                // Политики ещё нет или защита снята: ставить нечего, и ждать ожидающим тоже нечего.
+                lock (_pinGate)
+                {
+                    _promotedPinVersion = _pinVersion;
+                }
+            }
+
+            CompletePins(applied);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void CompletePins(bool applied)
+    {
+        // В очереди актора: перевод часов, замеченный здесь, сдвигает сроки актора сразу, а не в следующей работе.
+        DetectClockJumpBack();
+        lock (_pinGate)
+        {
+            if (applied)
+            {
+                _appliedPinVersion = Math.Max(_appliedPinVersion, _promotedPinVersion);
+                _promotedPinsApplied = true;
+            }
+            else
+            {
+                _failedPinVersion = Math.Max(_failedPinVersion, _pinVersion);
+                _lastPinFailureUtc = ClockNowLocked();
+            }
+
+            var waiters = _pinApplied;
+            _pinApplied = null;
+            waiters?.TrySetResult();
+        }
+    }
+
+    /// <summary>Номер набора, попавшего в последнюю собранную политику.</summary>
+    private long _promotedPinVersion;
+
+    /// <summary>
+    /// Переносит желаемые закрепления в применяемые. Вызывается из очереди актора перед сборкой политики:
+    /// маршруты, фильтры и диагностика строятся по одному набору. Здесь же отзываются закрепления,
+    /// у которых правило исчезло или сменило цель, — иначе прежний путь жил бы до конца TTL.
+    /// </summary>
+    private void PromotePins()
+    {
+        RefreshConnectivityCheckContext();
+        var rules = DomainTargets(out var revocation, out var priorities);
+        var dns = ServiceDnsAddresses().Concat(UpstreamDnsAddresses())
+            .Concat(Facts.Tunnels.Values.SelectMany(t => TunnelDnsRoute(t)?.Servers.Select(s => Ipv4.ToUInt(s.Address)) ?? []))
+            .ToHashSet();
+        DetectClockJumpBack();
+        lock (_pinGate)
+        {
+            var now = ClockNowLocked();
+            _manualPriorities = priorities;
+            _dnsTransportAddresses = dns;
+            _revocationPinSuffixes = new HashSet<string>(revocation, StringComparer.Ordinal);
+            foreach (var (address, owners) in _desiredPins.ToList())
+            {
+                owners.RemoveAll(pin => dns.Contains(address) || pin.ExpiresUtc <= now || !StillRuled(rules, pin)
+                    || !MatchesManualRule(pin.Suffix, pin.Name) || !MatchesManualRule(pin.Suffix, pin.Origin));
+                if (owners.Count == 0)
+                {
+                    _desiredPins.Remove(address);
+                }
+            }
+
+            // Предупреждение об отказе живёт, пока живо правило с той же целью.
+            foreach (var key in _rejectedPinWarnings.Where(p => !rules.TryGetValue(p.Key.Suffix, out var target) || target != p.Value.Pin.Target)
+                .Select(p => p.Key).ToList())
+            {
+                _rejectedPinWarnings.Remove(key);
+            }
+
+            Facts.Pinned.Clear();
+            Facts.RevocationPins.Clear();
+            _appliedPinPriorities.Clear();
+            foreach (var (address, owners) in _desiredPins)
+            {
+                // Служебное закрепление узла проверки отзыва не уводит адрес напрямую: защита открывает к нему только
+                // порт ссылки. Обычное закрепление того же адреса важнее: правило пользователя решает судьбу адреса
+                // целиком (прямой выход открывает и порт ссылки, туннель или блокировка - выбор пользователя), а
+                // разрешение порта рядом с блокировкой того же адреса и того же веса не имело бы определённого исхода.
+                // Закрепление, которое политика молча не применяет («напрямую» на адресе локальной сети), уступает
+                // применимому (в туннель): иначе оно заслонило бы его, и адрес ушёл бы мимо туннеля.
+                var ordinary = owners.Where(p => !revocation.Contains(p.Suffix)).ToList();
+                if (ordinary.Count > 0)
+                {
+                    var chosen = ordinary.OrderBy(p => PinIgnored(address, p.Target) ? 1 : 0).ThenByDescending(p => p.ExpiresUtc).First();
+                    Facts.Pinned[address] = chosen;
+                    // Приоритет - наибольший среди правил этой цели: при равенстве с CIDR-правилом домен важнее.
+                    _appliedPinPriorities[address] = ordinary.Where(p => p.Target == chosen.Target).Max(p => PinPriority(p.Suffix));
+                }
+                else
+                {
+                    Facts.RevocationPins[address] = owners.Select(p => p.Suffix).ToHashSet(StringComparer.Ordinal);
+                }
+            }
+
+            _promotedPinVersion = _pinVersion;
+
+            // Применённый набор собран заново из желаемого, сроки которого уже по текущим часам.
+            _pendingAppliedPinShift = TimeSpan.Zero;
+
+            // Набор ещё не применён: до успешного применения ответы DNS по нему не подтверждаются.
+            _promotedPinsApplied = false;
+        }
+
+        // Проверка отзыва снова понадобилась (туннель лёг): Windows могла запомнить адрес узла, пока имя шло по общей
+        // политике, и тогда не спросит посредника - закрепления по запросу не будет. Сброс кеша заставит спросить.
+        if (revocation.Except(_revocationSuffixes).Any())
+        {
+            // Сбой сброса не должен обрывать сборку политики (иначе он повторялся бы на каждой сверке и защита не
+            // перестраивалась): сброс повторит настройка посредника в этой же сверке.
+            FlushDnsCacheSafely("проверка отзыва снова нужна");
+        }
+
+        _revocationSuffixes = revocation;
+    }
+
+    /// <summary>Имена узлов проверки отзыва, нужные при последней сборке политики.</summary>
+    private HashSet<string> _revocationSuffixes = [];
+
+    /// <summary>Приоритет правила для домена у применяемых закреплений (<see cref="CoordinatorFacts.Pinned"/>); меняется в очереди актора.</summary>
+    private readonly Dictionary<uint, RoutePriority> _appliedPinPriorities = [];
+
+    /// <summary>Входы политики по применяемым закреплениям: адрес, цель и приоритет правила для домена.</summary>
+    private List<PinnedHost> PinnedHostsForPolicy() =>
+        Facts.Pinned.Select(p => new PinnedHost(p.Key, p.Value.Target, _appliedPinPriorities.GetValueOrDefault(p.Key, RoutePriority.Normal))).ToList();
+
+    /// <summary>
+    /// Имена узлов проверки отзыва для проверки конфликтов закреплений: читаются потоками DNS-посредника, поэтому
+    /// меняются только под _pinGate. Сборка политики заменяет набор целиком, начальное разрешение узла дополняет его.
+    /// </summary>
+    private HashSet<string> _revocationPinSuffixes = new(StringComparer.Ordinal);
+
+    /// <summary>Правило, создавшее закрепление, всё ещё действует и ведёт туда же.</summary>
+    private static bool StillRuled(Dictionary<string, RouteTarget> rules, PinnedRoute pin) =>
+        rules.TryGetValue(pin.Suffix, out var target) && target == pin.Target;
+
+    // Под _pinGate. Для CNAME без собственного правила проверяем исходный суффикс.
+    private bool MatchesManualRule(string suffix, string? name)
+    {
+        if (name is null || !_manualPriorities.ContainsKey(suffix))
+        {
+            return true;
+        }
+
+        var winner = WinningSuffix(name.TrimEnd('.')) ?? WinningSuffix(suffix);
+        return string.Equals(winner, suffix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string? WinningSuffix(string name)
+    {
+        string? winner = null;
+        var best = RoutePriority.Inherit;
+        while (true)
+        {
+            if (_manualPriorities.TryGetValue(name, out var priority) && priority > best)
+            {
+                best = priority;
+                winner = name;
+            }
+
+            var dot = name.IndexOf('.');
+            if (dot < 0)
+            {
+                return winner;
+            }
+
+            name = name[(dot + 1)..];
+        }
+    }
+
+    /// <summary>Действующие правила для доменов, которые закрепляют адреса: суффикс и его цель.</summary>
+    /// <param name="revocation">Из них служебные - узлы проверки отзыва, которые сейчас нужны.</param>
+    private Dictionary<string, RouteTarget> DomainTargets(out HashSet<string> revocation, out Dictionary<string, RoutePriority> priorities)
+    {
+        priorities = new(StringComparer.OrdinalIgnoreCase);
+        var targets = new Dictionary<string, RouteTarget>(StringComparer.Ordinal);
+        foreach (var route in BuildDomainRoutes(out revocation).Where(r => r.PinAddresses))
+        {
+            targets.TryAdd(route.Suffix, route.Target);
+            if (route.Priority is { } priority)
+            {
+                priorities.TryAdd(route.Suffix, priority);
+            }
+        }
+
+        return targets;
+    }
+
+    /// <summary>
+    /// Служебное закрепление адресов узла проверки отзыва за прямым выходом. С закреплениями других целей оно не
+    /// конфликтует (см. <see cref="PinConflicts"/>). Адреса DNS-посредника запрещены; для проверки интернета Windows
+    /// дополнительно проверяется лимит публичных адресов.
+    /// </summary>
+    private bool PinDirect(string suffix, IReadOnlyList<uint> addresses, TimeSpan ttl)
+    {
+        lock (_pinGate)
+        {
+            var now = ClockNowLocked();
+            var expires = now + ttl;
+            if (addresses.Any(_dnsTransportAddresses.Contains))
+            {
+                return false;
+            }
+
+            var warm = suffix == ConnectivityCheckWebHost;
+            if (warm && !CanPinConnectivityCheck(addresses, now))
+            {
+                return false;
+            }
+
+            // Новый прогрев заменяет прежний: иначе прежний час держал бы место в пределе адресов.
+            if (warm)
+            {
+                DropWarmConnectivityPins(addresses);
+            }
+
+            // Сборка политики могла ещё не видеть этот узел: без отметки его закрепление до неё отклоняло бы правила пользователя.
+            _revocationPinSuffixes.Add(suffix);
+            foreach (var address in addresses)
+            {
+                RememberPin(address, new PinnedRoute(RouteTarget.Direct, expires, suffix, Warm: warm), now);
+            }
+
+            return true;
+        }
+    }
+
+    /// <summary>Снимает закрепления с истёкшим сроком. true — набор изменился и нужна сверка.</summary>
+    private bool DropExpiredPins()
+    {
+        DetectClockJumpBack();
+        lock (_pinGate)
+        {
+            var now = ClockNowLocked();
+            if (now < _nextPinExpiry) return false;
+            _nextPinExpiry = DateTimeOffset.MaxValue;
+            var changed = false;
+            foreach (var owners in _desiredPins.Values)
+            {
+                changed |= owners.RemoveAll(p => p.ExpiresUtc <= now) > 0;
+                foreach (var owner in owners)
+                    if (owner.ExpiresUtc < _nextPinExpiry) _nextPinExpiry = owner.ExpiresUtc;
+            }
+
+            if (changed)
+            {
+                foreach (var address in _desiredPins.Where(p => p.Value.Count == 0).Select(p => p.Key).ToArray())
+                {
+                    _desiredPins.Remove(address);
+                }
+            }
+
+            return changed;
+        }
+    }
+
+    /// <summary>Снятие защиты: закрепления больше не нужны ни в желаемом наборе, ни в применённом.</summary>
+    private void ClearPins()
+    {
+        lock (_pinGate)
+        {
+            _desiredPins.Clear();
+            _warmConnectivityAddresses.Clear();
+            _nextPinExpiry = DateTimeOffset.MaxValue;
+            Facts.Pinned.Clear();
+            Facts.RevocationPins.Clear();
+            _pendingAppliedPinShift = TimeSpan.Zero;
+            _revocationPinSuffixes = new(StringComparer.Ordinal);
+            _promotedPinVersion = _pinVersion;
+            _appliedPinVersion = _pinVersion;
+            _promotedPinsApplied = true;
+            _pinPolicy = null;
+            _rejectedPinWarnings.Clear();
+            _appliedPinPriorities.Clear();
+            ResetConnectivityCheckContext();
+        }
+
+        _revocationSuffixes = [];
+    }
+}
+
+/// <summary>Отказ в закреплении для предупреждения: закрепление (для перепроверки новой политикой) и время последнего отказа.</summary>
+internal sealed record RejectedPinWarning(PinnedHost Pin, DateTimeOffset LastSeenUtc);
+
+/// <summary>Мост от DNS-посредника к координатору.</summary>
+public sealed class CoordinatorRouteSink(Coordinator coordinator) : IPinnedRouteSink
+{
+    public ValueTask<bool> ObserveAsync(PinnedRouteNotice notice, CancellationToken cancellationToken) =>
+        coordinator.ObservePinnedAsync(notice, cancellationToken);
+
+    public ValueTask<bool> CompleteAsync(PinnedRouteNotice notice, bool accepted) =>
+        coordinator.CompletePinnedAsync(notice, accepted);
+
+    public IReadOnlyList<uint> OpenAddresses(PinnedRouteNotice notice) =>
+        coordinator.OpenConnectivityCheckAddresses(notice);
+}

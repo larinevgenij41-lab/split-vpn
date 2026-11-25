@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.19.0",
+  "tag": "v0.19.0",
+  "releasedUtc": "2026-11-25T17:01:40Z",
+  "expiresUtc": "2027-01-24T17:01:40Z",
+  "package": {
+    "fileName": "SplitVpn-0.19.0.msi",
+    "size": 75399687,
+    "sha256": "4f1eee349052e6519ea5f56a79a05a06af27dc149507dd74498689285a8737e6",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.19.0/SplitVpn-0.19.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.19.0.msi"
+    ]
+  },
+  "notes": "Новое — экстренное отключение: одной командой программа полностью выключается, и Windows работает без неё. Исправлены три ошибки 0.18.0: молчаливый сбой окна входа Cisco AnyConnect, доска маршрутизации, которая не перечитывалась после запуска службы, и кнопки «Выше»/«Ниже» в «Подключениях». Защита стала строже: запрет по адресу сильнее правила для домена, публичная сеть адаптера считается локальной только у доверенного адаптера, в туннелях AnyConnect блокируется IPv6.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.19.0",
+  "kid": "sv-2026-09-2"
+}

@@ -1,0 +1,219 @@
+﻿using SplitVpn.Core.Net;
+
+namespace SplitVpn.Core.Policy;
+
+public enum RoutePriority
+{
+    Inherit,
+    Low,
+    Normal,
+    High,
+}
+
+/// <summary>Куда направляется трафик: напрямую, в туннель, в группу туннелей или в блок.</summary>
+public enum TargetKind
+{
+    Direct,
+    Tunnel,
+    Block,
+
+    /// <summary>Группа туннелей: нагрузка распределяется между её участниками.</summary>
+    Group,
+}
+
+/// <summary>
+/// Цель маршрутизации. Заменяет пару «режим маршрутизации + действие правила» из v1:
+/// одна и та же цель назначается RU-базе, остальному интернету, подсети и домену.
+/// Id — идентификатор подключения для Tunnel и идентификатор группы для Group.
+/// </summary>
+public readonly record struct RouteTarget(TargetKind Kind, Guid? Id = null)
+{
+    public static RouteTarget Direct { get; } = new(TargetKind.Direct);
+
+    public static RouteTarget Blocked { get; } = new(TargetKind.Block);
+
+    public static RouteTarget Tunnel(Guid id) => new(TargetKind.Tunnel, id);
+
+    public static RouteTarget Group(Guid id) => new(TargetKind.Group, id);
+
+    public bool IsTunnel(out Guid id)
+    {
+        id = Id ?? Guid.Empty;
+        return Kind == TargetKind.Tunnel && Id is not null;
+    }
+
+    public bool IsGroup(out Guid id)
+    {
+        id = Id ?? Guid.Empty;
+        return Kind == TargetKind.Group && Id is not null;
+    }
+
+    /// <summary>Цель отправляет трафик в туннель — сам по себе или через группу.</summary>
+    public bool IsVpn => Kind is TargetKind.Tunnel or TargetKind.Group && Id is not null;
+
+    public override string ToString() => Kind switch
+    {
+        TargetKind.Direct => "напрямую",
+        TargetKind.Block => "блокировать",
+        TargetKind.Group => Id is { } group ? "группа " + group : "группа не указана",
+        _ => Id is { } id ? "туннель " + id : "туннель не указан",
+    };
+}
+
+/// <summary>Итоговое решение для адреса назначения.</summary>
+public enum Decision
+{
+    Vpn,
+    Direct,
+    Block,
+    Local,
+    Server,
+}
+
+public enum DecisionSource
+{
+    Default,
+    Geo,
+
+    /// <summary>Список обхода блокировок: перекрывает RU-базу, но не правила пользователя.</summary>
+    Bypass,
+
+    UserRule,
+
+    /// <summary>Адрес, закреплённый за целью правилом для домена (ответ DNS).</summary>
+    DomainRule,
+
+    LocalNetwork,
+    OnLink,
+    Loopback,
+    Reserved,
+    Server,
+    ServiceDns,
+
+    /// <summary>Сеть, присланная шлюзом AnyConnect (split include).</summary>
+    ServerNetwork,
+
+    /// <summary>Служебный адрес туннеля (его DNS): всегда через свой туннель, что бы ни прислал шлюз.</summary>
+    TunnelInfrastructure,
+}
+
+/// <summary>Сети шлюза и цель, в которую их направил пользователь; UserRulesWin — ручные правила важнее этих сетей.</summary>
+public sealed record ServerNetworks(RouteTarget Target, IReadOnlyList<Ipv4Cidr> Cidrs, bool UserRulesWin = true);
+
+/// <summary>
+/// Служебный адрес туннеля, который должен идти через этот туннель. Запрет пользователя он не перекрывает никогда.
+/// UserRulesWin - у подключения включено «Ручные правила важнее сетей шлюза»: тогда адрес остаётся и под ручным
+/// правилом ровно на этот адрес (/32); широкое правило его не забирает (служба адрес под таким /32-правилом или запретом
+/// сама убирает из DNS туннеля с предупреждением).
+/// </summary>
+public readonly record struct TunnelHost(Guid Tunnel, uint Address, bool UserRulesWin = false);
+
+public sealed record UserRule(Ipv4Cidr Cidr, RouteTarget Target, string? Comment = null, RoutePriority Priority = RoutePriority.Normal);
+
+/// <summary>
+/// Адрес, полученный по правилу для домена, и цель, за которой он закреплён. В скомпилированной политике
+/// цель уже раскрыта: группа заменена своим участником, если хоть один годен.
+/// Priority - действующий приоритет правила для домена: при равном или более высоком приоритете цель «напрямую»
+/// важнее ручного CIDR-правила в туннель для публичного адреса (<see cref="PolicyCompiler.PinRejection"/>).
+/// </summary>
+public sealed record PinnedHost(uint Address, RouteTarget Target, RoutePriority Priority = RoutePriority.Normal);
+
+/// <summary>
+/// Закрепление по домену, которое политика не приняла: адрес держит адресное решение сильнее правила для домена
+/// (запрет пользователя, сеть шлюза, зарезервированный диапазон, ручное правило в туннель для цели «напрямую»). Служба
+/// не отдаёт такой адрес программе (SERVFAIL) и показывает предупреждение с правилом и причиной.
+/// </summary>
+public sealed record RejectedPin(uint Address, RouteTarget Target, string Reason);
+
+/// <summary>Итог разбора закреплений: принятые, отклонённые с причиной и молча не закреплённые адреса.</summary>
+public sealed record PinResolution(IReadOnlyList<PinnedHost> Accepted, IReadOnlyList<RejectedPin> Rejected, IReadOnlyList<uint> Ignored);
+
+/// <summary>Насколько пользователь доверяет адаптеру: его публичные сети и маршруты локальны только у доверенного.</summary>
+public enum AdapterTrust
+{
+    None,
+
+    /// <summary>Распознанная виртуальная сеть при включённом «Виртуальные сети»: доверие только к диапазонам поставщика.</summary>
+    Overlay,
+
+    /// <summary>Адаптер из списка «Доверенные адаптеры»: доверие ко всем его сетям и маршрутам.</summary>
+    Explicit,
+}
+
+/// <summary>Публичный маршрутизатор недоверенного адаптера: локален ниже правил, защита пропускает его только через Luid.</summary>
+public readonly record struct AdapterGateway(uint Address, ulong Luid);
+
+/// <summary>
+/// Итог <see cref="PolicyCompiler.SelectOnLinkPrefixes"/>: локальные сети, отброшенные публичные сети адаптеров (для
+/// предупреждения) и публичные маршрутизаторы недоверенных адаптеров.
+/// </summary>
+public sealed record OnLinkSelection(
+    IReadOnlyList<Ipv4Cidr> Local,
+    IReadOnlyList<(AdapterCandidate Adapter, Ipv4Cidr Prefix)> Untrusted,
+    IReadOnlyList<AdapterGateway> Gateways);
+
+/// <summary>
+/// Группа туннелей с уже отобранными участниками: служба передаёт только те, что сейчас годны
+/// (при распределении — все поднятые, при резервировании — первый поднятый). Пустой список
+/// означает, что группа целиком недоступна.
+/// </summary>
+public sealed record TunnelGroup(Guid Id, IReadOnlyList<Guid> Members);
+
+/// <summary>Решение и его происхождение; Tunnel заполнен только при Decision.Vpn.</summary>
+public readonly record struct Classification(Decision Decision, DecisionSource Source, UserRule? Rule, Guid Tunnel = default);
+
+/// <summary>Входные данные компилятора политики.</summary>
+public sealed record PolicyInput
+{
+    /// <summary>Куда идёт «остальной интернет» — всё, что не попало ни в одно правило.</summary>
+    public RouteTarget DefaultTarget { get; init; } = RouteTarget.Direct;
+
+    /// <summary>Куда идут адреса из RU-базы.</summary>
+    public RouteTarget GeoTarget { get; init; } = RouteTarget.Direct;
+
+    public RangeSet Geo { get; init; } = RangeSet.Empty;
+
+    /// <summary>
+    /// Куда идут адреса из списка обхода блокировок. Слой ложится поверх RU-базы: заблокированный
+    /// ресурс на российском хостинге должен идти через VPN, иначе он так и останется недоступен.
+    /// </summary>
+    public RouteTarget BypassTarget { get; init; } = RouteTarget.Direct;
+
+    public RangeSet Bypass { get; init; } = RangeSet.Empty;
+
+    public IReadOnlyList<UserRule> Rules { get; init; } = [];
+
+    /// <summary>Группы туннелей с годными участниками на момент сборки политики.</summary>
+    public IReadOnlyList<TunnelGroup> Groups { get; init; } = [];
+
+    /// <summary>On-link-префиксы интерфейсов (кроме туннелей), считаются локальными сетями.</summary>
+    public IReadOnlyList<Ipv4Cidr> OnLinePrefixes { get; init; } = [];
+
+    /// <summary>
+    /// Публичные адреса маршрутизаторов недоверенных адаптеров с публичной сетью (<see cref="PolicyCompiler.SelectOnLinkPrefixes"/>).
+    /// Они локальны, но слоем ниже правил пользователя и закреплений: чужая точка доступа, назвавшая маршрутизатором ценный
+    /// публичный адрес, не выведет его из VPN, если правило или закрепление ведёт его в туннель.
+    /// </summary>
+    public IReadOnlyList<uint> AdapterGateways { get; init; } = [];
+
+    /// <summary>IPv4-адреса серверов всех активных туннелей: транспорт идёт через основной адаптер.</summary>
+    public IReadOnlyList<uint> ServerAddresses { get; init; } = [];
+
+    /// <summary>Адреса DNS, к которым обращается служба до туннеля (начальное разрешение, DNS LAN).</summary>
+    public IReadOnlyList<uint> ServiceDnsAddresses { get; init; } = [];
+
+    /// <summary>
+    /// Сети поднятых шлюзов AnyConnect. Перекрывают пользовательские правила и частные диапазоны
+    /// (шлюз присылает 10.0.0.0/8), но не реальные сети адаптеров и не служебные адреса.
+    /// </summary>
+    public IReadOnlyList<ServerNetworks> ServerNetworks { get; init; } = [];
+
+    /// <summary>DNS-серверы туннелей: частная сеть шлюза не должна перехватить DNS другого туннеля.</summary>
+    public IReadOnlyList<TunnelHost> TunnelHosts { get; init; } = [];
+
+    /// <summary>
+    /// Адреса из правил для доменов. Они попадают в ту же политику, что маршруты и фильтры: иначе
+    /// закрепление живёт отдельно от решения и адрес уходит мимо назначенного туннеля.
+    /// </summary>
+    public IReadOnlyList<PinnedHost> PinnedHosts { get; init; } = [];
+}
