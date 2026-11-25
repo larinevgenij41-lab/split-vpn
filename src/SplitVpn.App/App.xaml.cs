@@ -82,10 +82,10 @@ public partial class App : Application
         Autostart.RepairStalePath();
 
         var connection = new ServiceConnection();
-        _main = new MainViewModel(connection, preferences) { Confirm = ConfirmAsync };
+        _main = new MainViewModel(connection, preferences) { Confirm = ConfirmAsync, ShowWindow = ShowMainWindow };
         var window = new MainWindow { DataContext = _main };
         MainWindow = window;
-        _tray = new TrayIcon(_main, ShowMainWindow, ExitApplication);
+        _tray = new TrayIcon(_main, ShowMainWindow, () => _ = RequestExitAsync());
         var signIn = new SignInCoordinator(connection);
         _main.ActivateSignIn = signIn.Activate;
         _proxy = new ProxyService(new WinInetProxySettings());
@@ -154,6 +154,18 @@ public partial class App : Application
         _ = _main?.RefreshAsync();
     }
 
+    /// <summary>
+    /// Выход по команде пользователя (меню трея): несохранённые черновики подключений, доска, «Защита» и «Настройки»
+    /// молча не теряются — сначала подтверждение. Завершение сеанса Windows и установщик закрывают сразу.
+    /// </summary>
+    public async Task RequestExitAsync()
+    {
+        if (_main is null || await _main.ConfirmDiscardUnsavedAsync())
+        {
+            ExitApplication();
+        }
+    }
+
     public void ExitApplication()
     {
         if (MainWindow is MainWindow window)
@@ -219,7 +231,9 @@ public partial class App : Application
         }
         catch (Exception ex) when (ex is IOException or TimeoutException or UnauthorizedAccessException)
         {
-            MessageBox.Show("Не удалось открыть окно уже запущенного приложения: " + ex.Message, "Раздельный VPN", MessageBoxButton.OK, MessageBoxImage.Warning);
+            Verbose.Write("Ui", "окно первого экземпляра не открыто: " + ex.GetType().Name + " «" + ex.Message + "»");
+            MessageBox.Show("Не удалось открыть окно уже запущенного приложения. Щёлкните по значку «Раздельного VPN» в области уведомлений.",
+                "Раздельный VPN", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 

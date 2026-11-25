@@ -54,7 +54,8 @@ public static class UpdateLauncher
         }
         catch (Win32Exception ex)
         {
-            return (0, "Установщик обновления не запустился: " + ex.Message);
+            SplitVpn.Core.Diagnostics.Verbose.Write("Update", "установщик не запущен: " + ex.Message);
+            return (0, $"Установщик обновления не запустился (код {ex.NativeErrorCode}). Повторите установку позже.");
         }
     }
 

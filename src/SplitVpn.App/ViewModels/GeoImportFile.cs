@@ -18,12 +18,23 @@ internal static class GeoImportFile
     /// <summary>Запрос импорта из файла; слишком большой файл - <see cref="FormatException"/> с понятным текстом.</summary>
     public static async Task<GeoImportRequest> ReadAsync(string path)
     {
-        if (new FileInfo(path).Length > MaxBytes)
+        string text;
+        try
         {
-            throw new FormatException(TooLarge);
+            if (new FileInfo(path).Length > MaxBytes)
+            {
+                throw new FormatException(TooLarge);
+            }
+
+            text = await File.ReadAllTextAsync(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            // Сообщение .NET английское: пользователю — имя файла и что с ним, исходное — в журнал.
+            throw new UserFacingException(UiText.FileError(ex, path), ex);
         }
 
-        var request = new GeoImportRequest(await File.ReadAllTextAsync(path));
+        var request = new GeoImportRequest(text);
         return FrameCodec.Fits(request)
             ? request
             : throw new FormatException(TooLarge + " При передаче переводы строк занимают вдвое больше места, чем в файле: уберите из файла комментарии и пустые строки.");

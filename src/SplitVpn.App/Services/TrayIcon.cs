@@ -23,11 +23,14 @@ public sealed class TrayIcon : IDisposable
     private readonly MenuItem _state = new() { IsEnabled = false };
     private readonly MenuItem _connect = new() { Header = "Подключить" };
     private readonly MenuItem _disconnect = new() { Header = "Отключить (защита остаётся)" };
-    private readonly MenuItem _restore = new() { Header = "Отключить и восстановить обычный интернет" };
+    private readonly MenuItem _restore = new() { Header = "Отключить и восстановить интернет" };
     // Пункт и включает выключенное подключение (дополнительным), и выключает дополнительное: название про оба действия.
     private readonly MenuItem _profiles = new() { Header = "Включить или выключить подключения" };
     private string _currentIcon = "";
     private bool _filling;
+
+    /// <summary>Последнее показанное уведомление: Windows показывает одно, и щелчок относится к нему.</summary>
+    private AppNotification? _lastNotification;
 
     public TrayIcon(MainViewModel main, Action showWindow, Action exit)
     {
@@ -35,7 +38,16 @@ public sealed class TrayIcon : IDisposable
         _showWindow = showWindow;
         _connect.Click += async (_, _) => await RunAsync(_main.ConnectCommand);
         _disconnect.Click += async (_, _) => await RunAsync(_main.DisconnectCommand);
-        _restore.Click += async (_, _) => await RunAsync(_main.DisconnectAndRestoreCommand);
+        _restore.Click += async (_, _) =>
+        {
+            // Снятие защиты подтверждается: окно открывается, чтобы вопрос появился поверх него, а не где-то сбоку.
+            if (_main.DisconnectAndRestoreCommand.CanExecute(null))
+            {
+                _showWindow();
+            }
+
+            await RunAsync(_main.DisconnectAndRestoreCommand);
+        };
         _profiles.SubmenuOpened += async (_, e) =>
         {
             if (e.OriginalSource == _profiles)
@@ -65,7 +77,18 @@ public sealed class TrayIcon : IDisposable
             NoLeftClickDelay = true,
             LeftClickCommand = new RelayCommand(showWindow),
         };
-        _icon.TrayBalloonTipClicked += (_, _) => showWindow();
+        // Щелчок по уведомлению открывает окно там, где нужно действие, а не на последней открытой странице.
+        _icon.TrayBalloonTipClicked += (_, _) =>
+        {
+            if (_lastNotification is { } notification)
+            {
+                _main.OpenNotificationTarget(notification);
+            }
+            else
+            {
+                showWindow();
+            }
+        };
         _icon.ForceCreate(false);
 
         _main.StatusUpdated += Update;
@@ -130,11 +153,17 @@ public sealed class TrayIcon : IDisposable
     /// </summary>
     internal static string Tooltip(string stateText, StatusDto? status)
     {
+        // Туннелю AnyConnect нужен не пароль, а вход на шлюзе: подсказка говорит, что именно ждёт пользователя.
+        if (status is { State: ConnectionState.PasswordRequired } && status.Tunnels.Any(t => t.SignIn is not null))
+        {
+            stateText = "Требуется вход";
+        }
+
         var protection = status is null ? "" : status.ProtectionSuspended ? "защита снята" : status.ProtectionActive ? "защита включена" : "защита выключена";
         var text = "Раздельный VPN: " + stateText + (protection.Length > 0 ? ", " + protection : "");
         if (status is not null)
         {
-            text += "\nРоссия → " + status.GeoTargetName + "\nОстальное → " + status.DefaultTargetName;
+            text += "\nРоссия → " + status.GeoTargetName + "\nОстальной интернет → " + status.DefaultTargetName;
         }
 
         return text.Length > 127 ? text[..126] + "…" : text;
@@ -167,7 +196,7 @@ public sealed class TrayIcon : IDisposable
                 {
                     // Пункт меняет роль, то есть выключает совсем. Временное отключение — выключатель в строке
                     // на главной и на странице «Подключения»; здесь оно и помечается, чтобы смыслы не путались.
-                    Header = profile.Name + profile.Role switch { ProfileRole.Primary => " (опорное)", ProfileRole.Secondary => " (дополнительное)", _ => "" }
+                    Header = UiText.MenuHeader(profile.Name) + profile.Role switch { ProfileRole.Primary => " (опорное)", ProfileRole.Secondary => " (дополнительное)", _ => "" }
                         + (paused.Contains(profile.Id) ? " — сейчас отключено" : ""),
                     IsChecked = profile.Role != ProfileRole.Off,
                     IsEnabled = profile.Role != ProfileRole.Primary,
@@ -222,11 +251,20 @@ public sealed class TrayIcon : IDisposable
         return new System.Drawing.Icon(stream, size, size);
     }
 
-    private void ShowNotification(string title, string message)
+    /// <summary>Значок уведомления по его важности: обрыв и блокировка — предупреждение, ошибка — ошибка.</summary>
+    internal static NotificationIcon IconFor(NotificationKind kind) => kind switch
     {
+        NotificationKind.Error => NotificationIcon.Error,
+        NotificationKind.Warning => NotificationIcon.Warning,
+        _ => NotificationIcon.Info,
+    };
+
+    private void ShowNotification(AppNotification notification)
+    {
+        _lastNotification = notification;
         try
         {
-            _icon.ShowNotification(title, message, NotificationIcon.Info);
+            _icon.ShowNotification(notification.Title, notification.Text, IconFor(notification.Kind));
         }
         catch (InvalidOperationException ex)
         {

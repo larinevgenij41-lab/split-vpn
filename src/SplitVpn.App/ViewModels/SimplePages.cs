@@ -52,7 +52,8 @@ public sealed partial class CheckAddressViewModel(MainViewModel main) : PageView
         "Block" => "Заблокировано",
         "Local" => "Локальная сеть",
         "Server" => "Сервер VPN",
-        _ => decision,
+        // Служба новее приложения прислала решение, которого интерфейс не знает: служебное имя пользователю не показываем.
+        _ => "Неизвестное решение",
     };
 }
 
@@ -77,6 +78,8 @@ public sealed partial class ProtectionViewModel(MainViewModel main) : PageViewMo
     /// <summary>Есть несохранённые правки: при возврате на страницу они не перезаписываются настройками службы.</summary>
     [ObservableProperty]
     private bool _dirty;
+
+    public override bool HasUnsavedChanges => Dirty;
 
     [ObservableProperty]
     private OutageMode _outageMode;
@@ -309,6 +312,8 @@ public sealed partial class SettingsViewModel(MainViewModel main) : PageViewMode
     [ObservableProperty]
     private bool _dirty;
 
+    public override bool HasUnsavedChanges => Dirty;
+
     [ObservableProperty]
     private bool _autostart;
 
@@ -485,7 +490,8 @@ public sealed partial class SettingsViewModel(MainViewModel main) : PageViewMode
         }
         catch (IOException ex)
         {
-            ShowMessage(ex.Message, isError: true);
+            Verbose.Write("Ui", "автозапуск не изменён: " + ex.Message);
+            ShowMessage("Не удалось изменить запуск при входе в Windows: Windows не разрешила изменить запись автозапуска. Повторите позже.", isError: true);
             // Переключатель возвращается к фактическому состоянию реестра.
             _loading = true;
             try
@@ -575,8 +581,59 @@ public sealed partial class DiagnosticsViewModel(MainViewModel main) : PageViewM
     /// </summary>
     private bool _replaceEvents;
 
-    [ObservableProperty]
-    private IReadOnlyList<ServiceEvent> _events = [];
+    /// <summary>Журнал событий: новые вставляются в начало того же списка, прокрутка не сбрасывается.</summary>
+    public EventJournal Journal { get; } = new();
+
+    /// <summary>Видимые события, новые первыми.</summary>
+    public ObservableCollection<ServiceEvent> Events => Journal.Visible;
+
+    /// <summary>«Только ошибки и предупреждения».</summary>
+    public bool OnlyProblems
+    {
+        get => Journal.OnlyProblems;
+        set
+        {
+            if (Journal.OnlyProblems != value)
+            {
+                Journal.OnlyProblems = value;
+                OnPropertyChanged();
+            }
+        }
+    }
+
+    [RelayCommand]
+    private void CopyEvent(ServiceEvent? item)
+    {
+        if (item is not null)
+        {
+            CopyText(EventJournal.Format(item), null);
+        }
+    }
+
+    [RelayCommand]
+    private void CopyAllEvents() => CopyText(Journal.FormatVisible(), $"Скопировано событий: {Events.Count}.");
+
+    private void CopyText(string text, string? done)
+    {
+        if (text.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            Clipboard.SetText(text);
+            if (done is not null)
+            {
+                ShowMessage(done, isError: false);
+            }
+        }
+        catch (System.Runtime.InteropServices.ExternalException ex)
+        {
+            Verbose.Write("Ui", "буфер обмена недоступен: " + ex.Message);
+            ShowError(HomeViewModel.ClipboardBusy);
+        }
+    }
 
     [ObservableProperty]
     private bool _maskReport = true;
@@ -650,13 +707,21 @@ public sealed partial class DiagnosticsViewModel(MainViewModel main) : PageViewM
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // Рабочий стол недоступен для записи (политика, OneDrive): пусть пользователь выберет место сам.
+            Verbose.Write("Ui", "архив на рабочий стол не записан: " + ex.GetType().Name + " «" + ex.Message + "»");
             var dialog = new SaveFileDialog { FileName = Path.GetFileName(path), Filter = "Архив ZIP|*.zip" };
             if (dialog.ShowDialog() != true)
             {
-                return "Архив не сохранён: " + ex.Message;
+                return "Архив не сохранён: на рабочий стол записать не удалось, а другое место не выбрано.";
             }
 
-            result = await Task.Run(() => DiagnosticsArchive.BuildAsync((request, token) => Service.SendAsync(request, token), files, dialog.FileName, progress, CancellationToken.None));
+            try
+            {
+                result = await Task.Run(() => DiagnosticsArchive.BuildAsync((request, token) => Service.SendAsync(request, token), files, dialog.FileName, progress, CancellationToken.None));
+            }
+            catch (Exception again) when (again is IOException or UnauthorizedAccessException)
+            {
+                throw new UserFacingException(UiText.FileError(again, dialog.FileName, writing: true), again);
+            }
         }
 
         try { Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{result.Path}\"") { UseShellExecute = true }); }
@@ -683,7 +748,7 @@ public sealed partial class DiagnosticsViewModel(MainViewModel main) : PageViewM
     /// </summary>
     internal const string ArchivePrivacyNote =
         "Паролей в нём нет, но есть адреса VPN-серверов, имена подключений, сетевые адреса компьютера и имя пользователя Windows, "
-        + "а при включённом подробном журнале - имена открывавшихся сайтов. Передавайте архив только тому, кто будет разбирать проблему.";
+        + "а при включённом подробном журнале — имена открывавшихся сайтов. Передавайте архив только тому, кто будет разбирать проблему.";
 
     private void RefreshVerbose()
     {
@@ -699,7 +764,7 @@ public sealed partial class DiagnosticsViewModel(MainViewModel main) : PageViewM
         _eventsGeneration++;
         _lastEventId = 0;
         _ids.Clear();
-        Events = [];
+        Journal.Clear();
         return LoadEventsAsync();
     });
 
@@ -731,7 +796,7 @@ public sealed partial class DiagnosticsViewModel(MainViewModel main) : PageViewM
                 if (_replaceEvents || (events.Count > 0 && (events[0].Id <= _lastEventId || (_lastEventId != 0 && (events[0].Id >> 32) != (_lastEventId >> 32)))))
                 {
                     // Служба перезапущена: журнал нумеруется заново.
-                    Events = [];
+                    Journal.Clear();
                     _ids.Clear();
                     _lastEventId = 0;
                     _replaceEvents = false;
@@ -741,8 +806,8 @@ public sealed partial class DiagnosticsViewModel(MainViewModel main) : PageViewM
                 if (added.Count > 0)
                 {
                     _lastEventId = Math.Max(_lastEventId, added[0].Id);
-                    Events = added.Concat(Events).Take(500).ToArray();
-                    _ids.IntersectWith(Events.Select(e => e.Id));
+                    Journal.Prepend(added);
+                    _ids.IntersectWith(Journal.Ids);
                 }
             }
             while (_eventsReloadPending);
@@ -779,7 +844,7 @@ public sealed partial class DiagnosticsViewModel(MainViewModel main) : PageViewM
         }
 
         var report = await Service.RequestAsync<string>(new ExportReportRequest(MaskReport));
-        await File.WriteAllTextAsync(dialog.FileName, report);
+        await WriteUserFileAsync(dialog.FileName, report);
         return "Отчёт сохранён.";
     });
 
@@ -1063,6 +1128,12 @@ public sealed partial class AboutViewModel(MainViewModel main) : PageViewModel(m
             return null;
         }
 
+        // Установка закрывает приложение: несохранённые черновики и правки страниц молча не теряются.
+        if (!await Main.ConfirmDiscardUnsavedAsync(forUpdate: true))
+        {
+            return null;
+        }
+
         if (!await Main.Confirm($"Установить обновление {version}?", ConfirmText(), "Установить"))
         {
             return null;
@@ -1137,8 +1208,11 @@ public sealed partial class AboutViewModel(MainViewModel main) : PageViewModel(m
     }
 }
 
-/// <summary>Строка диагностики о сеансе шлюза AnyConnect.</summary>
-public sealed record GatewaySessionRow(string Title, string Description)
+/// <summary>
+/// Строка диагностики о сеансе шлюза AnyConnect. Технические подробности (протокол канала, MTU, версия библиотеки)
+/// вынесены в подсказку <see cref="Details"/>: в основной строке — то, что понятно без знания сетей.
+/// </summary>
+public sealed record GatewaySessionRow(string Title, string Description, string? Details = null)
 {
     public override string ToString() => $"{Title}: {Description}";
 
@@ -1147,9 +1221,13 @@ public sealed record GatewaySessionRow(string Title, string Description)
         var n = tunnel.ServerNetworks!;
         var parts = new List<string>
         {
-            n.DtlsActive ? "DTLS (UDP)" : "TLS (TCP)",
-            "MTU " + n.Mtu.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            n.DtlsActive ? "быстрый канал (UDP)" : "обычный канал (TCP)",
             Format.Count(n.Networks.Count, "сеть", "сети", "сетей"),
+        };
+        var details = new List<string>
+        {
+            n.DtlsActive ? "Канал DTLS (UDP)" : "Канал TLS (TCP): UDP недоступен или выключен",
+            "MTU " + n.Mtu.ToString(System.Globalization.CultureInfo.InvariantCulture),
         };
         if (n.Dns.Count > 0)
         {
@@ -1173,9 +1251,9 @@ public sealed record GatewaySessionRow(string Title, string Description)
 
         if (n.ClientVersion is { } version)
         {
-            parts.Add("libopenconnect " + version);
+            details.Add("libopenconnect " + version);
         }
 
-        return new GatewaySessionRow(tunnel.Name + (tunnel.VpnAddress is { } address ? " · " + address : ""), string.Join(" · ", parts));
+        return new GatewaySessionRow(tunnel.Name + (tunnel.VpnAddress is { } address ? " · " + address : ""), string.Join(" · ", parts), string.Join(" · ", details));
     }
 }

@@ -18,6 +18,21 @@ public enum GeoStartOption
     ImportFile,
 }
 
+/// <summary>Поле мастера с ошибкой ввода: в него переводится фокус.</summary>
+public enum WizardField
+{
+    None,
+    Name,
+    Server,
+    UserName,
+    Password,
+
+    /// <summary>Поля блока «Параметры входа и безопасности»: блок раскрывается.</summary>
+    Security,
+
+    ImportFile,
+}
+
 /// <summary>
 /// Мастер первого запуска: сервер и вход → основной адаптер → режим → RU-база → проверка.
 /// Мастер можно прервать и запустить снова; до шага «Готово» в системе ничего не меняется.
@@ -50,6 +65,7 @@ public sealed partial class WizardViewModel : ObservableObject
     public WizardViewModel(MainViewModel main, bool loadAdapters = true)
     {
         _main = main;
+        Security.ResetDetailsExpanded();
         if (loadAdapters)
         {
             _adapterLoad = LoadAdaptersAsync();
@@ -60,9 +76,38 @@ public sealed partial class WizardViewModel : ObservableObject
 
     public static IReadOnlyList<string> StepTitles { get; } = ["Сервер и вход", "Основной адаптер", "Режим", "RU-база", "Проверка"];
 
+    /// <summary>Шаг «RU-база»: при режиме «Весь интернет через VPN» база не используется, и шаг пропускается.</summary>
+    private const int GeoStep = 3;
+
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(StepTitle), nameof(CanGoBack), nameof(NextText))]
     private int _step;
+
+    /// <summary>Шаг показывается: «RU-база» — только в режиме «Россия напрямую».</summary>
+    public bool IsStepShown(int step) => step != GeoStep || RussiaDirect;
+
+    /// <summary>Последний шаг с вводом: после него «Готово: подключить».</summary>
+    public int LastInputStep => RussiaDirect ? GeoStep : GeoStep - 1;
+
+    private int ShownStepCount => Enumerable.Range(0, LastStep + 1).Count(IsStepShown);
+
+    private int ShownStepNumber => Enumerable.Range(0, Math.Clamp(Step, 0, LastStep) + 1).Count(IsStepShown);
+
+    // Запросы фокуса на поле с ошибкой: представление переводит курсор в поле при каждом изменении.
+    [ObservableProperty]
+    private int _nameFocusToken;
+
+    [ObservableProperty]
+    private int _serverFocusToken;
+
+    [ObservableProperty]
+    private int _userNameFocusToken;
+
+    [ObservableProperty]
+    private int _passwordFocusToken;
+
+    [ObservableProperty]
+    private int _importFocusToken;
 
     [ObservableProperty]
     private string _name = "Основное";
@@ -86,6 +131,7 @@ public sealed partial class WizardViewModel : ObservableObject
     private AdapterDto? _pinnedAdapter;
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(StepTitle), nameof(NextText), nameof(LastInputStep))]
     private bool _russiaDirect = true;
 
     [ObservableProperty]
@@ -107,7 +153,7 @@ public sealed partial class WizardViewModel : ObservableObject
     [NotifyPropertyChangedFor(nameof(CanGoBack), nameof(CanCancel), nameof(NextText))]
     private bool _finished;
 
-    public string StepTitle => $"Шаг {Step + 1} из {LastStep + 1}. {StepTitles[Math.Clamp(Step, 0, LastStep)]}";
+    public string StepTitle => $"Шаг {ShownStepNumber} из {ShownStepCount}. {StepTitles[Math.Clamp(Step, 0, LastStep)]}";
 
     public bool CanGoBack => Step > 0 && !Finished && !IsBusy;
 
@@ -120,7 +166,7 @@ public sealed partial class WizardViewModel : ObservableObject
         NextCommand.NotifyCanExecuteChanged();
     }
 
-    public string NextText => Step == LastStep - 1 ? "Готово: подключить" : Finished ? "Закрыть" : "Далее";
+    public string NextText => Finished ? "Закрыть" : Step == LastInputStep ? "Готово: подключить" : "Далее";
 
     public bool GeoDownloadNow
     {
@@ -151,7 +197,13 @@ public sealed partial class WizardViewModel : ObservableObject
     private void Back()
     {
         Error = null;
-        Step = Math.Max(0, Step - 1);
+        var step = Math.Min(Step, LastStep) - 1;
+        while (step > 0 && !IsStepShown(step))
+        {
+            step--;
+        }
+
+        Step = Math.Max(0, step);
     }
 
     private bool CanGoNext => !IsBusy;
@@ -171,9 +223,11 @@ public sealed partial class WizardViewModel : ObservableObject
             return;
         }
 
-        Error = ValidateStep();
+        var (error, field) = ValidateStep();
+        Error = error;
         if (Error is not null)
         {
+            FocusField(field);
             return;
         }
 
@@ -183,18 +237,25 @@ public sealed partial class WizardViewModel : ObservableObject
             Error = await NameProblemAsync();
             if (Error is not null)
             {
+                FocusField(WizardField.Name);
                 return;
             }
         }
 
-        if (Step == LastStep - 1)
+        if (Step >= LastInputStep)
         {
             Step = LastStep;
             await ApplyAsync();
             return;
         }
 
-        Step++;
+        var next = Step + 1;
+        while (next < LastStep && !IsStepShown(next))
+        {
+            next++;
+        }
+
+        Step = next;
         if (Step == 1 && Adapters.Count == 0)
         {
             await (_adapterLoad is { IsCompleted: false } ? _adapterLoad : _adapterLoad = LoadAdaptersAsync());
@@ -250,7 +311,7 @@ public sealed partial class WizardViewModel : ObservableObject
             {
                 if (!await _main.RunCommandAsync(new DisconnectRequest(KeepProtection: false)))
                 {
-                    Error = "Не удалось отключить VPN и снять защиту. Повторите «Отмена» или нажмите «Отключить VPN и восстановить интернет» на главной странице.";
+                    Error = "Не удалось отключить VPN и снять защиту. Повторите «Отмена» или нажмите «Отключить и восстановить интернет» на главной странице.";
                     return;
                 }
 
@@ -280,26 +341,47 @@ public sealed partial class WizardViewModel : ObservableObject
         }
     }
 
-    private string? ValidateStep() => Step switch
+    /// <summary>Проверка шага: текст ошибки называет поле, а поле получает фокус (см. <see cref="FocusField"/>).</summary>
+    internal (string? Error, WizardField Field) ValidateStep() => Step switch
     {
-        0 when string.IsNullOrWhiteSpace(Name) => "Введите название подключения.",
-        0 when !VpnProtocols.TryParseServer(Server, Security.Protocol, out _) => VpnProtocols.ServerHint(Security.Protocol),
-        0 when !VpnProtocols.Supports(Security.Protocol, Security.AuthMethod) => Security.CompatibilityHint,
-        0 when VpnProtocols.ValidateAuthentication(Security.Apply(new ConnectionProfile { UserName = UserName })) is [var error, ..] => error,
-        0 when Security.NeedsPassword && string.IsNullOrWhiteSpace(UserName) => "Введите имя пользователя.",
-        0 => MissingCredentialMessage(CanKeepCredentials(BuildProfile(null))),
-        1 when PinAdapter && PinnedAdapter is null => "Выберите адаптер или оставьте автоматический выбор.",
-        3 when RussiaDirect && GeoOption == GeoStartOption.ImportFile && !File.Exists(ImportPath) => "Выберите файл базы.",
-        3 when RussiaDirect && GeoOption == GeoStartOption.ImportFile && new FileInfo(ImportPath!).Length > GeoImportFile.MaxBytes => GeoImportFile.TooLarge,
-        _ => null,
+        0 when string.IsNullOrWhiteSpace(Name) => ("Название: введите название подключения, например «Основное».", WizardField.Name),
+        0 when !VpnProtocols.TryParseServer(Server, Security.Protocol, out _) => (UiText.ServerFieldError(Security.Protocol), WizardField.Server),
+        0 when !VpnProtocols.Supports(Security.Protocol, Security.AuthMethod)
+            => ("Способ входа: прежний способ несовместим с выбранным протоколом. Выберите новый в блоке «Параметры входа и безопасности».", WizardField.Security),
+        0 when VpnProtocols.ValidateAuthentication(Security.Apply(new ConnectionProfile { UserName = UserName })) is [var error, ..]
+            => (error, error.StartsWith("Имя пользователя", StringComparison.Ordinal) ? WizardField.UserName : WizardField.Security),
+        0 when Security.NeedsPassword && string.IsNullOrWhiteSpace(UserName) => ("Имя пользователя: введите имя для входа в VPN.", WizardField.UserName),
+        0 => MissingCredential(CanKeepCredentials(BuildProfile(null))),
+        1 when PinAdapter && PinnedAdapter is null => ("Адаптер: выберите адаптер или оставьте автоматический выбор.", WizardField.None),
+        3 when RussiaDirect && GeoOption == GeoStartOption.ImportFile && !File.Exists(ImportPath) => ("Файл базы: выберите файл со списком сетей.", WizardField.ImportFile),
+        3 when RussiaDirect && GeoOption == GeoStartOption.ImportFile && new FileInfo(ImportPath!).Length > GeoImportFile.MaxBytes => (GeoImportFile.TooLarge, WizardField.ImportFile),
+        _ => (null, WizardField.None),
     };
 
-    private string? MissingCredentialMessage(bool canKeep)
+    private (string? Error, WizardField Field) MissingCredential(bool canKeep)
     {
-        if (canKeep) { return null; }
-        if (Security.NeedsPassword && Password.Length == 0) { return "Введите пароль."; }
-        return Security.NeedsPsk && Security.PreSharedKey.Length == 0 ? "Введите общий ключ IPsec (PSK)." : null;
+        if (canKeep) { return (null, WizardField.None); }
+        if (Security.NeedsPassword && Password.Length == 0) { return ("Пароль: введите пароль для входа в VPN.", WizardField.Password); }
+        return Security.NeedsPsk && Security.PreSharedKey.Length == 0
+            ? ("Общий ключ IPsec (PSK): введите ключ, который выдал администратор VPN.", WizardField.Security)
+            : (null, WizardField.None);
     }
+
+    /// <summary>Курсор — в поле с ошибкой; поля безопасности в свёрнутом блоке — блок раскрывается.</summary>
+    private void FocusField(WizardField field)
+    {
+        switch (field)
+        {
+            case WizardField.Name: NameFocusToken++; break;
+            case WizardField.Server: ServerFocusToken++; break;
+            case WizardField.UserName: UserNameFocusToken++; break;
+            case WizardField.Password: PasswordFocusToken++; break;
+            case WizardField.ImportFile: ImportFocusToken++; break;
+            case WizardField.Security: Security.DetailsExpanded = true; break;
+        }
+    }
+
+    private string? MissingCredentialMessage(bool canKeep) => MissingCredential(canKeep).Error;
 
     private const string NameTaken = "Название уже занято. Укажите другое название подключения.";
 
@@ -397,6 +479,11 @@ public sealed partial class WizardViewModel : ObservableObject
                             ? "Исправьте данные и нажмите «Далее» — или «Отмена»: VPN отключится, защита снимется, подключение останется в «Подключениях»."
                             : "Исправьте данные и нажмите «Далее» — или «Отмена»: вернутся прежние настройки подключений, работающие подключения не разорвутся, а новое останется выключенным в «Подключениях».");
                     Step = 0;
+                    if (status?.State == ConnectionState.PasswordRequired || status?.ErrorCategory == ErrorCategory.Authentication)
+                    {
+                        PasswordFocusToken++;
+                    }
+
                     return;
                 }
 
@@ -408,7 +495,7 @@ public sealed partial class WizardViewModel : ObservableObject
                     await _main.Service.CommandAsync(new GeoUpdateNowRequest());
                 }
 
-                Progress = "Готово. " + StatusText.Format(status);
+                Progress = "Готово. " + UiText.StatusSummary(status);
             }
             finally
             {
@@ -421,8 +508,17 @@ public sealed partial class WizardViewModel : ObservableObject
         }
         catch (Exception ex)
         {
-            Error = ex.Message;
-            Step = LastStep - 1;
+            // Сообщения службы и самого приложения русские; системные (.NET) — английские и пользователю не показываются.
+            Error = ex is ServiceUnavailableException or Services.ServiceCommandException or FormatException or UserFacingException
+                ? ex.Message
+                : ex is IOException or UnauthorizedAccessException ? UiText.FileError(ex, ImportPath)
+                : "Не удалось применить настройки. Повторите «Готово: подключить»; если ошибка повторится, соберите архив в «Диагностике».";
+            if (Error.StartsWith("Не удалось применить", StringComparison.Ordinal))
+            {
+                SplitVpn.Core.Diagnostics.Verbose.Write("Ui", "мастер: ошибка применения " + ex);
+            }
+
+            Step = LastInputStep;
         }
         finally
         {

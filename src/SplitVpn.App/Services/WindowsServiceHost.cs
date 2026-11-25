@@ -116,7 +116,8 @@ public static class WindowsServiceHost
         }
         catch (Win32Exception ex)
         {
-            return $"{Failure(action)}: {ex.Message}";
+            SplitVpn.Core.Diagnostics.Verbose.Write("Ui", "команда службе Windows не запущена: " + ex.Message);
+            return $"{Failure(action)} (код {ex.NativeErrorCode}). Проверьте службу «Раздельный VPN» в «Службах» Windows.";
         }
 
         var target = ServiceHostCommands.Target(action);

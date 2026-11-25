@@ -15,6 +15,7 @@
     <views:LevelToAppearanceConverter x:Key="LevelAppearance" />
     <views:DecisionToAppearanceConverter x:Key="DecisionAppearance" />
     <views:RoleToAppearanceConverter x:Key="RoleAppearance" />
+    <views:MenuHeaderConverter x:Key="MenuHeader" />
 
     <DataTemplate x:Key="WrappingChoiceContent">
         <TextBlock Text="{Binding}" TextWrapping="Wrap" />

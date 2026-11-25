@@ -127,7 +127,8 @@ public sealed class ProxyService : IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
         {
             Verbose.Write("Proxy", "Не удалось обновить прокси: " + ex.Message);
-            return "Не удалось обновить прокси Windows: " + ex.Message;
+            // Системный текст — в журнал; пользователю — что это значит для браузеров.
+            return "Не удалось обновить прокси Windows: браузеры могут идти мимо прокси шлюза AnyConnect. Повторная попытка — при следующем изменении состояния.";
         }
     }
 }

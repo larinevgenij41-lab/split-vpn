@@ -1,5 +1,6 @@
 using Microsoft.Web.WebView2.Core;
 using SplitVpn.App.Services;
+using SplitVpn.App.ViewModels;
 using SplitVpn.Core.Diagnostics;
 using SplitVpn.Core.Ipc;
 using SplitVpn.Core.OpenConnect;
@@ -85,7 +86,7 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            ShowProblem("Встроенный браузер не запустился: " + ex.Message + " Закройте окно и нажмите «Войти» ещё раз.");
+            LogError("браузер не запустился", ex);
             return;
         }
 
@@ -107,7 +108,7 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
-                        ShowProblem("Страница входа не открылась: " + ex.Message);
+                        LogError("перезагрузка страницы после сбоя", ex);
                     }
                 }
                 else
@@ -146,7 +147,7 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
                         return;
                     }
 
-                    ShowProblem($"Страница входа не открылась ({e.WebErrorStatus}). Проверьте в «Проверить адрес», доступен ли сайт организации.");
+                    ShowProblem($"Страница входа не открылась: {UiText.WebError(e.WebErrorStatus)}. Проверьте в «Проверить адрес», доступен ли сайт организации.");
                     return;
                 }
 
@@ -160,7 +161,8 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            ShowProblem("Страница входа не открылась: " + ex.Message);
+            LogError("открытие страницы входа", ex);
+            ShowProblem("Страница входа не открылась: встроенный браузер не справился с ней. Закройте окно и нажмите «Войти» ещё раз.");
         }
     }
 
@@ -171,7 +173,7 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
     private async Task RetryLoadAsync(CoreWebView2 core, CoreWebView2WebErrorStatus status, int attempt, ulong failedNavigation)
     {
 
-        ShowProblem($"Страница входа пока не открывается ({status}): обычно это значит, что VPN ещё подключается."
+        ShowProblem($"Страница входа пока не открывается ({UiText.WebError(status)}): обычно это значит, что VPN ещё подключается."
             + $" Повтор через {SignInRetryPolicy.Delay.TotalSeconds:F0} с (попытка {attempt} из {SignInRetryPolicy.MaxAttempts}).");
         await Task.Delay(SignInRetryPolicy.Delay);
         if (_closed)
@@ -195,8 +197,8 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Окно закрывается или браузер уже не работает: повтор не нужен, причину покажет панель.
-
-            ShowProblem("Страница входа не открылась: " + ex.Message);
+            LogError("повтор загрузки", ex);
+            ShowProblem("Страница входа не открылась. Закройте окно и нажмите «Войти» ещё раз.");
         }
     }
 
@@ -227,7 +229,7 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             if (popup.IsVisible) { popup.Close(); }
-            if (!_closed) { ShowProblem("Окно входа не открылось: " + ex.Message); }
+            LogError("дополнительное окно входа", ex);
         }
     }
 
@@ -250,7 +252,7 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
                 try
                 {
                     var response = await _service.SendAsync(request, token);
-                    if (!response.Ok) { ShowProblem(response.ErrorMessage ?? "Служба отклонила результат входа."); }
+                    if (!response.Ok) { ShowProblem(UiText.ServiceRejected(response, "Служба отклонила результат входа.")); }
                     else { Problem.IsOpen = false; }
                     break;
                 }
@@ -269,9 +271,13 @@ public partial class SignInWindow : FluentWindow, ISignInWindow
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Ошибка браузера (окно уже закрывается, cookie недоступны): вход можно повторить кнопкой «Войти».
-            ShowProblem("Результат входа не удалось передать службе: " + ex.Message);
+            LogError("передача результата входа", ex);
         }
     }
+
+    /// <summary>Сообщение WebView2 и COM английское и техническое: оно — только в журнал, пользователю — фраза по смыслу места.</summary>
+    private static void LogError(string where, Exception ex) =>
+        Verbose.Write("SignIn", $"{where}: {ex.GetType().Name} 0x{ex.HResult:X8} «{ex.Message}»");
 
     private void ShowProblem(string text)
     {

@@ -91,7 +91,10 @@ public sealed partial class ConnectionSecurityViewModel : ObservableObject
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or System.Security.SecurityException)
         {
-            SshKeyStatus = "Файл ключа не прочитан: " + ex.Message + (PendingSshKey is null ? "" : " Ранее выбранный ключ сохранён.");
+            // Причины формата ключа пишет ядро по-русски; ошибки чтения файла от .NET — английские, они только в журнал.
+            var reason = ex is InvalidDataException ? ex.Message : UiText.FileError(ex, path);
+            SshKeyStatus = (ex is InvalidDataException ? "Файл ключа не прочитан: " + reason : reason)
+                + (PendingSshKey is null ? "" : " Ранее выбранный ключ сохранён.");
         }
     }
 

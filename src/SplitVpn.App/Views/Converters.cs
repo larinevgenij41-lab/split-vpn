@@ -16,6 +16,15 @@ public sealed class WidthBelowConverter : IValueConverter
     public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => Binding.DoNothing;
 }
 
+/// <summary>Текст для заголовка пункта меню: «_» не становится клавишей доступа и не пропадает из названия.</summary>
+public sealed class MenuHeaderConverter : IValueConverter
+{
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture) =>
+        ViewModels.UiText.MenuHeader(value as string);
+
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => Binding.DoNothing;
+}
+
 /// <summary>true/непустое → Visible; параметр «invert» меняет смысл.</summary>
 public sealed class VisibleWhenConverter : IValueConverter
 {

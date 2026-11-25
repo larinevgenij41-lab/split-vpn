@@ -20,7 +20,8 @@ public static class StatusText
         ConnectionState.DisconnectedExternally => "VPN отключён извне",
         ConnectionState.PasswordRequired => "Требуется пароль",
         ConnectionState.PartiallyApplied => "Неполное применение",
-        _ => state.ToString(),
+        // Служба новее приложения прислала состояние, которого интерфейс не знает: служебное имя пользователю не показываем.
+        _ => "Неизвестное состояние",
     };
 
     /// <summary>Строка вида «Россия → напрямую · Остальные адреса → через «Основной» · Защита включена».</summary>

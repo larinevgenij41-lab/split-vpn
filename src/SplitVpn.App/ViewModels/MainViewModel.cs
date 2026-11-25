@@ -34,8 +34,27 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private bool _lossExpected;
     private (TimeSpan Time, ulong Sent, ulong Received)? _lastBytes;
 
-    public MainViewModel(ServiceConnection service, UiPreferences preferences)
+    /// <summary>Одно и то же уведомление (вид и туннель) — не чаще раза в 5 минут: «мигающий» VPN не засыпает ими экран.</summary>
+    internal static readonly TimeSpan NotificationRepeatInterval = TimeSpan.FromMinutes(5);
+
+    /// <summary>Обрыв короче этого — переподключение, а не сбой: пара «оборвался» и «восстановлен» не показывается.</summary>
+    internal static readonly TimeSpan OutageNoticeDelay = TimeSpan.FromSeconds(30);
+
+    private readonly TimeProvider _time;
+    private readonly Dictionary<string, DateTimeOffset> _notifiedAt = [];
+
+    /// <summary>Когда начался обрыв опорного VPN (Подключено → Переподключение); null — обрыва нет.</summary>
+    private DateTimeOffset? _outageSince;
+
+    /// <summary>Об идущем обрыве уже сообщено: о восстановлении тогда тоже сообщается.</summary>
+    private bool _outageAnnounced;
+
+    /// <summary>Ошибка команды подключения, показанная на странице: снимается, когда VPN подключился.</summary>
+    private (PageViewModel Page, string Text)? _commandError;
+
+    public MainViewModel(ServiceConnection service, UiPreferences preferences, TimeProvider? time = null)
     {
+        _time = time ?? TimeProvider.System;
         Service = service;
         Preferences = preferences;
         Home = new HomeViewModel(this);
@@ -180,11 +199,66 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     /// <summary>Окно на экране: иначе ошибка команды (например, из трея) показывается уведомлением.</summary>
     public bool IsWindowVisible { get; set; }
 
-    /// <summary>Уведомление о значимом событии для трея (заголовок, текст).</summary>
-    public event Action<string, string>? Notify;
+    /// <summary>Уведомление о значимом событии для трея: текст, вид значка и страница, где нужно действие.</summary>
+    public event Action<AppNotification>? Notify;
 
     /// <summary>Окно переводит навигацию на страницу модели; без окна страница просто становится текущей.</summary>
     public event Action<PageViewModel>? NavigationRequested;
+
+    /// <summary>Показать главное окно (из трея оно может быть скрыто): подтверждение и итог должны быть видны.</summary>
+    public Action? ShowWindow { get; set; }
+
+    /// <summary>
+    /// Отложенное действие в потоке интерфейса (скрытие сообщения об успехе). Возвращает отмену.
+    /// По умолчанию — таймер диспетчера; тесты подставляют свой планировщик и не ждут реального времени.
+    /// </summary>
+    public Func<TimeSpan, Action, IDisposable> ScheduleUi { get; set; } = DispatcherDelay.Schedule;
+
+    /// <summary>Щелчок по уведомлению: окно открывается там, где нужно действие, а для пароля — сразу в поле ввода.</summary>
+    public void OpenNotificationTarget(AppNotification notification)
+    {
+        ArgumentNullException.ThrowIfNull(notification);
+        ShowWindow?.Invoke();
+        if (notification.Target is { } page)
+        {
+            NavigateTo(page);
+        }
+
+        if (notification.FocusPassword)
+        {
+            Home.PasswordFocusToken++;
+        }
+    }
+
+    /// <summary>Страницы с несохранёнными правками в порядке меню: о них спрашивают перед выходом и установкой обновления.</summary>
+    public IReadOnlyList<PageViewModel> PagesWithUnsavedChanges() => Pages.Where(p => p.HasUnsavedChanges).ToList();
+
+    /// <summary>
+    /// Перед выходом или установкой обновления: есть несохранённые правки — подтверждение со списком страниц.
+    /// Отказ открывает окно на первой такой странице. true — можно продолжать.
+    /// </summary>
+    public async Task<bool> ConfirmDiscardUnsavedAsync(bool forUpdate = false)
+    {
+        var pages = PagesWithUnsavedChanges();
+        if (pages.Count == 0)
+        {
+            return true;
+        }
+
+        ShowWindow?.Invoke();
+        var names = string.Join(", ", pages.Select(p => "«" + p.Title + "»"));
+        if (await Confirm("Есть несохранённые изменения",
+                $"Не сохранены: {names}. " + (forUpdate
+                    ? "При установке обновления приложение закроется, и они будут потеряны."
+                    : "При закрытии они будут потеряны."),
+                forUpdate ? "Установить без сохранения" : "Закрыть без сохранения"))
+        {
+            return true;
+        }
+
+        NavigateTo(pages[0]);
+        return false;
+    }
 
     public void NavigateTo(PageViewModel page)
     {
@@ -264,13 +338,18 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         try { Preferences = preferences.SaveChanges(Preferences); }
         catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException)
         {
-            CurrentPage.ShowError("Не удалось сохранить настройки интерфейса: " + ex.Message);
+            SplitVpn.Core.Diagnostics.Verbose.Write("Ui", "настройки интерфейса не сохранены: " + ex.GetType().Name + " «" + ex.Message + "»");
+            CurrentPage.ShowError("Не удалось сохранить настройки интерфейса: файл настроек занят другой копией приложения или недоступен. Повторите через несколько секунд.");
         }
         Settings.LoadPreferences(Preferences);
         ThemeService.Apply(Preferences.Theme);
     }
 
-    partial void OnCurrentPageChanged(PageViewModel value) => _ = value.OnOpenedAsync();
+    partial void OnCurrentPageChanged(PageViewModel value)
+    {
+        value.ClearSuccessMessage();
+        _ = value.OnOpenedAsync();
+    }
 
     [RelayCommand]
     private void Navigate(PageViewModel page) => NavigateTo(page);
@@ -285,9 +364,23 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     [RelayCommand(CanExecute = nameof(CanRunCommand))]
     private Task<bool> DisconnectAsync() => RunCommandAsync(new DisconnectRequest(KeepProtection: true));
 
-    /// <summary>«Отключить VPN и восстановить обычный интернет»: снимаются фильтры, маршруты, DNS.</summary>
+    /// <summary>
+    /// «Отключить и восстановить интернет»: снимаются фильтры, маршруты, DNS. Защита ослабляется — как и «Восстановить
+    /// сеть» в «Диагностике», действие подтверждается.
+    /// </summary>
     [RelayCommand(CanExecute = nameof(CanRunCommand))]
-    private Task<bool> DisconnectAndRestoreAsync() => RunCommandAsync(new DisconnectRequest(KeepProtection: false));
+    private async Task<bool> DisconnectAndRestoreAsync()
+    {
+        if (!await Confirm("Снять защиту?",
+                "VPN отключится, а маршруты, фильтры и DNS вернутся к исходным — весь трафик пойдёт напрямую через провайдера. "
+                + "Вернуть защиту можно кнопкой «Подключить».",
+                "Снять защиту"))
+        {
+            return false;
+        }
+
+        return await RunCommandAsync(new DisconnectRequest(KeepProtection: false));
+    }
 
     [RelayCommand(CanExecute = nameof(CanRunCommand))]
     private Task<bool> ToggleConnectionAsync() => RunCommandAsync(IsConnectedIntent(Status)
@@ -322,7 +415,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             accepted = response.Ok;
             if (!response.Ok)
             {
-                ShowCommandError(origin, response.ErrorMessage ?? "Служба отклонила команду.");
+                ShowCommandError(origin, UiText.ServiceRejected(response, "Служба отклонила команду."));
             }
             else if (response.ResultAs<StatusDto>() is { } status)
             {
@@ -355,11 +448,28 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private void ShowCommandError(PageViewModel origin, string text)
     {
         origin.ShowError(text);
+        _commandError = (origin, text);
         if (!IsWindowVisible || CurrentPage != origin)
         {
             // Ответ на действие пользователя: уведомление показывается независимо от настройки уведомлений о сбоях.
-            Notify?.Invoke("Команда не выполнена", text);
+            Notify?.Invoke(new AppNotification("Команда не выполнена", text, NotificationKind.Error, origin));
         }
+    }
+
+    /// <summary>VPN подключился: прежняя ошибка команды подключения больше не верна и снимается.</summary>
+    private void ClearStaleCommandError(StatusDto? previous, StatusDto current)
+    {
+        if (current.State != ConnectionState.Connected || previous?.State == ConnectionState.Connected || _commandError is not { } error)
+        {
+            return;
+        }
+
+        if (error.Page.Message == error.Text && error.Page.MessageIsError)
+        {
+            error.Page.Message = null;
+        }
+
+        _commandError = null;
     }
 
     private async Task PollAsync(bool force = false)
@@ -419,8 +529,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         Status = status;
         ApplyProgress(status.Progress);
         StateText = StatusText.StateName(status.State);
-        SummaryText = StatusText.Format(status);
+        SummaryText = UiText.StatusSummary(status);
         SpeedText = Speed(status);
+        ClearStaleCommandError(previous, status);
         NotifyTransitions(previous, status);
         foreach (var page in Pages)
         {
@@ -446,7 +557,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         var (title, text, advice) = Describe(error.Reason);
         if (lost && Preferences.Notifications)
         {
-            Notify?.Invoke(title, advice);
+            Notify?.Invoke(new AppNotification(title, advice, NotificationKind.Warning, null));
         }
 
         ServiceAvailable = false;
@@ -514,12 +625,45 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         return text;
     }
 
-    /// <summary>Уведомления только о значимых сбоях и восстановлении (PLAN §6).</summary>
+    /// <summary>
+    /// Уведомления только о значимых сбоях и восстановлении (PLAN §6). Короткий обрыв опорного VPN (до
+    /// <see cref="OutageNoticeDelay"/>) — одно «VPN переподключился», а не пара «оборвался»/«восстановлен». Одно и то же
+    /// уведомление повторяется не чаще <see cref="NotificationRepeatInterval"/>. Уведомления, требующие действия
+    /// (пароль, вход, ошибка, заблокированный трафик, неполное применение), этим пределом не подавляются.
+    /// </summary>
     private void NotifyTransitions(StatusDto? previous, StatusDto current)
     {
-        if (previous is null || !Preferences.Notifications)
+        var now = _time.GetUtcNow();
+        if (previous is null)
+        {
+            _outageSince = null;
+            _outageAnnounced = false;
+            return;
+        }
+
+        var outageAnnounced = _outageAnnounced;
+        if (previous.State == ConnectionState.Connected && current.State == ConnectionState.Reconnecting)
+        {
+            _outageSince = now;
+            _outageAnnounced = false;
+        }
+        else if (current.State != ConnectionState.Reconnecting)
+        {
+            _outageSince = null;
+            _outageAnnounced = false;
+        }
+
+        if (!Preferences.Notifications)
         {
             return;
+        }
+
+        // Обрыв затянулся: теперь это сбой, о нём стоит знать.
+        if (current.State == ConnectionState.Reconnecting && _outageSince is { } since && !_outageAnnounced && now - since >= OutageNoticeDelay)
+        {
+            _outageAnnounced = Emit("outage", new AppNotification("VPN оборвался", current.OutageMode == OutageMode.AllowAll
+                ? "До переподключения трафик идёт напрямую, без VPN."
+                : "Трафик через VPN заблокирован до переподключения.", NotificationKind.Warning, Home), now);
         }
 
         if (previous.State == current.State)
@@ -527,32 +671,59 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             var connected = previous.Tunnels.Where(t => t.State == ConnectionState.Connected).Select(t => t.ProfileId).ToHashSet();
             foreach (var tunnel in current.Tunnels.Where(t => connected.Contains(t.ProfileId) && !t.Paused && t.State is ConnectionState.Error or ConnectionState.Reconnecting or ConnectionState.DisconnectedExternally))
             {
-                Notify?.Invoke($"Прервалось подключение «{tunnel.Name}»", StatusText.StateName(tunnel.State));
+                var notification = new AppNotification($"Прервалось подключение «{tunnel.Name}»", StatusText.StateName(tunnel.State),
+                    tunnel.State == ConnectionState.Error ? NotificationKind.Error : NotificationKind.Warning, Home);
+                Emit(tunnel.State == ConnectionState.Error ? null : "tunnel:" + tunnel.ProfileId, notification, now);
             }
+
             return;
         }
 
-        var text = (previous.State, current.State) switch
+        (string? Key, AppNotification? Notice) choice = (previous.State, current.State) switch
         {
-            (ConnectionState.Connected, ConnectionState.Reconnecting) => ("VPN оборвался", current.OutageMode == OutageMode.AllowAll
-                ? "До переподключения трафик идёт напрямую, без VPN."
-                : "Трафик через VPN заблокирован до переподключения."),
-            (ConnectionState.Reconnecting, ConnectionState.Connected) => ("VPN восстановлен", StatusText.Format(current)),
+            // Об обрыве — позже и только если он затянулся (см. выше).
+            (ConnectionState.Connected, ConnectionState.Reconnecting) => (null, null),
+            (ConnectionState.Reconnecting, ConnectionState.Connected) when outageAnnounced
+                => ("restored", new AppNotification("VPN восстановлен", UiText.StatusSummary(current), NotificationKind.Info, Home)),
+            (ConnectionState.Reconnecting, ConnectionState.Connected)
+                => ("reconnected", new AppNotification("VPN переподключился", "Связь ненадолго прерывалась и восстановилась сама.", NotificationKind.Info, Home)),
             (ConnectionState.Error or ConnectionState.TrafficBlocked or ConnectionState.PasswordRequired or ConnectionState.PartiallyApplied, ConnectionState.Connected)
-                => ("VPN снова подключён", StatusText.Format(current)),
-            (_, ConnectionState.DisconnectedExternally) => ("VPN отключён извне", "Защита сохранена. «Подключить» — чтобы подключиться снова."),
-            (_, ConnectionState.Error) => ("Ошибка подключения", current.ErrorText ?? "Подробности на главной странице."),
+                => ("connected-again", new AppNotification("VPN снова подключён", UiText.StatusSummary(current), NotificationKind.Info, Home)),
+            (_, ConnectionState.DisconnectedExternally)
+                => ("external", new AppNotification("VPN отключён извне", "Защита сохранена. «Подключить» — чтобы подключиться снова.", NotificationKind.Warning, Home)),
+            (_, ConnectionState.Error)
+                => (null, new AppNotification("Ошибка подключения", current.ErrorText ?? "Подробности на главной странице.", NotificationKind.Error, Home)),
             (_, ConnectionState.PasswordRequired) when current.Tunnels.FirstOrDefault(t => t.SignIn is not null) is { } signIn
-                => ("Требуется вход", $"Войдите в «{signIn.Name}»: окно входа откроется само или по кнопке «Войти» на главной."),
-            (_, ConnectionState.PasswordRequired) => ("Требуется пароль", "Введите пароль на главной странице."),
-            (_, ConnectionState.PartiallyApplied) => ("Неполное применение", current.ErrorText ?? "Откройте «Диагностика»."),
-            (_, ConnectionState.TrafficBlocked) => ("Трафик заблокирован", "Основной адаптер недоступен."),
-            _ => default,
+                => (null, new AppNotification("Требуется вход", $"Войдите в «{signIn.Name}»: окно входа откроется само или по кнопке «Войти» на главной.", NotificationKind.Warning, Home)),
+            (_, ConnectionState.PasswordRequired)
+                => (null, new AppNotification("Требуется пароль", "Введите пароль на главной странице.", NotificationKind.Warning, Home, FocusPassword: true)),
+            (_, ConnectionState.PartiallyApplied)
+                => (null, new AppNotification("Неполное применение", current.ErrorText ?? "Откройте «Диагностику».", NotificationKind.Error, Diagnostics)),
+            (_, ConnectionState.TrafficBlocked)
+                => (null, new AppNotification("Трафик заблокирован", "Основной адаптер недоступен.", NotificationKind.Error, Home)),
+            _ => (null, null),
         };
-        if (text != default)
+        if (choice.Notice is { } notice)
         {
-            Notify?.Invoke(text.Item1, text.Item2);
+            Emit(choice.Key, notice, now);
         }
+    }
+
+    /// <summary>Показывает уведомление, если такое же (тот же ключ) не показывалось последние 5 минут. null — без предела.</summary>
+    private bool Emit(string? key, AppNotification notification, DateTimeOffset now)
+    {
+        if (key is not null)
+        {
+            if (_notifiedAt.TryGetValue(key, out var shown) && now - shown < NotificationRepeatInterval)
+            {
+                return false;
+            }
+
+            _notifiedAt[key] = now;
+        }
+
+        Notify?.Invoke(notification);
+        return true;
     }
 
     /// <summary>Мастер предлагается один раз за запуск, если подключений нет: настройки не запрашиваются на каждом опросе.</summary>
@@ -590,7 +761,8 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        Notify?.Invoke("«Раздельный VPN» работает в трее", "VPN и защита продолжают работать. Открыть окно — щелчок по значку; закрыть пульт — пункт меню значка.");
+        Notify?.Invoke(new AppNotification("«Раздельный VPN» работает в трее",
+            "VPN и защита продолжают работать. Открыть окно — щелчок по значку; закрыть пульт — пункт меню значка.", NotificationKind.Info, null));
         SavePreferences(Preferences with { TrayHintShown = true });
     }
 
@@ -602,4 +774,39 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             SavePreferences(Preferences with { WizardDismissed = true });
         }
     }
+}
+
+/// <summary>Вид всплывающего уведомления: значок сообщает, насколько оно важно.</summary>
+public enum NotificationKind
+{
+    Info,
+    Warning,
+    Error,
+}
+
+/// <summary>
+/// Уведомление трея. <paramref name="Target"/> — страница, где нужно действие (null — окно открывается как есть),
+/// <paramref name="FocusPassword"/> — по щелчку фокус сразу в поле пароля на главной.
+/// </summary>
+public sealed record AppNotification(string Title, string Text, NotificationKind Kind, PageViewModel? Target, bool FocusPassword = false);
+
+/// <summary>Отложенное действие на таймере диспетчера; отмена — Dispose.</summary>
+internal sealed class DispatcherDelay : IDisposable
+{
+    private readonly DispatcherTimer _timer;
+
+    private DispatcherDelay(TimeSpan delay, Action action)
+    {
+        _timer = new DispatcherTimer { Interval = delay };
+        _timer.Tick += (_, _) =>
+        {
+            _timer.Stop();
+            action();
+        };
+        _timer.Start();
+    }
+
+    public static IDisposable Schedule(TimeSpan delay, Action action) => new DispatcherDelay(delay, action);
+
+    public void Dispose() => _timer.Stop();
 }

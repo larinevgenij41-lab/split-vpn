@@ -378,7 +378,18 @@ internal static class SelfTest
         pinnedProfile.IsDirty = false;
         main.Connections.Profiles.Remove(newProfile);
 
-        main.Diagnostics.GatewaySessions.Add(new GatewaySessionRow("Шлюз · 10.0.0.2", "DTLS (UDP) · MTU 1230 · 69 сетей"));
+        main.Diagnostics.GatewaySessions.Add(new GatewaySessionRow("Шлюз · 10.0.0.2", "быстрый канал (UDP) · 69 сетей", "Канал DTLS (UDP) · MTU 1230"));
+        // Строки журнала событий с меню «Копировать»: шаблон строки применяется только с данными.
+        main.Diagnostics.Journal.Prepend(
+        [
+            new Core.Ipc.ServiceEvent(3, DateTimeOffset.UtcNow, "Ошибка", "Проверка строки ошибки"),
+            new Core.Ipc.ServiceEvent(2, DateTimeOffset.UtcNow.AddMinutes(-1), "Предупреждение", "Проверка строки предупреждения"),
+            new Core.Ipc.ServiceEvent(1, DateTimeOffset.UtcNow.AddMinutes(-2), "Сведения", "Проверка строки сведений"),
+        ]);
+        // Ход пробного подключения у кнопки «Проверить» и пояснение главной кнопки, когда подключать нечего.
+        pinnedProfile.TestRunning = true;
+        pinnedProfile.TestText = "Пробное подключение к «Проверка»… Может занять до минуты.";
+        main.Home.SetupHint = "Подключений пока нет: добавьте данные VPN-сервера.";
         host.Content = null;
         host.Content = main.Diagnostics;
         host.UpdateLayout();
@@ -542,6 +553,13 @@ internal static class SelfTest
             main.ServiceProgressDetail, main.ServiceProgressPercent, main.ServiceProgressIndeterminate,
             main.ProxyError, main.ServiceAvailable, main.ShowServiceRecovery, main.ServiceErrorTitle, main.ServiceError, main.CurrentPage, main.Wizard, main.VerboseBadge,
         };
+        // Несохранённая правка настроек службы: у пункта меню «Настройки» видна отметка, у блока «Работа VPN» — бейдж.
+        main.Settings.AutoConnect = !main.Settings.AutoConnect;
+        if (!main.PagesWithUnsavedChanges().Contains(main.Settings))
+        {
+            errors.AppendLine("Правка настроек службы не отмечена как несохранённая.");
+        }
+
         foreach (var viewportWidth in new[] { 1080d, 760d, 640d, 1440d })
         {
             window.Width = viewportWidth;

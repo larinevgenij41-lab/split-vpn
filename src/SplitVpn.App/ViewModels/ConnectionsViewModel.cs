@@ -15,9 +15,57 @@ using Wpf.Ui.Controls;
 namespace SplitVpn.App.ViewModels;
 
 /// <summary>Подключения: список профилей, редактирование, пароль, роль туннеля, импорт и экспорт без секретов.</summary>
-public sealed partial class ConnectionsViewModel(MainViewModel main) : PageViewModel(main, "Подключения", SymbolRegular.PlugConnected24)
+public sealed partial class ConnectionsViewModel : PageViewModel
 {
+    public ConnectionsViewModel(MainViewModel main)
+        : base(main, "Подключения", SymbolRegular.PlugConnected24)
+    {
+        // Отметка несохранённых правок страницы: любой черновик (новый или изменённый профиль) — с паролями и ключами.
+        Profiles.CollectionChanged += (_, e) =>
+        {
+            foreach (var item in e.NewItems?.OfType<ProfileItem>() ?? [])
+            {
+                // Clear() не сообщает об убранных строках: черновик, вернувшийся в список после перечитывания, не подписывается дважды.
+                item.PropertyChanged -= OnProfileChanged;
+                item.PropertyChanged += OnProfileChanged;
+            }
+
+            foreach (var item in e.OldItems?.OfType<ProfileItem>() ?? [])
+            {
+                item.PropertyChanged -= OnProfileChanged;
+            }
+
+            RefreshUnsaved();
+        };
+    }
+
     public ObservableCollection<ProfileItem> Profiles { get; } = [];
+
+    private bool _hasUnsavedChanges;
+
+    public override bool HasUnsavedChanges => _hasUnsavedChanges;
+
+    private void OnProfileChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(ProfileItem.IsDirty) or nameof(ProfileItem.IsNew))
+        {
+            RefreshUnsaved();
+        }
+    }
+
+    private void RefreshUnsaved()
+    {
+        var unsaved = Profiles.Any(p => p.IsDirty || p.IsNew);
+        if (unsaved != _hasUnsavedChanges)
+        {
+            _hasUnsavedChanges = unsaved;
+            OnPropertyChanged(nameof(HasUnsavedChanges));
+        }
+    }
+
+    /// <summary>Запрос фокуса на поле «Адрес VPN-сервера»: ошибка адреса переводит туда курсор.</summary>
+    [ObservableProperty]
+    private int _serverFocusToken;
 
     public ObservableCollection<AdapterDto> Adapters { get; } = [];
 
@@ -320,6 +368,18 @@ public sealed partial class ConnectionsViewModel(MainViewModel main) : PageViewM
             }
             if (fresh?.Profile(item.Id) is null)
             {
+                // В черновике что-то набрано (поля, пароль, ключ): молча его не теряем.
+                if ((item.Edits > 0 || item.HasDraftCredentials)
+                    && !await Main.Confirm("Удалить черновик?", $"Введённые в «{item.Name}» данные, включая пароль и ключи, будут потеряны.", "Удалить черновик"))
+                {
+                    return null;
+                }
+
+                if (!Profiles.Contains(item))
+                {
+                    return null;
+                }
+
                 Profiles.Remove(item);
                 RenumberProfiles();
                 Selected = Profiles.FirstOrDefault();
@@ -331,13 +391,22 @@ public sealed partial class ConnectionsViewModel(MainViewModel main) : PageViewM
 
         // Роль — сохранённая в службе, а не выбранная в форме: служба поднимает туннель по сохранённой.
         fresh ??= await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
+        var turnOff = fresh.Profile(item.Id) is { Role: not ProfileRole.Off };
+        IReadOnlyList<string> direct = [];
         if (fresh.Profile(item.Id) is { Role: not ProfileRole.Off } saved)
         {
-            ShowMessage($"Сначала выключите «{saved.Name}» и сохраните: на него может быть направлен трафик.", isError: true);
-            return null;
+            // Включённое подключение сначала выключается — тем же путём, что «Выключить совсем» на главной:
+            // назначенное ему уходит на прямой выход, и об этом сказано в подтверждении.
+            direct = ConnectionEdits.NewlyDirect(fresh, ConnectionEdits.SaveProfile(fresh, saved with { Role = ProfileRole.Off }));
+            var consequence = direct.Count > 0 ? $" Напрямую, мимо VPN, пойдут: {string.Join(", ", direct)}." : "";
+            if (!await Main.Confirm("Выключить и удалить подключение?",
+                    $"«{saved.Name}» сейчас включено. Оно будет выключено и удалено вместе с сохранённым паролем.{consequence} Отменить удаление нельзя.",
+                    "Выключить и удалить"))
+            {
+                return null;
+            }
         }
-
-        if (!await Main.Confirm("Удалить подключение?", $"«{item.Name}» и его сохранённый пароль будут удалены. Отменить удаление нельзя.", "Удалить"))
+        else if (!await Main.Confirm("Удалить подключение?", $"«{item.Name}» и его сохранённый пароль будут удалены. Отменить удаление нельзя.", "Удалить"))
         {
             return null;
         }
@@ -347,8 +416,20 @@ public sealed partial class ConnectionsViewModel(MainViewModel main) : PageViewM
         fresh = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
         if (fresh.Profile(item.Id) is { Role: not ProfileRole.Off } enabled)
         {
-            ShowMessage($"Сначала выключите «{enabled.Name}» и сохраните: на него может быть направлен трафик.", isError: true);
-            return null;
+            var off = ConnectionEdits.SaveProfile(fresh, enabled with { Role = ProfileRole.Off });
+            if (!turnOff || ConnectionEdits.NewlyDirect(fresh, off).Except(direct).Any())
+            {
+                ShowMessage("Настройки изменились, пока было открыто подтверждение: удалите подключение ещё раз.", isError: true);
+                return null;
+            }
+
+            await Service.CommandAsync(new SaveSettingsRequest(off, SettingsSerializer.Revision(fresh)));
+            fresh = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
+            if (fresh.Profile(item.Id) is { Role: not ProfileRole.Off })
+            {
+                ShowMessage($"«{enabled.Name}» не удалось выключить: удалите подключение ещё раз.", isError: true);
+                return null;
+            }
         }
 
         if (fresh.Profile(item.Id) is not null)
@@ -380,7 +461,10 @@ public sealed partial class ConnectionsViewModel(MainViewModel main) : PageViewM
         var startEdits = item.Edits;
         if (!VpnProtocols.TryParseServer(item.Server, item.Security.Protocol, out _))
         {
-            throw new FormatException(VpnProtocols.ServerHint(item.Security.Protocol));
+            // Ошибка называет поле, а курсор переходит в него: баннер в шапке далеко от формы.
+            ShowMessage(UiText.ServerFieldError(item.Security.Protocol), isError: true);
+            ServerFocusToken++;
+            return null;
         }
 
         var fresh = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
@@ -578,8 +662,32 @@ public sealed partial class ConnectionsViewModel(MainViewModel main) : PageViewM
             return null;
         }
 
-        var result = await Service.RequestAsync<ProfileTestDto>(new TestProfileRequest(item.Id));
-        ShowMessage(result.Text, isError: !result.Success);
+        if (item.TestRunning)
+        {
+            return null;
+        }
+
+        // Пробный дозвон идёт до минуты: рядом с кнопкой видно, что он идёт, а итог остаётся у подключения
+        // до следующей проверки или правки его полей. Отменить проверку нельзя — её ведёт служба.
+        item.TestFailed = false;
+        item.TestText = $"Пробное подключение к «{item.Name}»… Может занять до минуты.";
+        item.TestRunning = true;
+        try
+        {
+            var result = await Service.RequestAsync<ProfileTestDto>(new TestProfileRequest(item.Id));
+            item.TestText = result.Text;
+            item.TestFailed = !result.Success;
+        }
+        catch (Exception ex) when (ex is ServiceUnavailableException or ServiceCommandException)
+        {
+            item.TestText = "Проверка не выполнена: " + ex.Message;
+            item.TestFailed = true;
+        }
+        finally
+        {
+            item.TestRunning = false;
+        }
+
         return null;
     });
 
@@ -595,7 +703,7 @@ public sealed partial class ConnectionsViewModel(MainViewModel main) : PageViewM
         // Пароли хранит только служба (DPAPI): в файл экспорта они не попадают.
         var settings = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
         var export = ConnectionEdits.PrepareExport(settings.Profiles);
-        await File.WriteAllTextAsync(dialog.FileName, JsonSerializer.Serialize(export, JsonDefaults.Options));
+        await WriteUserFileAsync(dialog.FileName, JsonSerializer.Serialize(export, JsonDefaults.Options));
         return "Подключения экспортированы без паролей.";
     });
 
@@ -608,7 +716,17 @@ public sealed partial class ConnectionsViewModel(MainViewModel main) : PageViewM
             return null;
         }
 
-        if (new FileInfo(dialog.FileName).Length > ConnectionEdits.MaxImportBytes)
+        long length;
+        try
+        {
+            length = new FileInfo(dialog.FileName).Length;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new UserFacingException(UiText.FileError(ex, dialog.FileName), ex);
+        }
+
+        if (length > ConnectionEdits.MaxImportBytes)
         {
             throw new FormatException("Файл слишком большой для списка подключений (больше 1 МБ).");
         }
@@ -616,7 +734,7 @@ public sealed partial class ConnectionsViewModel(MainViewModel main) : PageViewM
         List<ConnectionProfile?> parsed;
         try
         {
-            parsed = JsonSerializer.Deserialize<List<ConnectionProfile?>>(await File.ReadAllTextAsync(dialog.FileName), JsonDefaults.Options) ?? [];
+            parsed = JsonSerializer.Deserialize<List<ConnectionProfile?>>(await ReadUserFileAsync(dialog.FileName), JsonDefaults.Options) ?? [];
         }
         catch (JsonException)
         {
@@ -707,6 +825,18 @@ public sealed partial class ProfileItem : ObservableObject
     [ObservableProperty]
     private int _position;
 
+    /// <summary>Идёт пробное подключение («Проверить»): рядом с кнопкой — индикатор ожидания.</summary>
+    [ObservableProperty]
+    private bool _testRunning;
+
+    /// <summary>Ход или итог проверки; виден у подключения до следующей проверки или правки его полей. null — нет.</summary>
+    [ObservableProperty]
+    private string? _testText;
+
+    /// <summary>Проверка не удалась: итог показывается как ошибка.</summary>
+    [ObservableProperty]
+    private bool _testFailed;
+
     public string ToggleName => (Paused ? "Включить " : "Отключить ") + Name;
 
     /// <summary>Значок показывает, что произойдёт по нажатию.</summary>
@@ -792,6 +922,7 @@ public sealed partial class ProfileItem : ObservableObject
         // опрос раз в полторы секунды навсегда закрыл бы обновление списка из службы.
         if (e.PropertyName is not (nameof(IsDirty) or nameof(IsNew) or nameof(EditorTitle) or nameof(PasswordHint) or nameof(RoleText) or nameof(RoleChoices) or nameof(UserNameLabel) or nameof(ShowPinnedAdapter)
             or nameof(Paused) or nameof(CanToggle) or nameof(Position) or nameof(ToggleName) or nameof(ToggleSymbol)
+            or nameof(TestRunning) or nameof(TestText) or nameof(TestFailed)
             or nameof(ConnectionSecurityViewModel.DetailsExpanded)))
         {
             NoteEdit();
@@ -822,6 +953,12 @@ public sealed partial class ProfileItem : ObservableObject
     {
         Edits++;
         IsDirty = true;
+        // Итог проверки относился к прежним полям.
+        if (!TestRunning && TestText is not null)
+        {
+            TestText = null;
+            TestFailed = false;
+        }
     }
 
     /// <summary>

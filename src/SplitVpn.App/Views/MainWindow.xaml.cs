@@ -82,6 +82,7 @@ public partial class MainWindow : FluentWindow
         };
         _pages = new PageProvider(main);
         Navigation.SetPageProviderService(_pages);
+        MarkUnsavedPages(main);
         main.NavigationRequested += page =>
         {
             if (_pages.PageTypeFor(page) is { } type)
@@ -89,6 +90,40 @@ public partial class MainWindow : FluentWindow
                 Navigation.Navigate(type);
             }
         };
+    }
+
+    /// <summary>
+    /// Точка у пункта меню страницы с несохранёнными правками («Подключения», «Маршрутизация», «Защита и DNS»,
+    /// «Настройки»): видно, где остались черновики, не открывая страниц. Привязка — с явным источником, как у шапки
+    /// меню (см. <see cref="BindPaneParts"/>): пункты меню вне логического дерева окна.
+    /// </summary>
+    private void MarkUnsavedPages(MainViewModel main)
+    {
+        var pages = new Dictionary<Type, PageViewModel>
+        {
+            [typeof(ConnectionsPage)] = main.Connections,
+            [typeof(RoutingPage)] = main.Routing,
+            [typeof(ProtectionPage)] = main.Protection,
+            [typeof(SettingsPage)] = main.Settings,
+        };
+        var dot = TryFindResource("DotInfoBadgeStyle") as Style;
+        foreach (var item in Navigation.MenuItems.Cast<object>().Concat(Navigation.FooterMenuItems.Cast<object>()).OfType<NavigationViewItem>())
+        {
+            if (item.TargetPageType is not { } type || !pages.TryGetValue(type, out var page))
+            {
+                continue;
+            }
+
+            var badge = new InfoBadge { Severity = InfoBadgeSeverity.Caution, ToolTip = "Есть несохранённые изменения" };
+            if (dot is not null)
+            {
+                badge.Style = dot;
+            }
+
+            AutomationProperties.SetName(badge, "Есть несохранённые изменения");
+            badge.SetBinding(VisibilityProperty, new Binding(nameof(PageViewModel.HasUnsavedChanges)) { Source = page, Converter = new VisibleWhenConverter() });
+            item.InfoBadge = badge;
+        }
     }
 
     /// <summary>

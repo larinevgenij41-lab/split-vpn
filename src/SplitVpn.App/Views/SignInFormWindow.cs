@@ -165,7 +165,7 @@ public sealed class SignInFormWindow : FluentWindow, ISignInWindow
         try
         {
             var response = await _service.SendAsync(new SubmitAuthFormRequest(_profileId, RequestId, values, Cancel: false));
-            problem = response.Ok ? null : response.ErrorMessage ?? response.ErrorCode ?? "Служба отклонила данные входа.";
+            problem = response.Ok ? null : ViewModels.UiText.ServiceRejected(response, "Служба отклонила данные входа.");
         }
         catch (ServiceUnavailableException ex)
         {

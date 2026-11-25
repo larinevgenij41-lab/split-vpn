@@ -175,14 +175,14 @@ public sealed class ServiceConnection : IDisposable
         var response = await SendAsync(request, cancellationToken);
         return response.Ok
             ? response.ResultAs<T>()!
-            : throw new ServiceCommandException(response.ErrorMessage ?? response.ErrorCode ?? "Служба отклонила запрос.");
+            : throw new ServiceCommandException(ViewModels.UiText.ServiceRejected(response));
     }
 
-    /// <summary>Команда без результата; отказ службы — исключение с её текстом.</summary>
+    /// <summary>Команда без результата; отказ службы — исключение с её текстом (код без текста — только в журнал).</summary>
     public async Task<IpcResponse> CommandAsync(IpcRequest request, CancellationToken cancellationToken = default)
     {
         var response = await SendAsync(request, cancellationToken);
-        return response.Ok ? response : throw new ServiceCommandException(response.ErrorMessage ?? response.ErrorCode ?? "Служба отклонила запрос.");
+        return response.Ok ? response : throw new ServiceCommandException(ViewModels.UiText.ServiceRejected(response));
     }
 
     public void Dispose()

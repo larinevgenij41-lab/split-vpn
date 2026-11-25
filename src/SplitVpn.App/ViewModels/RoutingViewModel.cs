@@ -646,7 +646,7 @@ public sealed partial class RoutingViewModel : PageViewModel
 
         if (!SettingsSerializer.IsValidDomainSuffix(suffix))
         {
-            ShowMessage($"«{value}»: правило нельзя задать для домена верхнего уровня целиком - под него попадёт вся зона «{suffix}». Укажите имя вида example.{suffix}.", isError: true);
+            ShowMessage($"«{value}»: правило нельзя задать для домена верхнего уровня целиком — под него попадёт вся зона «{suffix}». Укажите имя вида example.{suffix}.", isError: true);
             return;
         }
 
@@ -891,8 +891,29 @@ public sealed partial class RoutingViewModel : PageViewModel
         return _settings.BypassTarget is null && bypass == TargetOf(CardKind.Default) ? null : bypass;
     }
 
+    /// <summary>
+    /// «Отменить изменения»: правки доски стираются, поэтому сначала подтверждение (как на «Подключениях»).
+    /// Во время сохранения перечитывание всё равно отбрасывается (см. <see cref="LoadAsync"/>), спрашивать незачем.
+    /// </summary>
     [RelayCommand(CanExecute = nameof(CanReload))]
-    private Task ReloadAsync() => RunAsync(async () => await LoadAsync() ? "Доска возвращена к сохранённому виду." : null);
+    private Task ReloadAsync() => RunAsync(async () =>
+    {
+        if (Dirty && _saving == 0 && !await Main.Confirm("Отменить изменения доски?",
+                "Все несохранённые перемещения, новые правила, папки и группы будут потеряны.", "Отменить изменения"))
+        {
+            return null;
+        }
+
+        return await LoadAsync() ? "Доска возвращена к сохранённому виду." : null;
+    });
+
+    public override bool HasUnsavedChanges => Dirty;
+
+    /// <summary>
+    /// Переименование папки: отметка правки ставится на каждом символе, но результаты поиска не пересобираются —
+    /// иначе поле названия в них пересоздавалось бы и теряло фокус посреди ввода.
+    /// </summary>
+    internal void MarkRenamed() => MarkPriorityChanged();
 
     /// <summary>Сводка второго списка. Служба присылает её одной записью — плоские поля остались за RU-базой.</summary>
     private void SyncBypass(GeoListStatusDto? bypass)
@@ -1116,7 +1137,7 @@ public sealed partial class BoardFolder : BoardEntry
     partial void OnNameChanged(string value)
     {
         OnPropertyChanged(nameof(Title));
-        Board.MarkDirty();
+        Board.MarkRenamed();
     }
 
     partial void OnIsExpandedChanged(bool value) => OnPropertyChanged(nameof(ToggleSymbol));

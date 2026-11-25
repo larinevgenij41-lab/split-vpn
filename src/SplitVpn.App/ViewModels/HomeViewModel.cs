@@ -54,9 +54,31 @@ public sealed partial class HomeViewModel : PageViewModel
                 SignInCommand.NotifyCanExecuteChanged();
                 ConnectWithPasswordCommand.NotifyCanExecuteChanged();
                 ToggleTunnelCommand.NotifyCanExecuteChanged();
+                PrimaryActionCommand.NotifyCanExecuteChanged();
+            }
+            else if (e.PropertyName == nameof(MainViewModel.ServiceAvailable))
+            {
+                PrimaryActionCommand.NotifyCanExecuteChanged();
             }
         };
     }
+
+    /// <summary>
+    /// Подключения из настроек службы: всего и включённых. null — ещё не прочитаны. Без включённых подключений
+    /// «Подключить» ведёт в тупик, поэтому главная кнопка тогда ведёт на страницу «Подключения».
+    /// </summary>
+    private (int Total, int Enabled)? _profileCounts;
+
+    /// <summary>Подключение из состояния службы на прошлом опросе: его смена — повод перечитать список подключений.</summary>
+    private string? _lastProfileName;
+
+    /// <summary>Что делает главная кнопка, пока подключать нечего.</summary>
+    [ObservableProperty]
+    private HomeSetupAction _setupAction;
+
+    /// <summary>Пояснение под главной кнопкой, когда подключать нечего; null — пояснения нет.</summary>
+    [ObservableProperty]
+    private string? _setupHint;
 
     public ObservableCollection<WarningRow> Warnings { get; } = [];
 
@@ -180,6 +202,8 @@ public sealed partial class HomeViewModel : PageViewModel
         try
         {
             var settings = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
+            _profileCounts = (settings.Profiles.Count, settings.Profiles.Count(p => p.Role != ProfileRole.Off));
+            UpdateSetupAction(Main.Status);
             var targets = settings.AllTargets.Select(t => t.Target).ToHashSet();
             _routedProfiles = settings.Profiles.Where(p => targets.Contains(RouteTarget.Tunnel(p.Id))).Select(p => p.Id).ToHashSet();
             foreach (var group in settings.Groups.Where(g => targets.Contains(RouteTarget.Group(g.Id))))
@@ -208,6 +232,7 @@ public sealed partial class HomeViewModel : PageViewModel
         if (status is null)
         {
             IsConnectedIntent = false;
+            UpdateSetupAction(null);
             UpdateButtonText();
             Warnings.Clear();
             Note = DohNote;
@@ -237,6 +262,14 @@ public sealed partial class HomeViewModel : PageViewModel
         }
 
         IsConnectedIntent = MainViewModel.IsConnectedIntent(status);
+        if (_profileCounts is not null && status.ProfileName != _lastProfileName)
+        {
+            // Опорное подключение сменилось (включили, выключили, добавили): список подключений перечитывается.
+            _ = RefreshProfileCountsAsync();
+        }
+
+        _lastProfileName = status.ProfileName;
+        UpdateSetupAction(status);
         UpdateButtonText();
         Profile = status.ProfileName ?? "не выбрано";
         if (status.Protocol is { } protocol) { Profile += " · " + VpnProtocols.Name(protocol); }
@@ -274,7 +307,68 @@ public sealed partial class HomeViewModel : PageViewModel
     }
 
     /// <summary>Надпись кнопки: во время команды — что идёт, иначе — что произойдёт по нажатию.</summary>
-    private void UpdateButtonText() => ButtonText = Main.BusyAction ?? (IsConnectedIntent ? "Отключить" : "Подключить");
+    private void UpdateButtonText() => ButtonText = Main.BusyAction ?? (IsConnectedIntent ? "Отключить" : SetupAction switch
+    {
+        HomeSetupAction.AddConnection => "Добавить подключение",
+        HomeSetupAction.OpenConnections => "Открыть «Подключения»",
+        _ => "Подключить",
+    });
+
+    /// <summary>
+    /// Подключать нечего: подключений нет или все выключены, а VPN не запрошен. Пока список подключений не прочитан
+    /// или служба поднимает туннели, кнопка обычная.
+    /// </summary>
+    private void UpdateSetupAction(StatusDto? status)
+    {
+        SetupAction = status is null || IsConnectedIntent || status.Tunnels.Count > 0 || _profileCounts is not { } counts
+            ? HomeSetupAction.None
+            : counts.Total == 0 ? HomeSetupAction.AddConnection
+            : counts.Enabled == 0 ? HomeSetupAction.OpenConnections
+            : HomeSetupAction.None;
+        SetupHint = SetupAction switch
+        {
+            HomeSetupAction.AddConnection => "Подключений пока нет: добавьте данные VPN-сервера, которые выдал провайдер VPN или администратор.",
+            HomeSetupAction.OpenConnections => "Все подключения выключены. Включите нужное на странице «Подключения»: роль «Опорное» или «Дополнительное».",
+            _ => null,
+        };
+        PrimaryActionCommand.NotifyCanExecuteChanged();
+    }
+
+    private async Task RefreshProfileCountsAsync()
+    {
+        try
+        {
+            var settings = await Service.RequestAsync<AppSettings>(new GetSettingsRequest());
+            _profileCounts = (settings.Profiles.Count, settings.Profiles.Count(p => p.Role != ProfileRole.Off));
+            UpdateSetupAction(Main.Status);
+            UpdateButtonText();
+        }
+        catch (Exception ex) when (ex is ServiceUnavailableException or ServiceCommandException)
+        {
+            // Список перечитается при следующем открытии главной.
+        }
+    }
+
+    private bool CanPrimaryAction => SetupAction != HomeSetupAction.None ? !Main.IsBusy : Main.ToggleConnectionCommand.CanExecute(null);
+
+    /// <summary>Главная кнопка: подключить или отключить, а если подключать нечего — перейти к подключениям.</summary>
+    [RelayCommand(CanExecute = nameof(CanPrimaryAction))]
+    private async Task PrimaryActionAsync()
+    {
+        switch (SetupAction)
+        {
+            case HomeSetupAction.AddConnection:
+                Main.NavigateTo(Main.Connections);
+                Main.Connections.AddCommand.Execute(null);
+                break;
+            case HomeSetupAction.OpenConnections:
+                Main.NavigateTo(Main.Connections);
+                break;
+            default:
+                await Main.ToggleConnectionCommand.ExecuteAsync(null);
+                break;
+        }
+    }
 
     private void SyncTunnels(StatusDto status)
     {
@@ -439,7 +533,8 @@ public sealed partial class HomeViewModel : PageViewModel
         catch (ExternalException ex)
         {
             // Буфером обмена владеет другая программа: копирование просто не состоялось.
-            ShowError("Не удалось скопировать сведения: " + ex.Message);
+            SplitVpn.Core.Diagnostics.Verbose.Write("Ui", "буфер обмена недоступен: " + ex.Message);
+            ShowError(ClipboardBusy);
         }
     }
 
@@ -581,9 +676,13 @@ public sealed partial class HomeViewModel : PageViewModel
         }
         catch (Win32Exception ex)
         {
-            ShowError("Не удалось открыть «Сетевые подключения»: " + ex.Message);
+            SplitVpn.Core.Diagnostics.Verbose.Write("Ui", "«Сетевые подключения» не открылись: " + ex.Message);
+            ShowError("Не удалось открыть «Сетевые подключения». Откройте их вручную: Win+R, затем ncpa.cpl.");
         }
     }
+
+    /// <summary>Буфер обмена занят другой программой (менеджер буфера, удалённый рабочий стол).</summary>
+    internal const string ClipboardBusy = "Не удалось скопировать: буфер обмена занят другой программой. Повторите через несколько секунд.";
 
     private void SyncWarnings(IReadOnlyList<StatusWarning> warnings)
     {
@@ -602,6 +701,19 @@ public sealed partial class HomeViewModel : PageViewModel
             Warnings.Add(row);
         }
     }
+}
+
+/// <summary>Что делает главная кнопка, когда подключать нечего.</summary>
+public enum HomeSetupAction
+{
+    /// <summary>Обычная кнопка «Подключить» / «Отключить».</summary>
+    None,
+
+    /// <summary>Подключений нет: кнопка открывает «Подключения» с новым черновиком.</summary>
+    AddConnection,
+
+    /// <summary>Подключения есть, но все выключены: кнопка открывает «Подключения».</summary>
+    OpenConnections,
 }
 
 /// <summary>
@@ -745,7 +857,8 @@ public sealed partial class TunnelRow(Guid profileId) : ObservableObject
 
         if (tunnel.ServerNetworks is { } gateway)
         {
-            parts.Add(gateway.DtlsActive ? "DTLS" : "TLS");
+            // Названия протоколов шифрования неспециалисту ничего не говорят: важно, быстрый канал или запасной.
+            parts.Add(gateway.DtlsActive ? "быстрый канал (UDP)" : "обычный канал (TCP)");
             parts.Add(Format.Count(gateway.Networks.Count, "сеть", "сети", "сетей") + " шлюза");
             if (gateway.SessionExpiresUtc is { } expires)
             {

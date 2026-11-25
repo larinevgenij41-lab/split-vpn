@@ -57,7 +57,9 @@ public static class NetworkRecovery
         }
         catch (Win32Exception ex)
         {
-            return (false, ex.NativeErrorCode == 1223 ? "Запуск с правами администратора отменён." : "Не удалось запустить восстановление: " + ex.Message);
+            SplitVpn.Core.Diagnostics.Verbose.Write("Ui", "восстановление не запущено: " + ex.Message);
+            return (false, ex.NativeErrorCode == 1223 ? "Запуск с правами администратора отменён."
+                : $"Не удалось запустить восстановление сети с правами администратора (код {ex.NativeErrorCode}). Перезагрузите компьютер.");
         }
     }
 
@@ -94,7 +96,9 @@ public static class NetworkRecovery
         }
         catch (Win32Exception ex)
         {
-            return (false, ex.NativeErrorCode == 1223 ? "Запуск с правами администратора отменён." : "Не удалось запустить службу: " + ex.Message);
+            SplitVpn.Core.Diagnostics.Verbose.Write("Ui", "служба не запущена: " + ex.Message);
+            return (false, ex.NativeErrorCode == 1223 ? "Запуск с правами администратора отменён."
+                : $"Не удалось запустить службу с правами администратора (код {ex.NativeErrorCode}). Проверьте службу «Раздельный VPN» в «Службах» Windows.");
         }
     }
 }
