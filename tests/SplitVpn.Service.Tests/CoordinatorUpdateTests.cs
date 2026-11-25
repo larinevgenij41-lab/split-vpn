@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using SplitVpn.Core.Ipc;
@@ -195,9 +195,13 @@ public sealed partial class CoordinatorTests
         Assert.Null(Status(coordinator).AvailableVersion);
     }
 
-    /// <summary>Подменённый ответ со старым, но верно подписанным манифестом не откатывает программу.</summary>
+    /// <summary>
+    /// Подменённый (или ещё не обновлённый в кэше) ответ со старым, но верно подписанным манифестом не откатывает
+    /// программу: младшая версия не предлагается. Но это не сбой: «обновлений нет», проверка по обычному расписанию,
+    /// без ошибки в журнале и без ежечасного повтора, а предупреждение о таком манифесте пишется один раз.
+    /// </summary>
     [Fact]
-    public async Task Check_BelowHighestSeen_IsRejected()
+    public async Task Check_BelowHighestSeen_IsNoUpdate_AndLoggedOnce()
     {
         var source = new UpdateSource(Manifest("0.9.5"));
         var coordinator = await UpdatingAsync(source);
@@ -207,11 +211,19 @@ public sealed partial class CoordinatorTests
         source.Override = request => request.RequestUri!.AbsoluteUri.EndsWith("update.json", StringComparison.Ordinal)
             ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Encoding.UTF8.GetBytes(Manifest("0.9.1"))) }
             : null;
-        var second = coordinator.HandleRequestAsync(new CheckUpdateRequest(), CancellationToken.None);
-        await PumpAsync(coordinator, second);
+        var journalBefore = _world.Journal.Since(0).Count;
+        for (var i = 0; i < 2; i++)
+        {
+            var check = coordinator.HandleRequestAsync(new CheckUpdateRequest(), CancellationToken.None);
+            await PumpAsync(coordinator, check);
+            Assert.True((await check).Ok);
+        }
 
-        Assert.False((await second).Ok);
         Assert.Equal("0.9.5", Status(coordinator).AvailableVersion);
+        Assert.True(Status(coordinator).NextCheckUtc >= _world.Time.GetUtcNow().AddDays(1));
+        var added = _world.Journal.Since(0).Skip(journalBefore).ToList();
+        Assert.DoesNotContain(added, e => e.Level == "Ошибка");
+        Assert.Single(added, e => e.Text.Contains("0.9.1", StringComparison.Ordinal));
     }
 
     /// <summary>Просроченный манифест — не ошибка, а «обновлений нет» с причиной; проверка идёт по обычному расписанию.</summary>
@@ -646,6 +658,110 @@ public sealed partial class CoordinatorTests
 
         Assert.Equal(UpdatePhase.Ready, Status(coordinator).Phase);
         Assert.Equal(1, source.PackageCalls);
+    }
+
+    /// <summary>
+    /// Источник раз за разом отдаёт файл не с той контрольной суммой: прежде счётчик попыток сбрасывался, и полный
+    /// установщик качался заново каждый час без конца и молча. Теперь повтор откладывается всё дольше, после трёх
+    /// несовпадений автозагрузка стоит с предупреждением в шапке, а загрузка по команде и новый выпуск её возобновляют.
+    /// </summary>
+    [Fact]
+    public async Task Download_RepeatedChecksumMismatch_BacksOffThenStopsAndWarns()
+    {
+        var source = new UpdateSource(Manifest());
+        var wrongPackages = 0;
+        source.Override = request =>
+        {
+            if (!request.RequestUri!.AbsoluteUri.EndsWith(".msi", StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            wrongPackages++;
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Encoding.UTF8.GetBytes(new string('д', 2048))) };
+        };
+        var coordinator = await UpdatingAsync(source);
+
+        var delays = new List<TimeSpan>();
+        for (var attempt = 1; attempt <= UpdateManager.MaxHashMismatches; attempt++)
+        {
+            var now = _world.Time.GetUtcNow();
+            await TickAsync(coordinator);
+            await PumpAsync(coordinator);
+            Assert.Equal(attempt, wrongPackages);
+            Assert.Equal(UpdatePhase.Available, Status(coordinator).Phase);
+            var next = Status(coordinator).NextCheckUtc!.Value;
+            delays.Add(next - now);
+            _world.Time.Advance(next - now + TimeSpan.FromMinutes(1));
+        }
+
+        Assert.Equal(TimeSpan.FromHours(1), delays[0]);
+        Assert.Equal(TimeSpan.FromHours(2), delays[1]);
+        Assert.Contains(coordinator.BuildStatus().Warnings, w => w.Code == "update-download-failed");
+        Assert.Contains("остановлена", Status(coordinator).LastResult, StringComparison.Ordinal);
+
+        // Плановые проверки идут, но тот же выпуск больше сам не качается.
+        var manifestCalls = source.ManifestCalls;
+        _world.Time.Advance(TimeSpan.FromDays(2));
+        await TickAsync(coordinator);
+        await PumpAsync(coordinator);
+        Assert.True(source.ManifestCalls > manifestCalls);
+        Assert.Equal(UpdateManager.MaxHashMismatches, wrongPackages);
+        Assert.Contains(coordinator.BuildStatus().Warnings, w => w.Code == "update-download-failed");
+
+        // Загрузка по команде пользователя идёт и при остановленной автозагрузке.
+        var manual = coordinator.HandleRequestAsync(new DownloadUpdateRequest("0.9.0"), CancellationToken.None);
+        await PumpAsync(coordinator, manual);
+        Assert.Equal(UpdateManager.MaxHashMismatches + 1, wrongPackages);
+
+        // Новый выпуск в манифесте - счёт с нуля, и исправный файл скачивается сам.
+        source.Override = null;
+        var fixedSource = new UpdateSource(Manifest("0.9.1"));
+        _world.HttpHandler = fixedSource;
+        var restarted = await StartAsync();
+        await restarted.HandleRequestAsync(new DisconnectRequest(KeepProtection: false), CancellationToken.None);
+        _world.Time.Advance(TimeSpan.FromDays(2));
+        await TickAsync(restarted);
+        await PumpAsync(restarted);
+        Assert.Equal(1, fixedSource.PackageCalls);
+        Assert.Equal(UpdatePhase.Ready, Status(restarted).Phase);
+        Assert.DoesNotContain(restarted.BuildStatus().Warnings, w => w.Code == "update-download-failed");
+    }
+
+    /// <summary>
+    /// Неудачная установка не скрывается следующим ответом манифеста о том же выпуске: прежде фаза становилась
+    /// «Готово», причина пропадала из шапки, и та же установка предлагалась снова. Новый выпуск начинается с чистого листа.
+    /// </summary>
+    [Fact]
+    public async Task Check_SamePackageAfterFailedInstall_KeepsFailure()
+    {
+        var coordinator = await InstallingAsync();
+        _world.ProcessExitCodes[77] = 1603;
+        var started = coordinator.HandleRequestAsync(new UpdateStartedRequest(77), CancellationToken.None);
+        await PumpAsync(coordinator, started);
+        Assert.Equal(UpdatePhase.Failed, Status(coordinator).Phase);
+        var failure = Status(coordinator).LastInstallResult;
+        Assert.Contains("1603", failure, StringComparison.Ordinal);
+
+        var check = coordinator.HandleRequestAsync(new CheckUpdateRequest(), CancellationToken.None);
+        await PumpAsync(coordinator, check);
+
+        Assert.True((await check).Ok);
+        Assert.Equal(UpdatePhase.Failed, Status(coordinator).Phase);
+        Assert.Equal(failure, Status(coordinator).LastInstallResult);
+        Assert.Contains(coordinator.BuildStatus().Warnings, w => w.Code == "update-failed");
+
+        var newer = new UpdateSource(Manifest("0.9.1"));
+        _world.HttpHandler = newer;
+        var restarted = await StartAsync();
+        await restarted.HandleRequestAsync(new DisconnectRequest(KeepProtection: false), CancellationToken.None);
+        var next = restarted.HandleRequestAsync(new CheckUpdateRequest(), CancellationToken.None);
+        await PumpAsync(restarted, next);
+
+        Assert.Equal("0.9.1", Status(restarted).AvailableVersion);
+        Assert.Equal(UpdatePhase.Ready, Status(restarted).Phase);
+        Assert.Null(Status(restarted).LastInstallResult);
+        Assert.DoesNotContain(restarted.BuildStatus().Warnings, w => w.Code == "update-failed");
     }
 
     /// <summary>Готовый к установке установщик: проверка, загрузка и сверка контрольной суммы уже прошли.</summary>

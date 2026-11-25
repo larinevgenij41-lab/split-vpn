@@ -44,6 +44,13 @@ public sealed partial class Coordinator
                     $"Готово обновление до версии {ready}: установка займёт около минуты.", "update-install");
                 break;
 
+            // Источник раз за разом отдаёт не тот файл: автозагрузка остановлена, и молчать об этом нельзя.
+            case UpdatePhase.Available when state.AvailableVersion is { } broken && UpdateManager.AutoDownloadSuspended(state):
+                yield return new StatusWarning("update-download-failed",
+                    $"Обновление до версии {broken} не скачивается: контрольная сумма установщика не совпала с подписанным " +
+                    "списком выпусков несколько раз подряд. Автозагрузка остановлена; повторить загрузку можно вручную.", "update-open");
+                break;
+
             // Пока установщик качается сам, сообщать не о чем: предупреждение появится, когда он будет готов.
             case UpdatePhase.Available when state.AvailableVersion is { } found && !_settings.AppUpdate.AutoDownload:
                 yield return new StatusWarning("update-available", $"Доступно обновление до версии {found}.", "update-open");

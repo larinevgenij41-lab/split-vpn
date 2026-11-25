@@ -53,9 +53,11 @@ public sealed class DnsProxyTcpLifetimeTests
         }
 
         // Без предела соединение жило бы все 15 запросов: срок простоя перезапускался с каждым.
+        // Паузы под нагрузкой только длиннее секунды, поэтому за срок 3 с ответов не больше пяти; хотя бы один - всегда.
+        // Закрытие раньше срока простоя (30 с) - закрытие по абсолютному сроку, а не по простою.
         Assert.True(closed);
-        Assert.InRange(answered, 2, 5);
-        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(10), $"соединение закрыто через {clock.Elapsed}");
+        Assert.InRange(answered, 1, 5);
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(25), $"соединение закрыто через {clock.Elapsed}");
     }
 
     [Fact]

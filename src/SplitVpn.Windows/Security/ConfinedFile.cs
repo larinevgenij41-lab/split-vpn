@@ -29,6 +29,14 @@ public static unsafe partial class ConfinedFile
             return null;
         }
 
+        // Символическая ссылка каталога на сетевой ресурс где-то в пути увела бы уже само открытие на чужой узел, до
+        // сверки настоящего пути с корнем: каталоги проверяются и закрепляются до открытия файла.
+        using var pin = ReparseFreePath.Pin(path, includeFile: false);
+        if (pin is null)
+        {
+            return null;
+        }
+
         var handle = Open(path, FileFlagOpenReparsePoint);
         try
         {

@@ -40,6 +40,16 @@ internal sealed class UpdateManager(ServiceDependencies deps)
     /// <summary>После трёх неудач подряд недокачанный файл выбрасывается и загрузка начинается с нуля.</summary>
     private const int MaxDownloadAttempts = 3;
 
+    /// <summary>
+    /// После стольких несовпадений SHA-256 подряд автозагрузка выпуска останавливается: источник раз за разом отдаёт
+    /// не тот файл, и ежечасная загрузка десятков мегабайт ничего не даст. Возобновляет её новый выпуск в манифесте
+    /// или загрузка по команде пользователя.
+    /// </summary>
+    internal const int MaxHashMismatches = 3;
+
+    /// <summary>Автозагрузка этого выпуска остановлена после повторных несовпадений контрольной суммы.</summary>
+    internal static bool AutoDownloadSuspended(UpdateState state) => state.HashMismatches >= MaxHashMismatches;
+
     private readonly UpdateStore _store = new(deps.Stores.Paths.Update) { OnCorrupt = deps.CorruptFiles.Add };
 
     private UpdateState? _state;
@@ -437,7 +447,7 @@ internal sealed class UpdateManager(ServiceDependencies deps)
         {
             var current = coordinator.Settings.AppUpdate;
             if (State.Phase != UpdatePhase.Available || !SamePackage(State, download)
-                || !current.AutoDownload || !coordinator.NetworkPathAllowed
+                || !current.AutoDownload || AutoDownloadSuspended(State) || !coordinator.NetworkPathAllowed
                 || (!force && current.DeferOnMetered && deps.IsMeteredNetwork()))
             {
                 return null;
@@ -479,6 +489,7 @@ internal sealed class UpdateManager(ServiceDependencies deps)
             // Найденный раньше выпуск так и не скачался (сон, обрыв, перезапуск службы): «не изменилось» не значит
             // «уже скачано», и автозагрузка продолжается, иначе обновление стояло бы до выхода следующей версии.
             var resume = State.Phase == UpdatePhase.Available && settings.AutoDownload && State.PackageFileName is not null
+                && !AutoDownloadSuspended(State)
                 && UpdateVersion.TryParse(State.AvailableVersion, out var available) && available > deps.ProductVersion;
             var unchanged = Complete(coordinator, State, "Список выпусков не изменился.", success: true, fetch.RetryAfter, fetch.ETag, settings, validUntil, fetch.Url?.AbsoluteUri);
             return (unchanged, resume ? State : null);
@@ -491,6 +502,14 @@ internal sealed class UpdateManager(ServiceDependencies deps)
 
         var state = State;
         var check = CheckManifest(fetch, HighestSeen(state));
+        if (check.Older)
+        {
+            // Верно подписанный манифест с версией ниже уже известной: кэш зеркала или CDN ещё не обновился, либо
+            // подмена ответа. Это не сбой, а «обновлений нет»: младшая версия не предлагается (защита от отката),
+            // проверка идёт по обычному расписанию, а в журнал о каждом таком манифесте пишется один раз.
+            return (CompleteOlder(coordinator, state, fetch.Manifest!, check.Problem!, settings), null);
+        }
+
         if (check.Release is not { } release)
         {
             // Просроченный манифест — не сбой, а «обновлений нет»: проверка идёт по обычному расписанию.
@@ -518,12 +537,17 @@ internal sealed class UpdateManager(ServiceDependencies deps)
         }
 
         var found = WithRelease(state, release, settings, verifiedHash);
-        var message = found.Phase == UpdatePhase.Ready
-            ? $"Обновление до версии {release.VersionText} готово к установке."
-            : $"Доступно обновление до версии {release.VersionText}.";
+        var message = found.Phase switch
+        {
+            UpdatePhase.Ready => $"Обновление до версии {release.VersionText} готово к установке.",
+            UpdatePhase.Failed => $"Обновление до версии {release.VersionText} не установилось в прошлый раз: {found.LastInstallResult}",
+            _ when AutoDownloadSuspended(found) => $"Доступно обновление до версии {release.VersionText}; автозагрузка остановлена: " +
+                "контрольная сумма скачанного установщика не совпала несколько раз подряд.",
+            _ => $"Доступно обновление до версии {release.VersionText}.",
+        };
         var completed = Complete(coordinator, found, message, success: true, null, fetch.ETag, settings, release.Manifest.ExpiresUtc, fetch.Url?.AbsoluteUri);
         _releaseGeneration++;
-        var download = found.Phase == UpdatePhase.Available && settings.AutoDownload ? State : null;
+        var download = found.Phase == UpdatePhase.Available && settings.AutoDownload && !AutoDownloadSuspended(found) ? State : null;
         return (completed, download);
     }
 
@@ -554,9 +578,11 @@ internal sealed class UpdateManager(ServiceDependencies deps)
 
         if (highest is not null && release.Version < highest)
         {
-            // Подменённый ответ со старым, но верно подписанным манифестом откатил бы программу назад.
+            // Подменённый ответ со старым, но верно подписанным манифестом откатил бы программу назад: версия не
+            // предлагается. Отвергнутый ответ не мешает спросить зеркала (у них может быть свежий манифест).
             return new ManifestCheck(null,
-                $"Список выпусков предлагает версию {release.VersionText} ниже уже известной {UpdateVersion.Text(highest)}.", Expired: false);
+                $"Список выпусков предлагает версию {release.VersionText} ниже уже известной {UpdateVersion.Text(highest)}: она не предлагается.",
+                Expired: false, Older: true);
         }
 
         return UpdateManifestParser.ExpiryProblem(release, deps.Time.GetUtcNow(), deps.ProductVersion) is { } expired
@@ -564,7 +590,35 @@ internal sealed class UpdateManager(ServiceDependencies deps)
             : new ManifestCheck(release, null, Expired: false);
     }
 
-    private sealed record ManifestCheck(ReleaseInfo? Release, string? Problem, bool Expired);
+    private sealed record ManifestCheck(ReleaseInfo? Release, string? Problem, bool Expired, bool Older = false);
+
+    /// <summary>
+    /// Итог проверки, когда лучший ответ - манифест младше уже известной версии: успех по обычному расписанию,
+    /// найденный раньше выпуск не трогается. В журнал событий пишется только первый раз для каждого такого манифеста.
+    /// </summary>
+    private IpcResponse CompleteOlder(Coordinator coordinator, UpdateState state, byte[] manifest, string problem, AppUpdateSettings settings)
+    {
+        var digest = Convert.ToHexStringLower(SHA256.HashData(manifest));
+        var known = string.Equals(state.IgnoredOlderManifestSha256, digest, StringComparison.Ordinal);
+        var now = deps.Time.GetUtcNow();
+        Save(state with
+        {
+            LastCheckUtc = now,
+            NextCheckUtc = now + Interval(settings) + TimeSpan.FromMinutes(deps.Random.Next(0, 60)),
+            LastResult = "Новых версий нет. " + problem,
+            IgnoredOlderManifestSha256 = digest,
+        });
+        if (known)
+        {
+            deps.Logger.LogDebug("Обновление: снова получен манифест младше известной версии: {Problem}", problem);
+        }
+        else
+        {
+            coordinator.Journal("Предупреждение", "Обновление программы: " + problem);
+        }
+
+        return IpcResponse.Success(coordinator.BuildStatus());
+    }
 
     /// <summary>Найденный выпуск в состоянии; если установщик уже лежит целиком, загрузка не нужна.</summary>
     private async Task<string?> ExistingPackageHashAsync(ReleaseInfo release, CancellationToken cancellationToken)
@@ -587,9 +641,12 @@ internal sealed class UpdateManager(ServiceDependencies deps)
         var samePackage = state.AvailableVersion == release.VersionText && state.PackageFileName == package.FileName
             && state.PackageSize == package.Size && state.PackageSha256 == package.Sha256;
         var ready = string.Equals(verifiedHash, package.Sha256, StringComparison.OrdinalIgnoreCase) && FileLength(path) == package.Size;
+        // Неудачная установка того же выпуска (та же версия и тот же файл) не скрывается следующим ответом манифеста:
+        // иначе «Готово» пригласило бы ту же неудачную установку, а причина пропала бы из шапки. Новый выпуск - с нуля.
+        var failedBefore = samePackage && state.Phase == UpdatePhase.Failed;
         return state with
         {
-            Phase = ready ? UpdatePhase.Ready : UpdatePhase.Available,
+            Phase = ready ? (failedBefore ? UpdatePhase.Failed : UpdatePhase.Ready) : UpdatePhase.Available,
             AvailableVersion = release.VersionText,
             ReleasedUtc = release.Manifest.ReleasedUtc,
             Notes = release.Manifest.Notes,
@@ -600,10 +657,11 @@ internal sealed class UpdateManager(ServiceDependencies deps)
             PackageUrls = UpdateSources.PackageUrls(release, settings.PackageMirrors).Select(u => u.ToString()).ToList(),
             DownloadedBytes = ready ? package.Size : Math.Max(0, FileLength(_store.PartialPath(package.FileName))),
             DownloadAttempts = !ready && samePackage ? state.DownloadAttempts : 0,
+            HashMismatches = !ready && samePackage ? state.HashMismatches : 0,
             HighestSeenVersion = release.VersionText,
             InstallVersion = null,
             InstallStartedUtc = null, InstallerProcessId = null,
-            LastInstallResult = null,
+            LastInstallResult = failedBefore ? state.LastInstallResult : null,
         };
     }
 
@@ -620,6 +678,7 @@ internal sealed class UpdateManager(ServiceDependencies deps)
         PackageSize = 0,
         DownloadedBytes = 0,
         DownloadAttempts = 0,
+        HashMismatches = 0,
         PackageUrls = [],
         InstallVersion = null,
         InstallStartedUtc = null, InstallerProcessId = null,
@@ -723,6 +782,7 @@ internal sealed class UpdateManager(ServiceDependencies deps)
                 Phase = UpdatePhase.Ready,
                 DownloadedBytes = state.PackageSize,
                 DownloadAttempts = 0,
+                HashMismatches = 0,
                 LastResult = $"Обновление до версии {state.AvailableVersion} готово к установке.",
             };
             Save(ready);
@@ -741,14 +801,31 @@ internal sealed class UpdateManager(ServiceDependencies deps)
             discarded = true;
         }
 
+        // Несовпадение SHA-256 - не обрыв: тот же источник, скорее всего, снова отдаст тот же файл. Повтор
+        // откладывается вдвое дольше каждый раз (1, 2, 4 ч), после MaxHashMismatches автозагрузка этого выпуска стоит.
+        var mismatches = result.HashMismatch ? state.HashMismatches + 1 : state.HashMismatches;
+        var retry = result.HashMismatch ? RetryAfterFailure * (1 << Math.Min(mismatches - 1, 6)) : RetryAfterFailure;
+        if (result.RetryAfter is { } after && after > retry)
+        {
+            retry = after;
+        }
+
         var message = "Загрузка обновления не удалась: " + result.Message;
+        var suspended = result.HashMismatch && mismatches >= MaxHashMismatches;
+        if (suspended)
+        {
+            message += string.Create(CultureInfo.InvariantCulture,
+                $" Контрольная сумма не совпала {mismatches} раз подряд: автозагрузка версии {state.AvailableVersion} остановлена до выхода нового выпуска; скачать её заново можно вручную на странице обновлений.");
+        }
+
         Save(state with
         {
             Phase = UpdatePhase.Available,
             DownloadedBytes = discarded ? 0 : result.Bytes,
             DownloadAttempts = attempts,
+            HashMismatches = mismatches,
             LastResult = message,
-            NextCheckUtc = deps.Time.GetUtcNow() + (result.RetryAfter is { } after && after > RetryAfterFailure ? after : RetryAfterFailure),
+            NextCheckUtc = deps.Time.GetUtcNow() + retry,
         });
         coordinator.Journal("Ошибка", message);
         return IpcResponse.Failure(IpcErrorCodes.Failed, message);

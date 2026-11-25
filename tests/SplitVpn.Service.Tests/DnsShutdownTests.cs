@@ -39,10 +39,10 @@ public sealed class DnsShutdownTests
     [Fact]
     public async Task TcpTaken_WorksOverUdpFailsLargeAnswersAndTakesTcpLater()
     {
-        var port = await FreePortAsync(IPAddress.Loopback);
-        var squatter = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { ExclusiveAddressUse = true };
-        squatter.Bind(new IPEndPoint(IPAddress.Loopback, port));
-        squatter.Listen(1);
+        // Захватчик TCP - сокет самой пробы: порт не отпускается между выбором и захватом.
+        var (probeUdp, squatter) = HoldFreePort(IPAddress.Loopback);
+        var port = ((IPEndPoint)squatter.LocalEndPoint!).Port;
+        probeUdp.Dispose();
 
         var cache = new DnsCache(TimeProvider.System);
         cache.Pin("small.example", [0xCB007109u]);
@@ -91,9 +91,11 @@ public sealed class DnsShutdownTests
     [Fact]
     public async Task Start_FailsWhenUdpPortIsTaken()
     {
-        var port = await FreePortAsync(IPAddress.Loopback);
-        using var squatter = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp) { ExclusiveAddressUse = true };
-        squatter.Bind(new IPEndPoint(IPAddress.Loopback, port));
+        // Захватчик UDP - сокет самой пробы: порт не отпускается между выбором и захватом.
+        var held = HoldFreePort(IPAddress.Loopback);
+        using var squatter = held.Udp;
+        var port = ((IPEndPoint)squatter.LocalEndPoint!).Port;
+        held.Tcp.Dispose();
 
         await using var proxy = new DnsProxyServer(IPAddress.Loopback, new DnsCache(TimeProvider.System));
 
@@ -104,12 +106,34 @@ public sealed class DnsShutdownTests
         tcp.Bind(new IPEndPoint(IPAddress.Loopback, port));
     }
 
-    /// <summary>Порт, годный и для UDP, и для TCP (вне исключённых диапазонов обоих протоколов).</summary>
-    private static async Task<int> FreePortAsync(IPAddress address)
+    /// <summary>
+    /// Эксклюзивно занимает случайный порт, годный и для UDP, и для TCP (вне исключённых диапазонов обоих протоколов),
+    /// и возвращает оба сокета. Тест оставляет один из них захватчиком: отпустить порт и занять его заново - гонка
+    /// с другими процессами за свободный номер.
+    /// </summary>
+    private static (Socket Udp, Socket Tcp) HoldFreePort(IPAddress address)
     {
-        await using var probe = new DnsProxyServer(address, new DnsCache(TimeProvider.System));
-        probe.Start(0);
-        return probe.ListenEndPoint!.Port;
+        for (var attempt = 1; ; attempt++)
+        {
+            var tcp = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { ExclusiveAddressUse = true };
+            var udp = new Socket(address.AddressFamily, SocketType.Dgram, ProtocolType.Udp) { ExclusiveAddressUse = true };
+            try
+            {
+                tcp.Bind(new IPEndPoint(address, Random.Shared.Next(49152, 65536)));
+                tcp.Listen(1);
+                udp.Bind(tcp.LocalEndPoint!);
+                return (udp, tcp);
+            }
+            catch (SocketException)
+            {
+                udp.Dispose();
+                tcp.Dispose();
+                if (attempt >= 50)
+                {
+                    throw;
+                }
+            }
+        }
     }
 
     private static async Task<byte[]> QueryUdpAsync(IPEndPoint endpoint, string name, CancellationToken token)
@@ -124,10 +148,7 @@ public sealed class DnsShutdownTests
     [Fact]
     public async Task OptionalAddress_AnswersOnBothAddresses()
     {
-        if (!Socket.OSSupportsIPv6)
-        {
-            return;
-        }
+        Assert.SkipUnless(Socket.OSSupportsIPv6, "Стек IPv6 недоступен: проверять ::1 нечем.");
 
         var cache = new DnsCache(TimeProvider.System);
         cache.Pin("pinned.example", [0xCB007109u]);
@@ -149,10 +170,7 @@ public sealed class DnsShutdownTests
     [Fact]
     public async Task OptionalAddressTaken_KeepsPrimaryAndTakesItLater()
     {
-        if (!Socket.OSSupportsIPv6)
-        {
-            return;
-        }
+        Assert.SkipUnless(Socket.OSSupportsIPv6, "Стек IPv6 недоступен: проверять ::1 нечем.");
 
         // Захватчик ::1 — такой же посредник: он подбирает порт, свободный и для UDP, и для TCP.
         var squatter = new DnsProxyServer(IPAddress.IPv6Loopback, new DnsCache(TimeProvider.System));

@@ -23,6 +23,12 @@ public sealed record PackageDownloadResult
 
     /// <summary>Недокачанный файл выброшен: следующая попытка начнётся с нуля.</summary>
     public bool PartialDiscarded { get; init; }
+
+    /// <summary>
+    /// Хоть один источник отдал файл полного размера, но не с той контрольной суммой: повтор того же выпуска
+    /// вероятно снова скачает тот же неверный файл, и вызывающий откладывает его, а не повторяет каждый час.
+    /// </summary>
+    public bool HashMismatch { get; init; }
 }
 
 /// <summary>
@@ -53,26 +59,31 @@ public sealed class PackageDownloader(HttpClient client, TimeSpan? idleTimeout =
         // Ограничение частоты у одного источника не закрывает зеркала: срок повтора возвращается, только если
         // не скачалось ни с одного.
         PackageDownloadResult? rateLimited = null;
+        var mismatch = false;
         foreach (var url in urls)
         {
             var reusable = PartialLength(partialPath);
             if (reusable > expectedSize) { reusable = 0; }
             if (FreeSpaceProblem(partialPath, expectedSize - reusable + spareDiskBytes) is { } space)
             {
-                return new PackageDownloadResult { Failure = FetchFailure.Network, Message = space };
+                return new PackageDownloadResult { Failure = FetchFailure.Network, Message = space, HashMismatch = mismatch };
             }
 
             last = await DownloadFromSourceAsync(url, true);
             if (!last.Success && last.PartialDiscarded && reusable > 0)
             {
+                // Несовпадение после докачки могло быть виной старого куска, а не источника: в счёт идёт попытка с нуля.
                 last = await DownloadFromSourceAsync(url, false);
             }
+
+            mismatch |= last.HashMismatch;
 
             if (last.Success) { return last; }
             if (last.Failure == FetchFailure.RateLimited) { rateLimited ??= last; }
         }
 
-        return rateLimited ?? last ?? new PackageDownloadResult { Failure = FetchFailure.Network, Message = "Не задан адрес установщика." };
+        var failed = rateLimited ?? last ?? new PackageDownloadResult { Failure = FetchFailure.Network, Message = "Не задан адрес установщика." };
+        return failed with { HashMismatch = mismatch };
 
         async Task<PackageDownloadResult> DownloadFromSourceAsync(Uri url, bool resume)
         {
@@ -105,6 +116,7 @@ public sealed class PackageDownloader(HttpClient client, TimeSpan? idleTimeout =
                     Message = "Контрольная сумма установщика не совпала: файл отброшен.",
                     Url = url,
                     PartialDiscarded = true,
+                    HashMismatch = true,
                 };
             }
 

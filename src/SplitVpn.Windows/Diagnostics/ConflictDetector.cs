@@ -472,8 +472,10 @@ public static class ConflictDetector
     /// </summary>
     private static void ReadPhonebook(string path, string root, List<WindowsVpnEntry> entries)
     {
-        // До File.Exists: даже проверка существования сетевого пути отправляет туда учётную запись компьютера.
-        if (!Security.LocalPath.IsLocalFixed(path) || !Security.LocalPath.IsLocalFixed(root) || !File.Exists(path))
+        // Без File.Exists: даже проверка существования сетевого пути (в том числе через ссылку каталога в локальном на
+        // вид пути) отправляет туда учётную запись компьютера. ConfinedFile сам проходит путь без ссылок, а
+        // отсутствующая книга - FileNotFoundException или DirectoryNotFoundException, которые ловит вызывающий.
+        if (!Security.LocalPath.IsLocalFixed(path) || !Security.LocalPath.IsLocalFixed(root))
         {
             return;
         }

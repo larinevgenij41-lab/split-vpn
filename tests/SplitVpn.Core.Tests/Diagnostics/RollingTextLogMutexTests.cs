@@ -58,15 +58,16 @@ public sealed class RollingTextLogMutexTests : IDisposable
         try
         {
             var watch = Stopwatch.StartNew();
-            for (var i = 0; i < 50; i++)
+            for (var i = 0; i < 200; i++)
             {
                 log.Write("Ui", "строка " + i);
             }
 
             watch.Stop();
 
-            // Одно короткое ожидание, затем без ожидания: прежде каждая строка ждала 2 с.
-            Assert.True(watch.Elapsed < TimeSpan.FromSeconds(2), $"запись заняла {watch.Elapsed}");
+            // Одно короткое ожидание (250 мс), затем без ожидания: ждать на каждой строке значило бы 200 x 250 мс = 50 с
+            // и больше. Срок с запасом для параллельного прогона и всё равно в пять раз меньше.
+            Assert.True(watch.Elapsed < TimeSpan.FromSeconds(10), $"запись заняла {watch.Elapsed}");
             Assert.False(File.Exists(ProcessFile));
         }
         finally
@@ -78,7 +79,7 @@ public sealed class RollingTextLogMutexTests : IDisposable
         log.Write("Ui", "после");
         var text = File.ReadAllText(LogPath);
         var first = text.IndexOf("строка 0" + Environment.NewLine, StringComparison.Ordinal);
-        var last = text.IndexOf("строка 49" + Environment.NewLine, StringComparison.Ordinal);
+        var last = text.IndexOf("строка 199" + Environment.NewLine, StringComparison.Ordinal);
         var after = text.IndexOf("после", StringComparison.Ordinal);
         Assert.True(first >= 0 && last > first && after > last, text);
         Assert.False(File.Exists(ProcessFile));

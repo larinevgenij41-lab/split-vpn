@@ -407,6 +407,14 @@ public static unsafe class RasPhonebook
             return ErrorCannotOpenPhonebook;
         }
 
+        // RasGetEntryProperties читает книгу в этом процессе (SYSTEM): ссылка в пути на сетевой ресурс увела бы туда
+        // учётную запись компьютера. Путь без ссылок закрепляется на время чтения.
+        using var pin = string.IsNullOrEmpty(phonebookPath) ? null : PinPhonebook(phonebookPath);
+        if (!string.IsNullOrEmpty(phonebookPath) && pin is null)
+        {
+            return ErrorCannotOpenPhonebook;
+        }
+
         var size = (uint)sizeof(RASENTRYW);
         uint deviceInfoSize = 0;
         var code = PInvoke.RasGetEntryProperties(phonebookPath, entryName, ref entry, ref size, default, ref deviceInfoSize);
@@ -424,6 +432,29 @@ public static unsafe class RasPhonebook
         }
 
         return code;
+    }
+
+    /// <summary>
+    /// Закрепляет путь книги без точек повторного анализа, включая сам файл; null - в пути ссылка или путь не открылся.
+    /// Файла ещё нет - закрепляются только каталоги, и об отсутствии книги, как прежде, отвечает RAS.
+    /// </summary>
+    internal static Security.ReparseFreePath? PinPhonebook(string phonebookPath)
+    {
+        try
+        {
+            try
+            {
+                return Security.ReparseFreePath.Pin(phonebookPath, includeFile: true);
+            }
+            catch (FileNotFoundException)
+            {
+                return Security.ReparseFreePath.Pin(phonebookPath, includeFile: false);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     private static void Copy(string value, Span<char> target)

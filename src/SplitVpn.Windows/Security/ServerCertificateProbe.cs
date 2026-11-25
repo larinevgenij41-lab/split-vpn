@@ -51,14 +51,7 @@ public static class ServerCertificateProbe
 
         try
         {
-            await tls.AuthenticateAsClientAsync(
-                new SslClientAuthenticationOptions
-                {
-                    TargetHost = TargetName(address, host),
-                    // Проверка отзыва здесь и не нужна, и невозможна: именно её адреса проба и ищет.
-                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-                },
-                cts.Token);
+            await tls.AuthenticateAsClientAsync(ClientOptions(TargetName(address, host)), cts.Token);
         }
         catch (Exception ex) when (ex is AuthenticationException or IOException or SocketException or OperationCanceledException)
         {
@@ -68,24 +61,43 @@ public static class ServerCertificateProbe
         return presented.Count == 0 ? null : Facts(presented, nameMatches);
     }
 
+    /// <summary>
+    /// Параметры рукопожатия пробы. Цепочка строится без загрузок: иначе CryptoAPI от имени SYSTEM сам скачал бы
+    /// недостающий промежуточный по AIA (запрос службы в сеть по адресу из чужого сертификата), и нехватку
+    /// промежуточного, которую проба должна объяснить, было бы не увидеть. Проверка отзыва здесь и не нужна,
+    /// и невозможна: именно её адреса проба и ищет. Решение о доверии от этого не меняется - обратный вызов
+    /// отказывает рукопожатию всегда.
+    /// </summary>
+    internal static SslClientAuthenticationOptions ClientOptions(string targetHost) => new()
+    {
+        TargetHost = targetHost,
+        CertificateChainPolicy = new X509ChainPolicy
+        {
+            RevocationMode = X509RevocationMode.NoCheck,
+            DisableCertificateDownloads = true,
+        },
+    };
+
     /// <summary>Имя для SNI: без него сервер с несколькими сайтами предъявит не тот сертификат.</summary>
     private static string TargetName(uint address, string? host) =>
         host is { Length: > 0 } name && Uri.CheckHostName(name) == UriHostNameType.Dns ? name : Ipv4.Format(address);
 
     /// <summary>
-    /// Сертификаты копируются байтами: объекты обратного вызова живут только на время рукопожатия
-    /// и после возврата уже освобождены.
+    /// Лист и то, что сервер прислал сам: SslStream кладёт присланные сертификаты в ExtraStore политики цепочки.
+    /// ChainElements не годятся: это цепочка, достроенная локально (из хранилищ компьютера), и промежуточный,
+    /// которого сервер не прислал, выглядел бы присланным - нехватку его проба не заметила бы. Сертификаты
+    /// копируются байтами: объекты обратного вызова живут только на время рукопожатия и после возврата уже освобождены.
     /// </summary>
-    private static void Collect(List<byte[]> presented, X509Certificate? certificate, X509Chain? chain)
+    internal static void Collect(List<byte[]> presented, X509Certificate? certificate, X509Chain? chain)
     {
         if (certificate is not null)
         {
             presented.Add(certificate.GetRawCertData());
         }
 
-        foreach (var element in chain?.ChainElements ?? (IEnumerable<X509ChainElement>)[])
+        foreach (var sent in chain?.ChainPolicy.ExtraStore ?? [])
         {
-            presented.Add(element.Certificate.RawData);
+            presented.Add(sent.RawData);
         }
     }
 

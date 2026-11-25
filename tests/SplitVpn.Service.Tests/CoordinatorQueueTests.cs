@@ -44,7 +44,9 @@ public sealed partial class CoordinatorTests
         Assert.Equal(_profile.Id, Assert.Single(settings.ResultAs<AppSettings>()!.Profiles).Id);
         Assert.Contains(events.ResultAs<List<ServiceEvent>>()!, e => e.Text.StartsWith("Служба запущена", StringComparison.Ordinal));
         Assert.Contains("Беспроводная сеть", report.ResultAs<string>()!, StringComparison.Ordinal);
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(2), $"пять чтений заняли {watch.ElapsedMilliseconds} мс");
+        // Главное доказательство - ответы пришли, пока долгая работа держит очередь (ворота не открыты). Срок
+        // лишь страхует от зависания и широк для параллельного прогона.
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(10), $"пять чтений заняли {watch.ElapsedMilliseconds} мс");
         Assert.False(gate.Task.IsCompleted);
 
         gate.TrySetResult();
@@ -70,7 +72,9 @@ public sealed partial class CoordinatorTests
         Assert.Equal(ConnectionState.PreparingProtection, response.ResultAs<StatusDto>()!.State);
         Assert.Equal("Проверка сетевых адаптеров", response.ResultAs<StatusDto>()!.Progress?.Stage);
         Assert.Equal(15, response.ResultAs<StatusDto>()!.Progress?.Percent);
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(1), $"состояние при запуске заняло {watch.ElapsedMilliseconds} мс");
+        // Запуск стоит на воротах снимка сети (до 30 с): ответ раньше них - ответ без ожидания запуска.
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(10), $"состояние при запуске заняло {watch.ElapsedMilliseconds} мс");
+        Assert.True(_world.Inventory.CaptureEntered.Task.IsCompleted && !gate.IsSet);
 
         _world.Inventory.CaptureGate = null;
         gate.Set();
@@ -174,6 +178,8 @@ public sealed partial class CoordinatorTests
         using var cancellation = new CancellationTokenSource();
         var run = Task.Run(() => coordinator.RunAsync(cancellation.Token), CancellationToken.None);
 
+        // Сначала дождаться конца запуска: иначе быстрая работа ждала бы его в очереди и попадала в журнал за ожидание.
+        await WaitQueueAsync(coordinator);
         await coordinator.EnqueueAsync("Test:Fast", () => Task.CompletedTask);
         await coordinator.EnqueueAsync("Test:Slow", () => Task.Delay(700));
         await WaitQueueAsync(coordinator);

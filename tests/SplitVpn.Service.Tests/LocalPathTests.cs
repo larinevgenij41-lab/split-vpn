@@ -13,7 +13,17 @@ public sealed class LocalPathTests : IDisposable
 
     public LocalPathTests() => Directory.CreateDirectory(_root);
 
-    public void Dispose() => Directory.Delete(_root, recursive: true);
+    public void Dispose()
+    {
+        // Рекурсивное удаление корня спотыкается о junction (отказ в доступе): ссылки убираются по одной.
+        foreach (var link in Directory.EnumerateDirectories(_root, "*", SearchOption.TopDirectoryOnly)
+            .Where(d => File.GetAttributes(d).HasFlag(FileAttributes.ReparsePoint)).ToList())
+        {
+            Directory.Delete(link);
+        }
+
+        Directory.Delete(_root, recursive: true);
+    }
 
     /// <summary>Шов типа диска: вызов означал бы обращение к системе, для этих путей его быть не должно.</summary>
     private static DriveType NoAccess(string root) => throw new InvalidOperationException("обращение к диску " + root);
@@ -152,7 +162,14 @@ public sealed class LocalPathTests : IDisposable
         using (var compact = System.Diagnostics.Process.Start(start)!)
         {
             compact.StandardOutput.ReadToEnd();
-            compact.WaitForExit(30_000);
+            if (!compact.WaitForExit(30_000))
+            {
+                // Процесс запущен этим тестом: его и останавливаем, иначе ExitCode бросил бы InvalidOperationException.
+                compact.Kill();
+                Assert.Skip("compact.exe не завершился за 30 с");
+                return;
+            }
+
             if (compact.ExitCode != 0)
             {
                 Assert.Skip("Том не поддерживает сжатие WOF");
@@ -179,6 +196,103 @@ public sealed class LocalPathTests : IDisposable
     {
         Assert.Null(ConfinedFile.OpenRead(@"\\?\UNC\localhost\c$\Windows\win.ini", _root));
         Assert.Null(ConfinedFile.OpenRead(Path.Combine(_root, "x.txt"), @"\\localhost\c$"));
+    }
+
+    /// <summary>Junction создаётся без особых прав (в отличие от символической ссылки): им и проверяется проход пути.</summary>
+    private static string CreateJunctionOrSkip(string link, string target)
+    {
+        var start = new System.Diagnostics.ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"), $"/c mklink /J \"{link}\" \"{target}\"")
+        {
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        using var mklink = System.Diagnostics.Process.Start(start)!;
+        mklink.StandardOutput.ReadToEnd();
+        mklink.StandardError.ReadToEnd();
+        if (!mklink.WaitForExit(30_000))
+        {
+            mklink.Kill();
+            Assert.Skip("mklink не завершился за 30 с");
+        }
+
+        Assert.SkipUnless(mklink.ExitCode == 0 && Directory.Exists(link), "Не удалось создать junction на этом томе");
+        return link;
+    }
+
+    [Fact]
+    public void ReparseFreePath_PinsOrdinaryPath()
+    {
+        var file = Path.Combine(_root, "dir", "file.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+        File.WriteAllText(file, "x");
+
+        using (var pin = ReparseFreePath.Pin(file, includeFile: true))
+        {
+            Assert.NotNull(pin);
+            // Пока путь закреплён, каталог нельзя переименовать и подставить вместо него ссылку.
+            Assert.ThrowsAny<IOException>(() => Directory.Move(Path.Combine(_root, "dir"), Path.Combine(_root, "moved")));
+        }
+
+        Directory.Move(Path.Combine(_root, "dir"), Path.Combine(_root, "moved"));
+        Assert.Throws<DirectoryNotFoundException>(() => ReparseFreePath.Pin(Path.Combine(_root, "нет", "file.txt"), includeFile: true));
+        Assert.Throws<FileNotFoundException>(() => ReparseFreePath.Pin(Path.Combine(_root, "moved", "нет.txt"), includeFile: true));
+        Assert.Null(ReparseFreePath.Pin(@"\\localhost\c$\Windows\win.ini", includeFile: true));
+    }
+
+    /// <summary>
+    /// Аудит, итерация 10: путь, локальный на вид, мог вести на сетевой ресурс через ссылку каталога в середине, и
+    /// открытие от имени SYSTEM отдало бы туда NTLM-аутентификацию компьютера. Точка повторного анализа в любом
+    /// каталоге пути отвергается до открытия файла - даже если настоящий путь остаётся внутри корня.
+    /// </summary>
+    [Fact]
+    public void ReparsePointInMiddleOfPath_IsRejectedBeforeOpening()
+    {
+        var real = Path.Combine(_root, "real");
+        Directory.CreateDirectory(real);
+        File.WriteAllText(Path.Combine(real, "rasphone.pbk"), "[Запись]\r\n");
+        var junction = CreateJunctionOrSkip(Path.Combine(_root, "junction"), real);
+        var viaJunction = Path.Combine(junction, "rasphone.pbk");
+
+        Assert.Null(ReparseFreePath.Pin(viaJunction, includeFile: true));
+        Assert.Null(ReparseFreePath.Pin(viaJunction, includeFile: false));
+        Assert.Null(ReparseFreePath.Pin(Path.Combine(junction, "нет-такого.pbk"), includeFile: false));
+        // Прежде настоящий путь (внутри корня) проходил сверку, и файл читался через junction.
+        Assert.Null(ConfinedFile.OpenRead(viaJunction, _root));
+        Assert.Null(RasPhonebook.PinPhonebook(viaJunction));
+
+        using (var direct = ConfinedFile.OpenRead(Path.Combine(real, "rasphone.pbk"), _root))
+        {
+            Assert.NotNull(direct);
+        }
+
+        using var pinned = RasPhonebook.PinPhonebook(Path.Combine(real, "rasphone.pbk"));
+        Assert.NotNull(pinned);
+        // Книги ещё нет: закрепляются каталоги, об отсутствии отвечает RAS, как прежде.
+        using var missing = RasPhonebook.PinPhonebook(Path.Combine(real, "new.pbk"));
+        Assert.NotNull(missing);
+    }
+
+    /// <summary>Символическая ссылка каталога (так её направили бы на \\attacker\share) отвергается так же.</summary>
+    [Fact]
+    public void DirectorySymlinkInPath_IsRejected()
+    {
+        var real = Path.Combine(_root, "real");
+        Directory.CreateDirectory(real);
+        File.WriteAllText(Path.Combine(real, "file.txt"), "x");
+        var link = Path.Combine(_root, "link");
+        try
+        {
+            Directory.CreateSymbolicLink(link, real);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Assert.Skip("Нет права создавать символические ссылки: " + ex.Message);
+        }
+
+        Assert.Null(ReparseFreePath.Pin(Path.Combine(link, "file.txt"), includeFile: true));
+        Assert.Null(ConfinedFile.OpenRead(Path.Combine(link, "file.txt"), _root));
     }
 
     /// <summary>Symlink на последнем компоненте не разыменовывается даже внутри корня: файл-ссылка отвергается.</summary>

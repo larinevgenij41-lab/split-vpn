@@ -55,13 +55,18 @@ public sealed class AdapterAddressDnsTests
     private static IPAddress? LocalAddress() =>
         Dns.GetHostAddresses(Dns.GetHostName(), AddressFamily.InterNetwork).FirstOrDefault(a => !IPAddress.IsLoopback(a));
 
+    /// <summary>Адрес IPv4 компьютера, кроме loopback; без него тест пропускается с причиной, а не проходит молча.</summary>
+    private static IPAddress LocalAddressOrSkip()
+    {
+        var local = LocalAddress();
+        Assert.SkipWhen(local is null, "У компьютера нет адреса IPv4, кроме loopback: проверять нечем.");
+        return local!;
+    }
+
     [Fact]
     public async Task Proxy_AnswersOnAdapterAddress_OnlyToThisComputer()
     {
-        if (LocalAddress() is not { } local)
-        {
-            return; // У компьютера нет адреса IPv4, кроме loopback: проверять нечем.
-        }
+        var local = LocalAddressOrSkip();
 
         var cache = new DnsCache(new FakeTimeProvider());
         cache.Pin("pinned.example", [Ipv4.Parse("203.0.113.7")]);
@@ -92,10 +97,7 @@ public sealed class AdapterAddressDnsTests
     [Fact]
     public async Task Proxy_IgnoresQueryFromForeignAddress()
     {
-        if (LocalAddress() is not { } local)
-        {
-            return;
-        }
+        var local = LocalAddressOrSkip();
 
         var cache = new DnsCache(new FakeTimeProvider());
         cache.Pin("pinned.example", [Ipv4.Parse("203.0.113.7")]);
@@ -163,16 +165,25 @@ public sealed class AdapterAddressDnsTests
     [Fact]
     public async Task Proxy_AdapterListener_CoexistsWithForeignListenerOnItsOwnAddress()
     {
-        if (LocalAddress() is not { } local)
-        {
-            return;
-        }
+        var local = LocalAddressOrSkip();
 
-        await using var proxy = new DnsProxyServer(IPAddress.Loopback, new DnsCache(new FakeTimeProvider())) { ServeAdapterAddresses = true };
+        var cache = new DnsCache(new FakeTimeProvider());
+        cache.Pin("pinned.example", [Ipv4.Parse("203.0.113.7")]);
+        await using var proxy = new DnsProxyServer(IPAddress.Loopback, cache) { ServeAdapterAddresses = true };
         proxy.Start(0);
 
         // Чужой резолвер (DNS WSL, Hyper-V) занимает порт на своём адресе эксклюзивно уже после нас: ему не мешаем.
         using var foreign = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp) { ExclusiveAddressUse = true };
         foreign.Bind(new IPEndPoint(local, proxy.AdapterEndPoint!.Port));
+
+        // И сами продолжаем отвечать на 127.0.0.1: чужая привязка на адресе адаптера основной слушатель не задевает.
+        using var client = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        await client.SendAsync(DnsMessage.BuildQuery(9, "pinned.example", DnsMessage.TypeA), proxy.ListenEndPoint!, TestContext.Current.CancellationToken);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        var answer = (await client.ReceiveAsync(timeout.Token)).Buffer;
+        Assert.Equal(9, DnsMessage.GetId(answer));
+        Assert.Equal(0, DnsMessage.GetRcode(answer));
+        Assert.True(proxy.AdapterListening);
     }
 }

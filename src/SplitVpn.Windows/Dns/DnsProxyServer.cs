@@ -574,7 +574,8 @@ public sealed class DnsProxyServer : IAsyncDisposable
                 throw new InvalidOperationException("DNS-посредник уже запущен.");
             }
 
-            var primary = BindPrimary(port);
+            var bound = BindAll(port);
+            var primary = bound.Primary;
             _listeners.Add(primary);
             _loops.Add(Task.Run(() => UdpLoopAsync(primary, _stop.Token)));
             if (primary.Tcp is { } tcp)
@@ -591,17 +592,16 @@ public sealed class DnsProxyServer : IAsyncDisposable
             if (_optionalAddress is not null)
             {
                 var endpoint = new IPEndPoint(_optionalAddress, primary.EndPoint.Port);
-                try
+                if (bound.Optional is { } optional)
                 {
-                    var optional = Bind(endpoint);
                     _listeners.Add(optional);
                     _loops.Add(Task.Run(() => UdpLoopAsync(optional, _stop.Token)));
                     _loops.Add(Task.Run(() => TcpAcceptLoopAsync(optional, optional.Tcp!, _stop.Token)));
                 }
-                catch (SocketException ex)
+                else
                 {
                     // Адрес занят другим процессом или стек IPv6 выключен: пока он не занят, адаптерам не назначается.
-                    Warn($"DNS-посредник не занял {endpoint}: {ex.SocketErrorCode}; попытки продолжаются");
+                    Warn($"DNS-посредник не занял {endpoint}: {bound.OptionalError}; попытки продолжаются");
                     _loops.Add(Task.Run(() => OptionalRetryLoopAsync(endpoint, _stop.Token)));
                 }
             }
@@ -610,18 +610,89 @@ public sealed class DnsProxyServer : IAsyncDisposable
             {
                 // Первая попытка - сразу: служба ставит адаптеру DNS в той же сверке, и список не меняется дважды.
                 var endpoint = new IPEndPoint(IPAddress.Any, primary.EndPoint.Port);
-                try
+                if (bound.Wildcard is { } wildcard)
                 {
-                    StartWildcard(BindShared(endpoint));
+                    StartWildcard(wildcard);
                 }
-                catch (SocketException ex)
+                else
                 {
-                    Warn($"DNS-посредник не занял {endpoint}: {ex.SocketErrorCode}; проверка интернета Windows на адаптере " +
+                    Warn($"DNS-посредник не занял {endpoint}: {bound.WildcardError}; проверка интернета Windows на адаптере " +
                         "не пройдёт, попытки продолжаются");
                     _loops.Add(Task.Run(() => WildcardRetryLoopAsync(endpoint, _stop.Token)));
                 }
             }
         }
+    }
+
+    /// <summary>Слушатели, занятые при старте; не занятый дополнительный или общий слушатель - с кодом ошибки.</summary>
+    private readonly record struct BoundListeners(
+        Listener Primary, Listener? Optional, SocketError OptionalError, Listener? Wildcard, SocketError WildcardError);
+
+    /// <summary>
+    /// Занимает основной, дополнительный (::1) и общий (0.0.0.0) слушатели одного порта. Заданный порт (53) - как
+    /// прежде: основной обязательно, остальные - если свободны (иначе повтор в фоне). Порт 0 (тесты): номер
+    /// случайный, и если он свободен на 127.0.0.1, но занят на ::1 или 0.0.0.0 другим процессом, все слушатели
+    /// освобождаются и берётся другой номер - иначе посредник стартовал бы без них и ждал повтора 5 с. Ошибку,
+    /// которую смена номера не исправит (стек IPv6 выключен), принимаем сразу, как при заданном порте.
+    /// </summary>
+    private BoundListeners BindAll(int port)
+    {
+        if (port != 0)
+        {
+            return BindSecondary(BindPrimary(port));
+        }
+
+        const int attempts = 50;
+        for (var attempt = 1; ; attempt++)
+        {
+            var bound = BindSecondary(BindPrimary(0));
+            var collided = IsCollision(bound.Optional, bound.OptionalError) || IsCollision(bound.Wildcard, bound.WildcardError);
+            if (!collided || attempt >= attempts)
+            {
+                return bound;
+            }
+
+            bound.Wildcard?.Close();
+            bound.Optional?.Close();
+            bound.Primary.Close();
+        }
+
+        static bool IsCollision(Listener? listener, SocketError error) =>
+            listener is null && error is SocketError.AddressAlreadyInUse or SocketError.AccessDenied;
+    }
+
+    private BoundListeners BindSecondary(Listener primary)
+    {
+        var port = primary.EndPoint.Port;
+        Listener? optional = null;
+        var optionalError = SocketError.Success;
+        if (_optionalAddress is not null)
+        {
+            try
+            {
+                optional = Bind(new IPEndPoint(_optionalAddress, port));
+            }
+            catch (SocketException ex)
+            {
+                optionalError = ex.SocketErrorCode;
+            }
+        }
+
+        Listener? wildcard = null;
+        var wildcardError = SocketError.Success;
+        if (ServeAdapterAddresses)
+        {
+            try
+            {
+                wildcard = BindShared(new IPEndPoint(IPAddress.Any, port));
+            }
+            catch (SocketException ex)
+            {
+                wildcardError = ex.SocketErrorCode;
+            }
+        }
+
+        return new BoundListeners(primary, optional, optionalError, wildcard, wildcardError);
     }
 
     /// <summary>Запускает приём на слушателе всех адресов; вызывается под <see cref="_workGate"/>.</summary>

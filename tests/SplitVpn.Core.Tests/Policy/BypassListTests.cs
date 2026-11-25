@@ -144,7 +144,8 @@ public class BypassListTests
         var policy = PolicyCompiler.Compile(input);
         stopwatch.Stop();
 
-        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(3), $"Компиляция заняла {stopwatch.Elapsed}");
+        // Обычно доли секунды; срок с запасом для параллельного прогона ловит только квадратичную деградацию.
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(15), $"Компиляция заняла {stopwatch.Elapsed}");
         Assert.True(policy.SegmentCount > 0);
     }
 

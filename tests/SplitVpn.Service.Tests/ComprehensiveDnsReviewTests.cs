@@ -98,14 +98,15 @@ public sealed class ComprehensiveDnsReviewTests
             .ToList();
         await stalled.ReceivedFirst.Task.WaitAsync(TimeSpan.FromSeconds(2), token);
 
-        var timer = System.Diagnostics.Stopwatch.StartNew();
         var extra = await proxy.HandleAsync(DnsMessage.BuildQuery(900, "extra.slow.example", DnsMessage.TypeA), token);
         var other = await proxy.HandleAsync(DnsMessage.BuildQuery(901, "fast.example.org", DnsMessage.TypeA), token);
-        timer.Stop();
+        // Вместо замера времени - порядок: запросы к зависшему пути держатся до своего тайм-аута, и пока ни один из них
+        // не завершился, ответы выше пришли без ожидания зависшего пути (освободившееся место им не понадобилось).
+        var pendingStalled = waiting.Count(t => !t.IsCompleted);
 
         Assert.Equal(2, DnsMessage.GetRcode(extra));
         Assert.Equal(0, DnsMessage.GetRcode(other));
-        Assert.True(timer.Elapsed < TimeSpan.FromSeconds(1), $"Ответы пришли за {timer.ElapsedMilliseconds} мс: посредник ждал зависший путь.");
+        Assert.Equal(DnsProxyServer.MaxQueriesPerRoute, pendingStalled);
         Assert.All(await Task.WhenAll(waiting), response => Assert.Equal(2, DnsMessage.GetRcode(response)));
     }
 

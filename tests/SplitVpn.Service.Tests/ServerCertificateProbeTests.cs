@@ -69,6 +69,53 @@ public sealed class ServerCertificateProbeTests
         Assert.Null(IntermediateCertificateInstaller.SelectIntermediate(leaf, leaf.RawData, roots));
     }
 
+    /// <summary>
+    /// Рукопожатие пробы строит цепочку без загрузок: иначе CryptoAPI от имени SYSTEM скачивал бы промежуточный по
+    /// AIA, и нехватку промежуточного проба не видела бы. Отзыв не проверяется - его адреса проба и ищет.
+    /// </summary>
+    [Fact]
+    public void ClientOptions_DisableDownloadsAndRevocation()
+    {
+        var options = ServerCertificateProbe.ClientOptions("vpn.splitvpn-test.invalid");
+
+        Assert.Equal("vpn.splitvpn-test.invalid", options.TargetHost);
+        Assert.NotNull(options.CertificateChainPolicy);
+        Assert.True(options.CertificateChainPolicy.DisableCertificateDownloads);
+        Assert.Equal(X509RevocationMode.NoCheck, options.CertificateChainPolicy.RevocationMode);
+    }
+
+    /// <summary>
+    /// Предъявленное - лист и присланное сервером (ExtraStore), а не цепочка, достроенная локально: промежуточный,
+    /// найденный в хранилище компьютера, не считается присланным, и его нехватка распознаётся.
+    /// </summary>
+    [Fact]
+    public void Collect_TakesWhatServerSent_NotLocallyBuiltChain()
+    {
+        using var root = CreateCa("SplitVpn Test Root", null);
+        using var intermediate = CreateCa("SplitVpn Test Intermediate", root);
+        using var leaf = CreateLeaf(intermediate);
+        using var chain = new X509Chain();
+        chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        chain.ChainPolicy.DisableCertificateDownloads = true;
+        chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+        // Промежуточный есть только «у компьютера»: локальная цепочка его находит, а сервер его не прислал.
+        chain.ChainPolicy.CustomTrustStore.Add(intermediate);
+        chain.Build(leaf);
+        Assert.Contains(chain.ChainElements, e => e.Certificate.Thumbprint == intermediate.Thumbprint);
+
+        var presented = new List<byte[]>();
+        ServerCertificateProbe.Collect(presented, leaf, chain);
+
+        Assert.Equal([leaf.RawData], presented);
+        Assert.True(ServerCertificateProbe.Facts(presented, nameMatches: true).MissingIntermediateOnly);
+
+        // Присланный сервером промежуточный (ExtraStore) входит в предъявленное.
+        chain.ChainPolicy.ExtraStore.Add(intermediate);
+        presented.Clear();
+        ServerCertificateProbe.Collect(presented, leaf, chain);
+        Assert.Equal([leaf.RawData, intermediate.RawData], presented);
+    }
+
     private static X509Certificate2 CreateCa(string name, X509Certificate2? issuer)
     {
         using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);

@@ -101,8 +101,23 @@ internal sealed class FakeWorld : IDisposable
     /// <summary>Журнал службы; по умолчанию ничего не пишет.</summary>
     public Microsoft.Extensions.Logging.ILogger Logger { get; set; } = NullLogger.Instance;
 
-    /// <summary>Ответы на запросы обновлений; по умолчанию сеть недоступна.</summary>
+    /// <summary>
+    /// Ответы на запросы обновлений; по умолчанию сеть недоступна: <see cref="OfflineHandler"/> сразу отвечает 503
+    /// и не открывает ни одного соединения (иначе тесты ходили бы на GitHub и могли скачать настоящий MSI в %TEMP%).
+    /// </summary>
     public HttpMessageHandler? HttpHandler { get; set; }
+
+    /// <summary>
+    /// true - фоновые проверки по расписанию (обновление программы, RU-база, список обхода) остаются включёнными,
+    /// как в настройках продукта. По умолчанию false: если тест не записал настройки сам, мир записывает их с
+    /// выключенными автопроверками. Тест, которому они нужны, включает это свойство или сохраняет свои настройки.
+    /// </summary>
+    public bool ScheduledFetches { get; set; }
+
+    /// <summary>Запросы, дошедшие до обработчика «без сети» (для проверки, что тесты в сеть не ходят).</summary>
+    public int OfflineRequests => _offline.Requests;
+
+    private readonly OfflineHandler _offline = new();
 
     /// <summary>Версия «установленной» программы: по ней служба решает, что предлагать и что установилось.</summary>
     public Version ProductVersion { get; set; } = new(0, 8, 0);
@@ -118,7 +133,13 @@ internal sealed class FakeWorld : IDisposable
     /// <summary>Процессы, которые ещё работают: ожидание их завершения не заканчивается.</summary>
     public HashSet<int> RunningProcesses { get; } = [];
 
-    public ServiceDependencies Dependencies() => new()
+    public ServiceDependencies Dependencies()
+    {
+        WriteQuietSettings();
+        return NewDependencies();
+    }
+
+    private ServiceDependencies NewDependencies() => new()
     {
         Stores = new ServiceStores(Paths),
         Inventory = Inventory,
@@ -133,7 +154,7 @@ internal sealed class FakeWorld : IDisposable
         SshTunnel = SshTunnel,
         DnsProxy = Proxy,
         Probes = Probes,
-        Http = HttpHandler is null ? new HttpClient() : new HttpClient(HttpHandler),
+        Http = new HttpClient(HttpHandler ?? _offline, disposeHandler: false),
         Time = Time,
         Journal = Journal,
         WifiIncidentDirectory = Paths.Logs,
@@ -163,11 +184,47 @@ internal sealed class FakeWorld : IDisposable
         public string? Verify(byte[] manifest, byte[] signature, string? keyId) => null;
     }
 
+    /// <summary>Настройки без автопроверок по расписанию, если тест не записал свои.</summary>
+    private void WriteQuietSettings()
+    {
+        if (!ScheduledFetches && !File.Exists(Paths.Settings))
+        {
+            new ServiceStores(Paths).SaveSettings(new AppSettings
+            {
+                GeoUpdate = new GeoUpdateSettings { AutoUpdate = false },
+                BypassUpdate = new GeoUpdateSettings { AutoUpdate = false, Source = GeoSourceKind.ReFilter },
+                AppUpdate = new AppUpdateSettings { AutoCheck = false },
+            });
+        }
+    }
+
+    /// <summary>Сеть недоступна: 503 без единого соединения.</summary>
+    private sealed class OfflineHandler : HttpMessageHandler
+    {
+        private int _requests;
+
+        public int Requests => Volatile.Read(ref _requests);
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _requests);
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.ServiceUnavailable) { RequestMessage = request });
+        }
+    }
+
     public void Dispose()
     {
-        if (Directory.Exists(_root))
+        _offline.Dispose();
+        try
         {
-            Directory.Delete(_root, recursive: true);
+            if (Directory.Exists(_root))
+            {
+                Directory.Delete(_root, recursive: true);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Файл ещё держит фоновая работа координатора: временный каталог уберёт система.
         }
     }
 }
