@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.21.0",
+  "tag": "v0.21.0",
+  "releasedUtc": "2026-11-27T14:43:26Z",
+  "expiresUtc": "2027-01-26T14:43:26Z",
+  "package": {
+    "fileName": "SplitVpn-0.21.0.msi",
+    "size": 75448839,
+    "sha256": "c40ab6641f395d058cdd27b0d251f580a11a3ed2d18d53ade483f23b8530cde8",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.21.0/SplitVpn-0.21.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.21.0.msi"
+    ]
+  },
+  "notes": "Мастер первого запуска убран: подключения настраиваются сразу на обычных страницах. Исправлены ошибки 0.20.0: правила для доменов переставали действовать после перезапуска службы, запасной скрипт восстановления сети не разрывал соединения программы, после восстановления сети в DNS адаптера мог остаться адрес программы. При смене опорного подключения программа теперь спрашивает подтверждение.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.21.0",
+  "kid": "sv-2026-09-2"
+}

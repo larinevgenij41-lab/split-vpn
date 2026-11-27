@@ -1,0 +1,1471 @@
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Time.Testing;
+using SplitVpn.Core.Net;
+using SplitVpn.Core.Settings;
+using SplitVpn.Core.Protection;
+using SplitVpn.Core.State;
+using SplitVpn.Core.Update;
+using SplitVpn.Service;
+using SplitVpn.Service.Coordination;
+using SplitVpn.Windows.Dns;
+using SplitVpn.Windows.Native;
+using SplitVpn.Windows.Net;
+using SplitVpn.Windows.Operations;
+using SplitVpn.Windows.Ras;
+
+namespace SplitVpn.Service.Tests;
+
+/// <summary>
+/// Мир фейков: сеть с Wi-Fi и Radmin, туннели появляются после успешного дозвона. Туннелей может быть
+/// несколько: номер («слот») закрепляется за записью телефонной книги в порядке её создания.
+/// </summary>
+internal sealed class FakeWorld : IDisposable
+{
+    public const ulong WiFiLuid = 8;
+    public const ulong RadminLuid = 19;
+    public const ulong TunnelLuid = 56;
+
+    public static readonly Guid WiFiGuid = Guid.NewGuid();
+    public static readonly Guid TunnelGuid = FakeInventory.TunnelGuid(0);
+    public static readonly uint WiFiAddress = Ipv4.Parse("192.168.1.100");
+    public static readonly uint TunnelAddress = FakeInventory.TunnelAddress(0);
+    public static readonly uint Gateway = Ipv4.Parse("192.168.1.1");
+    public static readonly uint Server = Ipv4.Parse("203.0.113.10");
+    public static readonly uint SecondServer = Ipv4.Parse("203.0.113.77");
+
+    private readonly string _root = Path.Combine(Path.GetTempPath(), "splitvpn-service-tests", Guid.NewGuid().ToString("N"));
+
+    public FakeWorld()
+    {
+        Directory.CreateDirectory(_root);
+        Paths = new ServicePaths(_root);
+        Inventory = new FakeInventory();
+        Ras = new FakeRas(Inventory);
+        Routes.Ras = Ras;
+        Probes.Inventory = Inventory;
+    }
+
+    public ServicePaths Paths { get; }
+
+    public FakeTimeProvider Time { get; } = new(new DateTimeOffset(2026, 9, 13, 10, 0, 0, TimeSpan.Zero));
+
+    public FakeInventory Inventory { get; }
+
+    public FakeRoutes Routes { get; } = new();
+
+    public FakeWfp Wfp { get; } = new();
+
+    public FakeDns Dns { get; } = new();
+
+    public FakeRas Ras { get; }
+
+    public FakeSecrets Secrets { get; } = new();
+
+    public FakeResolver Resolver { get; } = new();
+
+    public FakeAnyConnect AnyConnect { get; } = new();
+
+    public FakeSshTunnel SshTunnel { get; } = new();
+
+    public FakeProxy Proxy { get; } = new();
+
+    public FakeProbes Probes { get; } = new();
+
+    public EventJournal Journal => _journal ??= new EventJournal(Time);
+
+    private EventJournal? _journal;
+
+    /// <summary>Код завершения RAS из «журнала»: 631 — отключил пользователь.</summary>
+    public uint? TerminationReason { get; set; }
+
+    /// <summary>Чьё соединение завершилось по «журналу»; null — код отдаётся любой записи.</summary>
+    public string? TerminationEntry { get; set; }
+
+    /// <summary>Время события завершения в «журнале»; null — текущее время часов.</summary>
+    public DateTimeOffset? TerminationTimeUtc { get; set; }
+
+    public TimeSpan Uptime { get; set; } = TimeSpan.FromHours(3);
+
+    /// <summary>Идентификатор загрузки Windows; по умолчанию недоступен — загрузка узнаётся по времени.</summary>
+    public string? BootId { get; set; }
+
+    /// <summary>
+    /// Чтение отметки экстренного отключения (HKLM\Software\SplitVpn, EmergencyOff) службой; по умолчанию отметки нет.
+    /// Читается при создании координатора и при остановке службы.
+    /// </summary>
+    public Func<SplitVpn.Core.Recovery.EmergencyFlag?> EmergencyMark { get; set; } = () => null;
+
+    public bool Metered { get; set; }
+
+    /// <summary>Удалённые адреса «установленных соединений TCP»; null - таблица не читается. По умолчанию соединений нет.</summary>
+    public HashSet<uint>? TcpConnections { get; set; } = [];
+
+    /// <summary>Сколько раз служба читала таблицу соединений TCP.</summary>
+    public int TcpTableReads { get; private set; }
+
+    public List<SplitVpn.Core.Ipc.StatusWarning> Conflicts { get; } = [];
+
+    /// <summary>Сколько раз запускался детектор конфликтов и с какими туннелями — последний раз.</summary>
+    public int ConflictChecks { get; private set; }
+
+    public IReadOnlyList<SplitVpn.Windows.Diagnostics.ConflictTunnel> ConflictTunnels { get; private set; } = [];
+
+    /// <summary>Журнал службы; по умолчанию ничего не пишет.</summary>
+    public Microsoft.Extensions.Logging.ILogger Logger { get; set; } = NullLogger.Instance;
+
+    /// <summary>
+    /// Ответы на запросы обновлений; по умолчанию сеть недоступна: <see cref="OfflineHandler"/> сразу отвечает 503
+    /// и не открывает ни одного соединения (иначе тесты ходили бы на GitHub и могли скачать настоящий MSI в %TEMP%).
+    /// </summary>
+    public HttpMessageHandler? HttpHandler { get; set; }
+
+    /// <summary>
+    /// true - фоновые проверки по расписанию (обновление программы, RU-база, список обхода) остаются включёнными,
+    /// как в настройках продукта. По умолчанию false: если тест не записал настройки сам, мир записывает их с
+    /// выключенными автопроверками. Тест, которому они нужны, включает это свойство или сохраняет свои настройки.
+    /// </summary>
+    public bool ScheduledFetches { get; set; }
+
+    /// <summary>Запросы, дошедшие до обработчика «без сети» (для проверки, что тесты в сеть не ходят).</summary>
+    public int OfflineRequests => _offline.Requests;
+
+    private readonly OfflineHandler _offline = new();
+
+    /// <summary>Версия «установленной» программы: по ней служба решает, что предлагать и что установилось.</summary>
+    public Version ProductVersion { get; set; } = new(0, 8, 0);
+
+    /// <summary>Срок одной попытки загрузки установщика; null - срок продукта (30 мин).</summary>
+    public TimeSpan? UpdateAttemptTimeout { get; set; }
+
+    /// <summary>Проверка подписи манифеста; по умолчанию принимает всё — подпись проверяют свои тесты.</summary>
+    public IManifestVerifier ManifestVerifier { get; set; } = new AcceptingVerifier();
+
+    /// <summary>Коды завершения установщика по номеру процесса: чем закончился запущенный msiexec.</summary>
+    public Dictionary<int, int?> ProcessExitCodes { get; } = [];
+
+    public List<int> WatchedProcesses { get; } = [];
+
+    /// <summary>Процессы, которые ещё работают: ожидание их завершения не заканчивается.</summary>
+    public HashSet<int> RunningProcesses { get; } = [];
+
+    public ServiceDependencies Dependencies()
+    {
+        WriteQuietSettings();
+        return NewDependencies();
+    }
+
+    private ServiceDependencies NewDependencies() => new()
+    {
+        Stores = new ServiceStores(Paths),
+        Inventory = Inventory,
+        Routes = Routes,
+        Wfp = Wfp,
+        Dns = Dns,
+        DnsBackups = new DnsBackupStore(Paths.DnsBackup),
+        Ras = Ras,
+        Secrets = Secrets,
+        Resolver = Resolver,
+        AnyConnect = AnyConnect,
+        SshTunnel = SshTunnel,
+        DnsProxy = Proxy,
+        Probes = Probes,
+        Http = new HttpClient(HttpHandler ?? _offline, disposeHandler: false),
+        Time = Time,
+        Journal = Journal,
+        WifiIncidentDirectory = Paths.Logs,
+        Logger = Logger,
+        ServiceExecutablePath = @"C:\Program Files\SplitVpn\SplitVpn.Service.exe",
+        Random = new Random(1),
+        RasTerminationReason = (_, entry) => TerminationReason is not null && (TerminationEntry is null || TerminationEntry == entry)
+            ? new RasTermination(TerminationReason, TerminationTimeUtc ?? Time.GetUtcNow())
+            : null,
+        SystemUptime = () => Uptime,
+        BootId = () => BootId,
+        EmergencyFlag = () => EmergencyMark(),
+        IsMeteredNetwork = () => Metered,
+        EstablishedTcpRemotes = () =>
+        {
+            TcpTableReads++;
+            return TcpConnections?.ToHashSet();
+        },
+        DetectConflicts = _ => Conflicts.ToList(),
+        ProductVersion = ProductVersion,
+        UpdateAttemptTimeout = UpdateAttemptTimeout,
+        ManifestVerifier = ManifestVerifier,
+        WaitForProcessAsync = (id, _) =>
+        {
+            WatchedProcesses.Add(id);
+            return RunningProcesses.Contains(id) ? new TaskCompletionSource<int?>().Task
+                : Task.FromResult(ProcessExitCodes.TryGetValue(id, out var code) ? code : null);
+        },
+        InstallerRunning = (id, _) => RunningProcesses.Contains(id),
+    };
+
+    /// <summary>Подпись принимается без проверки: тесты планировщика не занимаются криптографией.</summary>
+    private sealed class AcceptingVerifier : IManifestVerifier
+    {
+        public string? Verify(byte[] manifest, byte[] signature, string? keyId) => null;
+    }
+
+    /// <summary>Настройки без автопроверок по расписанию, если тест не записал свои.</summary>
+    private void WriteQuietSettings()
+    {
+        if (!ScheduledFetches && !File.Exists(Paths.Settings))
+        {
+            new ServiceStores(Paths).SaveSettings(new AppSettings
+            {
+                GeoUpdate = new GeoUpdateSettings { AutoUpdate = false },
+                BypassUpdate = new GeoUpdateSettings { AutoUpdate = false, Source = GeoSourceKind.ReFilter },
+                AppUpdate = new AppUpdateSettings { AutoCheck = false },
+            });
+        }
+    }
+
+    /// <summary>Сеть недоступна: 503 без единого соединения.</summary>
+    private sealed class OfflineHandler : HttpMessageHandler
+    {
+        private int _requests;
+
+        public int Requests => Volatile.Read(ref _requests);
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _requests);
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.ServiceUnavailable) { RequestMessage = request });
+        }
+    }
+
+    public void Dispose()
+    {
+        _offline.Dispose();
+        try
+        {
+            if (Directory.Exists(_root))
+            {
+                Directory.Delete(_root, recursive: true);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Файл ещё держит фоновая работа координатора: временный каталог уберёт система.
+        }
+    }
+}
+
+internal sealed class FakeInventory : INetInventory
+{
+    private static readonly Guid[] TunnelGuids = [Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()];
+
+    private readonly Lock _lock = new();
+    private readonly HashSet<int> _present = [];
+
+    /// <summary>Номера поднятых туннелей. Дозвоны идут параллельно, поэтому доступ под замком.</summary>
+    public IReadOnlyCollection<int> PresentTunnels
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _present.ToList();
+            }
+        }
+    }
+
+    public void AddTunnel(int slot)
+    {
+        lock (_lock)
+        {
+            _present.Add(slot);
+        }
+    }
+
+    public void RemoveTunnel(int slot)
+    {
+        lock (_lock)
+        {
+            _present.Remove(slot);
+        }
+    }
+
+    public bool FailCapture { get; set; }
+
+    /// <summary>Снимок сети падает этим исключением (нет доступа, сокет): не только IOException.</summary>
+    public Exception? CaptureFailure { get; set; }
+
+    public bool TunnelHasAddress { get; set; } = true;
+    public uint TunnelType { get; set; } = 23;
+
+    public bool WiFiUp { get; set; } = true;
+
+    private readonly HashSet<int> _hidden = [];
+
+    /// <summary>Соединение туннеля есть, а его интерфейса в снимке нет: не появился после дозвона или исчез.</summary>
+    public void HideTunnel(int slot, bool hidden = true)
+    {
+        lock (_lock)
+        {
+            if (hidden)
+            {
+                _hidden.Add(slot);
+            }
+            else
+            {
+                _hidden.Remove(slot);
+            }
+        }
+    }
+
+    /// <summary>Адрес, который все серверы выдали туннелям; null — у каждого туннеля свой.</summary>
+    public uint? SharedTunnelAddress { get; set; }
+
+    /// <summary>Имя интерфейса туннеля по номеру; null — «Раздельный VPN N».</summary>
+    public Func<int, string>? TunnelName { get; set; }
+
+    public uint AddressOf(int slot) => SharedTunnelAddress ?? TunnelAddress(slot);
+    /// <summary>Адрес Wi-Fi: смена при тех же DNS и шлюзе — переход в другую сеть.</summary>
+    public uint WiFiAddress { get; set; } = FakeWorld.WiFiAddress;
+
+    /// <summary>Описание драйвера Radmin; пусто — адаптер не распознаётся как виртуальная сеть.</summary>
+    public string RadminDescription { get; set; } = "";
+
+    /// <summary>GUID адаптера Wi-Fi: сброс сети Windows выдаёт ему новый.</summary>
+    public Guid WiFiGuid { get; set; } = FakeWorld.WiFiGuid;
+
+    public string WiFiDescription { get; set; } = "Intel(R) Wi-Fi 6 AX200 160MHz";
+
+    /// <summary>LUID адаптера Wi-Fi: другой адаптер (или пересозданный драйвером) получает новый.</summary>
+    public ulong WiFiLuid { get; set; } = FakeWorld.WiFiLuid;
+
+    /// <summary>Адрес Radmin есть; false — адаптер на месте, но адрес пропал (переподключение Radmin).</summary>
+    public bool RadminHasAddress { get; set; } = true;
+
+    /// <summary>«Ворота» для долгой работы: снимок сети ждёт, пока тест их не откроет.</summary>
+    public ManualResetEventSlim? CaptureGate { get; set; }
+
+    /// <summary>Снимок сети дошёл до ворот.</summary>
+    public TaskCompletionSource CaptureEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public static Guid TunnelGuid(int slot) => TunnelGuids[slot];
+
+    public static ulong TunnelLuid(int slot) => FakeWorld.TunnelLuid + (ulong)slot;
+
+    public static uint TunnelAddress(int slot) => Ipv4.Parse("192.168.44.20") + (uint)slot;
+
+    /// <summary>Совместимость с тестами про один туннель.</summary>
+    public bool TunnelPresent
+    {
+        get => PresentTunnels.Contains(0);
+        set
+        {
+            if (value)
+            {
+                AddTunnel(0);
+            }
+            else
+            {
+                RemoveTunnel(0);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Снимок собирается до ворот: сверка, остановленная на воротах, уже прочитала состояние сети, и его
+    /// изменение в это время увидит только следующая сверка.
+    /// </summary>
+    public NetSnapshot Capture()
+    {
+        if (FailCapture) throw new IOException("Снимок сети недоступен.");
+        if (CaptureFailure is { } failure) throw failure;
+        var snapshot = BuildSnapshot();
+        if (CaptureGate is { } gate)
+        {
+            CaptureEntered.TrySetResult();
+            gate.Wait(TimeSpan.FromSeconds(30));
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>DNS, который сейчас стоит на Wi-Fi (задан вручную или выдан DHCP).</summary>
+    public IReadOnlyList<uint> WiFiDnsServers { get; set; } = [FakeWorld.Gateway];
+
+    /// <summary>Метрика маршрута по умолчанию Radmin: меньше, чем у Wi-Fi, — Windows выберет его.</summary>
+    public uint RadminDefaultRouteMetric { get; set; } = 9257;
+
+    /// <summary>DNS адаптера Radmin; пусто — адаптер без DNS, служба его DNS не трогает.</summary>
+    public IReadOnlyList<uint> RadminDnsServers { get; set; } = [];
+
+    /// <summary>GUID адаптера Radmin; null — новый в каждом снимке.</summary>
+    public Guid? RadminGuid { get; set; }
+
+    private NetSnapshot BuildSnapshot()
+    {
+        var adapters = new List<AdapterCandidate>
+        {
+            new()
+            {
+                InterfaceGuid = WiFiGuid, Luid = WiFiLuid, InterfaceIndex = 8, Name = "Беспроводная сеть", IfType = 71, Description = WiFiDescription,
+                IsHardware = true, IsUp = WiFiUp, DefaultGateway = FakeWorld.Gateway, DefaultRouteMetric = 35,
+                OnLinkPrefixes = [Ipv4Cidr.Parse("192.168.1.0/24")], Addresses = [WiFiAddress], DnsServers = WiFiDnsServers,
+            },
+            new()
+            {
+                InterfaceGuid = RadminGuid ?? Guid.NewGuid(), Luid = FakeWorld.RadminLuid, InterfaceIndex = 19, Name = "Radmin VPN", IfType = 6,
+                Description = RadminDescription, IsUp = true, DefaultGateway = RadminHasAddress ? Ipv4.Parse("26.0.0.1") : null, DefaultRouteMetric = RadminDefaultRouteMetric,
+                OnLinkPrefixes = RadminHasAddress ? [Ipv4Cidr.Parse("26.0.0.0/8")] : [], Addresses = RadminHasAddress ? [Ipv4.Parse("26.185.67.105")] : [],
+                DnsServers = RadminDnsServers, OnLinkPrefixesV6 = RadminPrefixesV6,
+            },
+        };
+        List<int> hidden;
+        lock (_lock)
+        {
+            hidden = _hidden.ToList();
+        }
+
+        foreach (var slot in PresentTunnels.Except(hidden).Order())
+        {
+            adapters.Add(new AdapterCandidate
+            {
+                InterfaceGuid = TunnelGuid(slot),
+                Luid = TunnelLuid(slot),
+                InterfaceIndex = (uint)(56 + slot),
+                Name = TunnelName?.Invoke(slot) ?? "Раздельный VPN " + slot,
+                IfType = TunnelType,
+                IsUp = true,
+                Addresses = TunnelHasAddress ? [AddressOf(slot)] : [],
+                DnsServers = [Ipv4.Parse("198.51.100.50") + (uint)slot],
+            });
+        }
+
+        adapters.AddRange(Extra);
+        return new NetSnapshot(adapters, [.. ExtraRoutes]);
+    }
+
+    /// <summary>Дополнительные адаптеры снимка (например, выключенный Ethernet с оставшимся DNS).</summary>
+    public List<AdapterCandidate> Extra { get; } = [];
+
+    /// <summary>Маршруты IPv4 снимка (например, маршруты подсетей через адаптер Radmin или Tailscale).</summary>
+    public List<RouteEntry> ExtraRoutes { get; } = [];
+
+    /// <summary>On-link-сети IPv6 адаптера Radmin.</summary>
+    public IReadOnlyList<System.Net.IPNetwork> RadminPrefixesV6 { get; set; } = [];
+
+    public IReadOnlyList<uint> DhcpDnsServers(Guid interfaceGuid) => interfaceGuid == FakeWorld.WiFiGuid ? [FakeWorld.Gateway] : [];
+}
+
+internal sealed class FakeRoutes : IRouteOps
+{
+    public HashSet<RouteKey> Current { get; } = [];
+
+    /// <summary>Все маршруты, когда-либо применённые (с последней очистки теста): ловят и мимолётные.</summary>
+    public HashSet<RouteKey> Ever { get; } = [];
+
+    public int FailNext { get; set; }
+
+    public FakeRas? Ras { get; set; }
+
+    public bool ServerRouteLostWhileConnected { get; private set; }
+
+    /// <summary>Адрес сервера основного туннеля, без маршрута /32 к которому сессия рвётся.</summary>
+    public uint ServerAddress { get; set; } = FakeWorld.Server;
+
+    public RouteApplyResult Reconcile(IReadOnlyCollection<RouteKey> desired, Action<int, int>? progress = null)
+    {
+        if (FailNext > 0)
+        {
+            FailNext--;
+            return new RouteApplyResult(0, 0, 1, TimeSpan.Zero, ["сбой"]);
+        }
+
+        // Как в реальной системе: без маршрута /32 к серверу SSTP-сессия уходит в туннель и рвётся.
+        if (Ras?.Connected == true && !desired.Any(r => r.Destination == new Ipv4Cidr(ServerAddress, 32)))
+        {
+            Ras.Drop();
+            ServerRouteLostWhileConnected = true;
+        }
+
+        if (FailDestinations.Count > 0)
+        {
+            return ReconcilePartially(desired);
+        }
+
+        var added = desired.Count(r => !Current.Contains(r));
+        var removed = Current.Count(r => !desired.Contains(r));
+        Current.Clear();
+        Current.UnionWith(desired);
+        Ever.UnionWith(desired);
+        return new RouteApplyResult(added, removed, 0, TimeSpan.Zero, []);
+    }
+
+    /// <summary>
+    /// Назначения, добавление маршрута к которым не проходит (как CreateIpForwardEntry2 с ошибкой). Сверка тогда идёт как
+    /// у RouteOps.Reconcile: остальные маршруты применяются, а прежний маршрут к сбойному назначению остаётся, только
+    /// если его интерфейс по-прежнему покрывает назначение (<see cref="RouteOps.StillPermitted"/>).
+    /// </summary>
+    public HashSet<Ipv4Cidr> FailDestinations { get; } = [];
+
+    /// <summary>Сколько добавлений не прошло из-за <see cref="FailDestinations"/>.</summary>
+    public int FailedAdds { get; private set; }
+
+    /// <summary>Сколько прежних маршрутов к сбойному назначению оставлено (их интерфейс всё ещё покрывает назначение).</summary>
+    public int KeptStillPermitted { get; private set; }
+
+    private RouteApplyResult ReconcilePartially(IReadOnlyCollection<RouteKey> desired)
+    {
+        var wanted = desired.ToHashSet();
+        var failedDestinations = new HashSet<Ipv4Cidr>();
+        var errors = new List<string>();
+        var added = 0;
+        var removed = 0;
+        var failed = 0;
+        foreach (var route in wanted.Where(r => !Current.Contains(r)).ToList())
+        {
+            if (FailDestinations.Contains(route.Destination))
+            {
+                failed++;
+                FailedAdds++;
+                failedDestinations.Add(route.Destination);
+                errors.Add("добавление " + route.Destination + ": сбой");
+                continue;
+            }
+
+            Current.Add(route);
+            Ever.Add(route);
+            added++;
+        }
+
+        foreach (var route in Current.Where(r => !wanted.Contains(r)).ToList())
+        {
+            if (failedDestinations.Contains(route.Destination) && RouteOps.StillPermitted(route, wanted))
+            {
+                KeptStillPermitted++;
+                continue;
+            }
+
+            Current.Remove(route);
+            removed++;
+        }
+
+        return new RouteApplyResult(added, removed, failed, TimeSpan.Zero, errors);
+    }
+
+    public bool HasHalfRoutesOn(ulong luid) =>
+        Current.Any(r => r.InterfaceLuid == luid && r.Destination == Ipv4Cidr.Parse("0.0.0.0/1"));
+
+    public IEnumerable<Ipv4Cidr> On(ulong luid) => Current.Where(r => r.InterfaceLuid == luid).Select(r => r.Destination);
+}
+
+internal sealed class FakeWfp : IWfpOps
+{
+    public Dictionary<FilterGroup, IReadOnlyList<FilterSpec>> Groups { get; } = [];
+
+    public int FailNextReplace { get; set; }
+
+    public FilterGroup? FailOnGroup { get; set; }
+
+    public int Replacements { get; private set; }
+
+    public int Transactions { get; private set; }
+
+    public IReadOnlyList<FilterGroup> LastReplacedGroups { get; private set; } = [];
+
+    public int Reopens { get; private set; }
+
+    /// <summary>Вызывается в начале каждой замены групп (посреди сверки).</summary>
+    public Action? BeforeReplace { get; set; }
+
+    public IReadOnlyDictionary<FilterGroup, int> ReplaceGroups(IReadOnlyDictionary<FilterGroup, IReadOnlyList<FilterSpec>> groups, Action<int, int>? progress = null)
+    {
+        BeforeReplace?.Invoke();
+        if (FailNextReplace > 0)
+        {
+            FailNextReplace--;
+            throw new NativeCallException("FwpmTransactionCommit0", 0x80320017);
+        }
+
+        var pending = new Dictionary<FilterGroup, IReadOnlyList<FilterSpec>>();
+        foreach (var (group, specs) in groups)
+        {
+            if (FailOnGroup == group)
+            {
+                FailOnGroup = null;
+                throw new NativeCallException("FwpmFilterAdd0", 0x80320017);
+            }
+
+            pending[group] = specs;
+        }
+
+        foreach (var (group, specs) in pending)
+        {
+            Groups[group] = specs;
+        }
+
+        Transactions++;
+        LastReplacedGroups = pending.Keys.ToList();
+        Replacements += pending.Count;
+        return pending.ToDictionary(g => g.Key, g => g.Value.Count);
+    }
+
+    /// <summary>Сколько раз подсчёт включал группу Direct (полное перечисление фильтров).</summary>
+    public int DirectCounts { get; private set; }
+
+    public IReadOnlyDictionary<FilterGroup, int> InstalledCounts(bool includeDirect)
+    {
+        DirectCounts += includeDirect ? 1 : 0;
+        return Groups.Where(g => includeDirect || g.Key != FilterGroup.Direct).ToDictionary(g => g.Key, g => g.Value.Count);
+    }
+
+    /// <summary>Удаление одного фильтра извне (дрейф).</summary>
+    public void RemoveOne(FilterGroup group) => Groups[group] = Groups[group].Skip(1).ToList();
+
+    public void RemoveAll(Action<int, int>? progress = null) => Groups.Clear();
+
+    public void Reopen() => Reopens++;
+
+    public void Dispose()
+    {
+    }
+
+    public bool HasTunnelPermit => TunnelPermits > 0;
+
+    public int TunnelPermits => Groups.TryGetValue(FilterGroup.Runtime, out var runtime)
+        ? runtime.Count(f => f.Weight == FilterPlanBuilder.WeightTunnel && f.Action == FilterAction.Permit)
+        : 0;
+
+    public IReadOnlyList<FilterSpec> Group(FilterGroup group) => Groups.GetValueOrDefault(group, []);
+}
+
+internal sealed class FakeDns : IDnsOps
+{
+    public Dictionary<Guid, string> NameServers { get; } = [];
+
+    public Dictionary<Guid, string> SearchLists { get; } = [];
+
+    public int Flushes { get; private set; }
+    public bool FailFlush { get; set; }
+
+    public string ReadSearchList(Guid interfaceGuid) => SearchLists.GetValueOrDefault(interfaceGuid, "");
+
+    /// <summary>Запись списка суффиксов DNS падает (реестр адаптера недоступен).</summary>
+    public bool FailSetSearchList { get; set; }
+
+    public void SetSearchList(Guid interfaceGuid, string searchList) =>
+        SearchLists[interfaceGuid] = FailSetSearchList ? throw new IOException("реестр адаптера недоступен") : searchList;
+
+    public string ReadNameServer(Guid interfaceGuid)
+    {
+        if (NameServers.TryGetValue(interfaceGuid, out var stored))
+        {
+            return stored;
+        }
+
+        for (var slot = 0; slot < 3; slot++)
+        {
+            if (interfaceGuid == FakeInventory.TunnelGuid(slot))
+            {
+                return Ipv4.Format(Ipv4.Parse("198.51.100.50") + (uint)slot) + " 198.51.100.60";
+            }
+        }
+
+        return "";
+    }
+
+    /// <summary>IPv6-списки DNS адаптеров.</summary>
+    public Dictionary<Guid, string> NameServersV6 { get; } = [];
+
+    /// <summary>Занял ли посредник [::1]:53: только тогда ApplyLoopback ставит ::1.</summary>
+    public bool Ipv6Loopback { get; set; } = true;
+
+    public int LoopbackApplies { get; private set; }
+
+    /// <summary>Адаптеры, на которых подмена DNS на loopback падает (нет прав, адаптер пропал).</summary>
+    public HashSet<Guid> FailLoopback { get; } = [];
+
+    /// <summary>Адаптеры, у которых чтение IPv6-настроек DNS временно не удаётся (как RPC 1722): IPv6-часть копии неизвестна.</summary>
+    public HashSet<Guid> Ipv6ReadFails { get; } = [];
+
+    /// <summary>Как InterfaceDnsOps.Capture: loopback считается нашим, только если по интерфейсу уже есть копия.</summary>
+    public InterfaceDnsBackup Capture(Guid interfaceGuid, InterfaceDnsBackup? previous) =>
+        InterfaceDnsOps.Capture(interfaceGuid, previous, DateTimeOffset.UnixEpoch, ownsIpv6Loopback: false, (guid, ipv6) => ipv6
+            ? Ipv6ReadFails.Contains(guid)
+                ? throw new NativeCallException("GetInterfaceDnsSettings", 1722)
+                : new InterfaceDnsState(NameServersV6.GetValueOrDefault(guid, ""), "", 0)
+            : new InterfaceDnsState(ReadNameServer(guid), "", 0, ReadSearchList(guid))) with { AppliedSearchList = null };
+
+    /// <summary>
+    /// Как InterfaceDnsOps.ApplyLoopback: ::1 — только при занятом [::1]:53, иначе снимается лишь наш прежний ::1
+    /// (исходный IPv6-список известен и сам не loopback) — он возвращается к исходному. Исходный IPv6 неизвестен — IPv6 не трогается.
+    /// </summary>
+    public void ApplyLoopback(Guid interfaceGuid, string? originalV6 = null, string? nameServerV4 = null, bool ipv6Known = true)
+    {
+        if (FailLoopback.Contains(interfaceGuid))
+        {
+            throw new IOException("адаптер недоступен");
+        }
+
+        LoopbackApplies++;
+        NameServers[interfaceGuid] = nameServerV4 ?? "127.0.0.1";
+        if (!ipv6Known)
+        {
+            return;
+        }
+
+        if (Ipv6Loopback)
+        {
+            NameServersV6[interfaceGuid] = "::1";
+        }
+        else if (InterfaceDnsOps.IsStaleIpv6Loopback(NameServersV6.GetValueOrDefault(interfaceGuid, ""), originalV6))
+        {
+            NameServersV6[interfaceGuid] = originalV6!;
+        }
+    }
+
+    public bool Ipv6LoopbackMatches(Guid interfaceGuid, string? originalV6 = null) => Ipv6Loopback
+        ? InterfaceDnsOps.IsLoopback(NameServersV6.GetValueOrDefault(interfaceGuid, ""))
+        : !InterfaceDnsOps.IsStaleIpv6Loopback(NameServersV6.GetValueOrDefault(interfaceGuid, ""), originalV6);
+
+    public void ClearNameServer(Guid interfaceGuid)
+    {
+        NameServers[interfaceGuid] = "";
+        NameServersV6[interfaceGuid] = "";
+    }
+
+    /// <summary>Адаптеры, у которых IPv6-список DNS не возвращается (запись IPv6 не прошла).</summary>
+    public HashSet<Guid> FailIpv6Restore { get; } = [];
+
+    /// <summary>Адаптеры, на которых восстановление DNS падает целиком (нет прав, реестр занят).</summary>
+    public HashSet<Guid> FailRestore { get; } = [];
+
+    public DnsRestoreOutcome Restore(Guid interfaceGuid, InterfaceDnsBackup? backup)
+    {
+        if (FailRestore.Contains(interfaceGuid))
+        {
+            throw new IOException("реестр адаптера недоступен");
+        }
+
+        if (backup is not null)
+        {
+            SearchLists[interfaceGuid] = backup.SearchList;
+        }
+
+        var v4 = InterfaceDnsOps.IsProxySet(ReadNameServer(interfaceGuid));
+        // Как InterfaceDnsOps.Restore: исходный IPv6 неизвестен — IPv6 не трогается.
+        var v6 = backup?.Ipv6Unknown != true && InterfaceDnsOps.IsLoopback(NameServersV6.GetValueOrDefault(interfaceGuid, ""));
+        if (!v4 && !v6)
+        {
+            return DnsRestoreOutcome.ChangedByUser;
+        }
+
+        if (v4)
+        {
+            NameServers[interfaceGuid] = backup?.NameServerV4 ?? "";
+        }
+
+        if (v6)
+        {
+            if (FailIpv6Restore.Contains(interfaceGuid))
+            {
+                return DnsRestoreOutcome.Incomplete;
+            }
+
+            NameServersV6[interfaceGuid] = backup?.NameServerV6 ?? "";
+        }
+
+        return DnsRestoreOutcome.Restored;
+    }
+
+    public void FlushCache()
+    {
+        if (FailFlush) { throw new IOException("Сбой сброса кеша DNS"); }
+        Flushes++;
+    }
+
+    public string? ReadNameServerV6(Guid interfaceGuid) => NameServersV6.GetValueOrDefault(interfaceGuid, "");
+
+    /// <summary>Сбросы на «автоматически»: адаптер и какие списки.</summary>
+    public List<(Guid Interface, bool V4, bool V6)> Resets { get; } = [];
+
+    public bool ResetToAutomatic(Guid interfaceGuid, bool v4, bool v6)
+    {
+        Resets.Add((interfaceGuid, v4, v6));
+        if (v4) { NameServers[interfaceGuid] = ""; }
+        if (v6) { NameServersV6[interfaceGuid] = ""; }
+        return true;
+    }
+}
+
+internal sealed class FakeRas(FakeInventory inventory) : IRasOps
+{
+    private const int HandleBase = 0x5150;
+
+    private readonly Lock _lock = new();
+    private readonly Dictionary<string, int> _slots = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _entries = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _connected = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Общая очередь ответов на дозвон; пусто — успех.</summary>
+    public Queue<RasDialResult> Results { get; } = new();
+
+    /// <summary>Ответы для конкретной записи (по имени профиля, в порядке дозвона).</summary>
+    public Dictionary<string, Queue<RasDialResult>> ResultsByEntry { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public int Dials { get; private set; }
+
+    public string? SavedServer { get; private set; }
+
+    public List<string> DeletedEntries { get; } = [];
+
+    /// <summary>Последний профиль и ключ IPsec, с которыми готовили запись.</summary>
+    public ConnectionProfile? SavedProfile { get; private set; }
+
+    public string? SavedKey { get; private set; }
+
+    public bool Connected => ConnectedEntries.Count > 0;
+
+    public IReadOnlyCollection<string> ConnectedEntries
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _connected.ToList();
+            }
+        }
+    }
+
+    public int Slot(string entryName)
+    {
+        lock (_lock)
+        {
+            if (!_slots.TryGetValue(entryName, out var slot))
+            {
+                slot = _slots.Count;
+                _slots[entryName] = slot;
+            }
+
+            return slot;
+        }
+    }
+
+    /// <summary>Подготовка записи падает (нет подходящего сертификата, неверные параметры).</summary>
+    public Exception? SaveEntryFailure { get; set; }
+
+    /// <summary>Вызывается в начале подготовки записи: так тест видит, что служба успела сделать до дозвона.</summary>
+    public Action<string>? BeforeSaveEntry { get; set; }
+
+    public void SaveEntry(string entryName, ConnectionProfile profile, ReadOnlySpan<char> preSharedKey)
+    {
+        BeforeSaveEntry?.Invoke(entryName);
+        if (SaveEntryFailure is { } failure)
+        {
+            throw failure;
+        }
+
+        var key = preSharedKey.ToString();
+        lock (_lock)
+        {
+            _entries[entryName] = profile.Server;
+            SavedServer = profile.Server;
+            SavedProfile = profile;
+            SavedKey = key;
+        }
+
+        Slot(entryName);
+    }
+
+    /// <summary>Следующее удаление записи телефонной книги падает (книга занята, нет доступа); один раз.</summary>
+    public Exception? DeleteEntryFailure { get; set; }
+
+    public void DeleteEntry(string entryName)
+    {
+        if (DeleteEntryFailure is { } failure)
+        {
+            DeleteEntryFailure = null;
+            throw failure;
+        }
+
+        lock (_lock)
+        {
+            _entries.Remove(entryName);
+            DeletedEntries.Add(entryName);
+        }
+    }
+
+    public IReadOnlyList<string> EntryNames()
+    {
+        lock (_lock)
+        {
+            return _entries.Keys.ToList();
+        }
+    }
+
+    /// <summary>
+    /// Придерживает дозвон указанной записи, пока тест её не отпустит: так проверяется очерёдность подъёма
+    /// и то, что положенный на ходу туннель не присоединяется.
+    /// </summary>
+    public Dictionary<string, TaskCompletionSource> Gates { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Записи в порядке начала дозвона: по нему проверяется очерёдность подъёма.</summary>
+    public List<string> DialOrder { get; } = [];
+
+    public async Task<RasDialResult> DialAsync(string entryName, string userName, ReadOnlyMemory<char> password, string? domain, CancellationToken cancellationToken)
+    {
+        TaskCompletionSource? gate;
+        lock (_lock)
+        {
+            // Счётчик растёт в момент начала дозвона: задвижка держит уже начатый дозвон, а не отменяет его.
+            Dials++;
+            DialOrder.Add(entryName);
+            gate = Gates.GetValueOrDefault(entryName);
+        }
+
+        if (gate is not null)
+        {
+            await gate.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
+        }
+
+        var slot = Slot(entryName);
+        RasDialResult result;
+        lock (_lock)
+        {
+            var queue = ResultsByEntry.GetValueOrDefault(entryName);
+            result = queue is { Count: > 0 } ? queue.Dequeue()
+                : Results.Count > 0 ? Results.Dequeue()
+                : new RasDialResult(true, null, 0, null);
+            if (result.Success)
+            {
+                _connected.Add(entryName);
+            }
+        }
+
+        if (result.Success)
+        {
+            inventory.AddTunnel(slot);
+        }
+
+        return result with { Handle = result.Success ? new RasConnectionHandle(HandleBase + slot) : null };
+    }
+
+    /// <summary>Сбой RasHangUp: разрыв не выполняется, соединение остаётся.</summary>
+    public Exception? HangUpFailure { get; set; }
+
+    /// <summary>Сколько раз служба вызывала RasHangUp.</summary>
+    public int HangUps { get; private set; }
+
+    /// <summary>Состояние соединения записи вместо обычного «подключено/нет»: «подключается», «разорвано».</summary>
+    public Dictionary<string, RasConnectionStatus> StatusOverride { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Ожидание внутри RasHangUp с токеном, который передала служба: так тест держит разрыв посреди сверки и видит,
+    /// под каким сроком он идёт. null — разрыв сразу.
+    /// </summary>
+    public Func<CancellationToken, Task>? HangUpHook { get; set; }
+
+    public Task HangUpAsync(RasConnectionHandle handle, CancellationToken cancellationToken)
+    {
+        HangUps++;
+        if (HangUpFailure is { } failure)
+        {
+            throw failure;
+        }
+
+        return HangUpHook is { } hook ? HangUpAfterAsync(hook, handle, cancellationToken) : HangUpNow(handle);
+    }
+
+    private async Task HangUpAfterAsync(Func<CancellationToken, Task> hook, RasConnectionHandle handle, CancellationToken cancellationToken)
+    {
+        await hook(cancellationToken);
+        await HangUpNow(handle);
+    }
+
+    private Task HangUpNow(RasConnectionHandle handle)
+    {
+        var entry = EntryOf(handle);
+        if (entry is not null)
+        {
+            StatusOverride.Remove(entry);
+        }
+
+        Drop(entry);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Обрыв всех соединений со стороны сети.</summary>
+    public void Drop()
+    {
+        foreach (var entry in ConnectedEntries)
+        {
+            Drop(entry);
+        }
+    }
+
+    /// <summary>Обрыв одного соединения со стороны сети.</summary>
+    public void Drop(string? entryName)
+    {
+        if (entryName is null)
+        {
+            return;
+        }
+
+        bool removed;
+        lock (_lock)
+        {
+            removed = _connected.Remove(entryName);
+        }
+
+        if (removed)
+        {
+            inventory.RemoveTunnel(Slot(entryName));
+        }
+    }
+
+    /// <summary>Опрос состояния падает этим исключением (RasMan остановлен или завис).</summary>
+    public Exception? StatusFailure { get; set; }
+
+    public RasConnectionStatus GetStatus(RasConnectionHandle handle)
+    {
+        if (StatusFailure is { } failure)
+        {
+            throw failure;
+        }
+
+        var entry = EntryOf(handle);
+        if (entry is not null && StatusOverride.TryGetValue(entry, out var status))
+        {
+            return status;
+        }
+
+        lock (_lock)
+        {
+            return entry is not null && _connected.Contains(entry) ? RasConnectionStatus.Connected : RasConnectionStatus.Gone;
+        }
+    }
+
+    /// <summary>Перечисление соединений падает (служба RAS сбоит).</summary>
+    public bool FailFind { get; set; }
+
+    public IReadOnlyList<RasActiveConnection> FindOwnConnections() => FailFind
+        ? throw new NativeCallException("RasEnumConnections", 600)
+        : ConnectedEntries
+        .Select(e => new RasActiveConnection(new RasConnectionHandle(HandleBase + Slot(e)), e, "x.pbk", Guid.Empty))
+        .ToList();
+
+    public RasProjection GetProjection(RasConnectionHandle handle) =>
+        new(inventory.AddressOf((int)(handle.Value - HandleBase)), Ipv4.Parse("192.168.44.1"));
+
+    /// <summary>Имя записи, за которой закреплён номер туннеля.</summary>
+    public string? EntryOfSlot(int slot)
+    {
+        lock (_lock)
+        {
+            return _slots.FirstOrDefault(p => p.Value == slot).Key;
+        }
+    }
+
+    public RasStatistics? GetStatistics(RasConnectionHandle handle) => new(1000, 2000, TimeSpan.FromSeconds(5));
+
+    private string? EntryOf(RasConnectionHandle handle)
+    {
+        lock (_lock)
+        {
+            return _slots.FirstOrDefault(p => HandleBase + p.Value == handle.Value).Key;
+        }
+    }
+}
+
+internal sealed class FakeSecrets : ISecretOps
+{
+    public Dictionary<Guid, string> Saved { get; } = [];
+    public Dictionary<Guid, string> Keys { get; } = [];
+    public Dictionary<Guid, string> SshKeys { get; } = [];
+    private Dictionary<Guid, string> Store(SecretKind kind) => kind switch
+    {
+        SecretKind.Password => Saved, SecretKind.PreSharedKey => Keys, SecretKind.SshPrivateKey => SshKeys,
+        _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+    };
+
+    public char[]? TryLoad(Guid profileId, SecretKind kind = SecretKind.Password) =>
+        FailLoad.Contains(profileId) ? throw new IOException("Файл secrets.bin занят другим процессом.")
+        : !Unreadable.Contains(profileId) && Store(kind).TryGetValue(profileId, out var value) ? value.ToCharArray() : null;
+
+    /// <summary>Профили, чтение секрета которых падает (secrets.bin держит антивирус).</summary>
+    public HashSet<Guid> FailLoad { get; } = [];
+
+    /// <summary>Запись секрета падает (диск, DPAPI).</summary>
+    public bool FailSave { get; set; }
+
+    public void Save(Guid profileId, ReadOnlySpan<char> password, SecretKind kind = SecretKind.Password) =>
+        Store(kind)[profileId] = FailSave ? throw new IOException("диск недоступен") : password.ToString();
+
+    public void Delete(Guid profileId, SecretKind kind = SecretKind.Password) => Store(kind).Remove(profileId);
+
+    public bool Contains(Guid profileId, SecretKind kind = SecretKind.Password) => Store(kind).ContainsKey(profileId) && !Unreadable.Contains(profileId);
+
+    /// <summary>Записаны, но сейчас не расшифровываются (временный сбой DPAPI).</summary>
+    public HashSet<Guid> Unreadable { get; } = [];
+
+    public bool IsStored(Guid profileId, SecretKind kind = SecretKind.Password) => Store(kind).ContainsKey(profileId);
+}
+
+internal sealed class FakeResolver : IResolver
+{
+    public IReadOnlyList<uint> Answer { get; set; } = [FakeWorld.Server];
+
+    /// <summary>Ответы по именам хостов; если имени нет — общий Answer.</summary>
+    public Dictionary<string, IReadOnlyList<uint>> Answers { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public int Calls { get; private set; }
+
+    /// <summary>Разрешение имени падает этим исключением (например, ArgumentException на недопустимом имени).</summary>
+    public Dictionary<string, Exception> Failures { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public Task<IReadOnlyList<uint>> ResolveAsync(string host, IReadOnlyList<uint> servers, uint? interfaceIndex, CancellationToken cancellationToken)
+    {
+        if (Failures.TryGetValue(host, out var failure))
+        {
+            Calls++;
+            return Task.FromException<IReadOnlyList<uint>>(failure);
+        }
+
+        // Служба сама заранее разрешает имя проверки интернета Windows при каждой смене сети: в счёт вызовов и в общий
+        // ответ оно не входит, пока тест не задал для него адреса явно.
+        if (host == Coordination.Coordinator.ConnectivityCheckWebHost && !Answers.ContainsKey(host))
+        {
+            return Task.FromResult<IReadOnlyList<uint>>([]);
+        }
+
+        Calls++;
+        return Task.FromResult(Answers.GetValueOrDefault(host, Answer));
+    }
+}
+
+internal sealed class FakeProxy : IDnsProxy
+{
+    public DnsProxyConfiguration Configuration { get; set; } = new();
+
+    public IPinnedRouteSink? RouteSink { get; set; }
+
+    public DnsProxyStats Stats => new(0, 0, 0, 0, 0);
+
+    public bool IsRunning { get; private set; }
+
+    /// <summary>Посредник занимает адреса адаптеров: основному адаптеру ставится «свой адрес, 127.0.0.1».</summary>
+    public bool ServesAdapterAddresses { get; set; }
+
+    /// <summary>Адреса, порт на которых держит чужой процесс: эксклюзивный захват не удаётся.</summary>
+    public HashSet<uint> ForeignHeld { get; } = [];
+
+    /// <summary>Эксклюзивно занятые сейчас адреса.</summary>
+    public HashSet<uint> Claimed { get; } = [];
+
+    /// <summary>Вызывается перед освобождением каждого адреса: тест проверяет, что адрес уже убран из DNS адаптеров.</summary>
+    public Action<uint>? OnRelease { get; set; }
+
+    public IReadOnlyCollection<uint> ClaimAdapterAddresses(IReadOnlyCollection<uint> addresses)
+    {
+        if (!IsRunning || !ServesAdapterAddresses)
+        {
+            return [];
+        }
+
+        foreach (var address in addresses.Where(a => !ForeignHeld.Contains(a)))
+        {
+            Claimed.Add(address);
+        }
+
+        return [.. addresses.Where(Claimed.Contains)];
+    }
+
+    public void ReleaseAdapterAddresses(IReadOnlyCollection<uint> keep)
+    {
+        foreach (var address in Claimed.Where(a => !keep.Contains(a)).ToList())
+        {
+            OnRelease?.Invoke(address);
+            Claimed.Remove(address);
+        }
+    }
+
+    public Dictionary<string, IReadOnlyList<uint>> Pinned { get; } = [];
+
+    /// <summary>Порт 53 занят другой программой: посредник не запускается.</summary>
+    public bool FailStart { get; set; }
+
+    public void Start()
+    {
+        if (FailStart)
+        {
+            // Как DnsProxyServer: эксклюзивная привязка UDP к 127.0.0.1:53 не удалась.
+            throw new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.AddressAlreadyInUse);
+        }
+
+        IsRunning = true;
+    }
+
+    public Dictionary<string, TimeSpan?> PinLifetimes { get; } = [];
+
+    public void Pin(string name, IReadOnlyList<uint> addresses, TimeSpan? lifetime = null)
+    {
+        Pinned[name] = addresses;
+        PinLifetimes[name] = lifetime;
+    }
+
+    public void RetainPins(IEnumerable<string> permanentNames)
+    {
+        var keep = permanentNames.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var name in Pinned.Keys.Where(n => PinLifetimes.GetValueOrDefault(n) is null && !keep.Contains(n)).ToList())
+        {
+            Pinned.Remove(name);
+            PinLifetimes.Remove(name);
+        }
+    }
+
+    /// <summary>Сколько раз сброшен кеш посредника.</summary>
+    public int Clears { get; private set; }
+
+    public void ClearCache() => Clears++;
+}
+
+internal sealed class FakeProbes : IProbeOps
+{
+    public bool TunnelWorks { get; set; } = true;
+
+    /// <summary>Доступна ли российская контрольная цель напрямую: false воспроизводит сеть, где 77.88.55.242 не отвечает.</summary>
+    public bool RussianWorks { get; set; } = true;
+
+    public FakeInventory? Inventory { get; set; }
+
+    /// <summary>Сервер VPN отвечает сбросом на иностранную цель (запрет DoH к 1.1.1.1:443), а туннель при этом жив.</summary>
+    public bool TunnelRefusesTarget { get; set; }
+
+    /// <summary>
+    /// Придерживает пробу, пока тест её не отпустит: так воспроизводится таймаут сокета и проверяется,
+    /// что очередь актора его не ждёт. null — проба отвечает сразу.
+    /// </summary>
+    public TaskCompletionSource? Gate { get; set; }
+
+    public async Task<TcpProbeResult> TcpAsync(uint remote, ushort port, uint? localAddress, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (Gate is { } gate)
+        {
+            await gate.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
+        }
+
+        // Иностранная цель по умолчанию — 1.1.1.1, российская — 77.88.55.242.
+        var foreign = remote == Ipv4.Parse("1.1.1.1");
+        if (foreign)
+        {
+            if (TunnelRefusesTarget)
+            {
+                return new TcpProbeResult(false, localAddress ?? FakeWorld.TunnelAddress, "ConnectionRefused", Refused: true);
+            }
+
+            return TunnelWorks
+                ? new TcpProbeResult(true, localAddress ?? FakeWorld.TunnelAddress, null)
+                : new TcpProbeResult(false, null, "таймаут");
+        }
+
+        return RussianWorks
+            ? new TcpProbeResult(true, localAddress ?? FakeWorld.WiFiAddress, null)
+            : new TcpProbeResult(false, null, "таймаут");
+    }
+
+    /// <summary>Что «предъявляет» сервер по TLS: тест задаёт это сам; null — сервер не отвечает по TLS.</summary>
+    public ServerCertificateFacts? ServerCertificate { get; set; }
+
+    public int ServerCertificateCalls { get; private set; }
+
+    /// <summary>Сертификат отдельного узла сервера (несколько узлов под одним именем).</summary>
+    public Dictionary<uint, ServerCertificateFacts> CertificatesByAddress { get; } = [];
+
+    public TaskCompletionSource<ServerCertificateFacts?>? CertificateResult { get; set; }
+
+    public Task<ServerCertificateFacts?> ServerCertificateAsync(uint remote, ushort port, string? host, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        ServerCertificateCalls++;
+        return CertificateResult?.Task ?? Task.FromResult(CertificatesByAddress.TryGetValue(remote, out var own) ? own : ServerCertificate);
+    }
+
+    /// <summary>Что вернёт установка промежуточного сертификата; по умолчанию - не получен.</summary>
+    public SplitVpn.Windows.Security.IntermediateInstallResult IntermediateResult { get; set; } = new(false, "Промежуточный сертификат не получен: узел не ответил");
+
+    /// <summary>Источники, с которых служба просила скачать промежуточный сертификат.</summary>
+    public List<IReadOnlyList<SplitVpn.Windows.Security.IntermediateSource>> IntermediateRequests { get; } = [];
+
+    public Task<SplitVpn.Windows.Security.IntermediateInstallResult> InstallIntermediateAsync(
+        byte[] leafRaw, IReadOnlyList<SplitVpn.Windows.Security.IntermediateSource> sources, uint? interfaceIndex, TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        IntermediateRequests.Add(sources);
+        return IntermediateGate is { } gate ? gate.Task.ContinueWith(_ => IntermediateResult, TaskScheduler.Default) : Task.FromResult(IntermediateResult);
+    }
+
+    /// <summary>Придержать загрузку промежуточного сертификата, пока тест не отпустит.</summary>
+    public TaskCompletionSource? IntermediateGate { get; set; }
+
+    public BestRoute? FindBestRoute(uint destination) => null;
+}
+
+/// <summary>
+/// Помощники AnyConnect: тест сам «присылает» события от имени процесса и видит отправленные команды.
+/// </summary>
+internal sealed class FakeAnyConnect : IAnyConnectOps
+{
+    public List<FakeAnyConnectSession> Sessions { get; } = [];
+
+    public FakeAnyConnectSession? Last => Sessions.Count > 0 ? Sessions[^1] : null;
+
+    public bool FailStart { get; set; }
+
+    public IAnyConnectSession Start(Action<SplitVpn.Core.OpenConnect.HelperEvent> onEvent)
+    {
+        if (FailStart)
+        {
+            throw new FileNotFoundException("Не найден помощник AnyConnect.");
+        }
+
+        var session = new FakeAnyConnectSession(onEvent);
+        Sessions.Add(session);
+        return session;
+    }
+
+    /// <summary>Отпечатки, копии которых служба удаляла из хранилища SYSTEM.</summary>
+    public List<string> RemovedCopies { get; } = [];
+
+    /// <summary>Удаление копии падает (хранилище SYSTEM недоступно).</summary>
+    public Exception? RemoveFailure { get; set; }
+
+    public int RemoveCertificateCopies(string thumbprint)
+    {
+        RemovedCopies.Add(thumbprint);
+        return RemoveFailure is { } failure ? throw failure : 1;
+    }
+}
+
+/// <summary>Движок «VPN поверх SSH»: тест сам «присылает» события процесса и задаёт ответ проверки связи.</summary>
+internal sealed class FakeSshTunnel : ISshTunnelOps
+{
+    public Task InterfacePreparation { get; set; } = Task.CompletedTask;
+    public int PreparationCalls { get; private set; }
+
+    public Task PrepareInterfaceAsync(string name)
+    {
+        PreparationCalls++;
+        return InterfacePreparation;
+    }
+
+    public TaskCompletionSource<bool>? ReadKeyGate { get; set; }
+    public bool KeyReadable { get; set; } = true;
+    public Task<bool> CanReadKeyAsync(SplitVpn.Core.SshTunnel.SingBoxParameters parameters, string privateKey, CancellationToken cancellationToken) => ReadKeyGate?.Task ?? Task.FromResult(KeyReadable);
+    public List<FakeSshTunnelSession> Sessions { get; } = [];
+
+    public FakeSshTunnelSession? Last => Sessions.Count > 0 ? Sessions[^1] : null;
+
+    public string? EnginePath { get; set; } = @"C:\Program Files\SplitVpn\sing-box.exe";
+
+    public bool FailStart { get; set; }
+
+    /// <summary>Отвечает ли сервер через туннель.</summary>
+    public bool Alive { get; set; } = true;
+
+    public int Probes { get; private set; }
+
+    public ISshTunnelSession Start(SplitVpn.Core.SshTunnel.SingBoxParameters parameters, ReadOnlySpan<char> privateKey, Action<SshTunnelEvent> onEvent)
+    {
+        if (FailStart)
+        {
+            throw new FileNotFoundException("Не найден движок.");
+        }
+
+        var session = new FakeSshTunnelSession(parameters, privateKey.ToString(), onEvent);
+        Sessions.Add(session);
+        return session;
+    }
+
+    public Task<bool> ProbeAsync(IReadOnlyList<System.Net.IPEndPoint> dnsServers, uint? interfaceIndex, CancellationToken cancellationToken)
+    {
+        Probes++;
+        LastProbe = (dnsServers, interfaceIndex);
+        return Task.FromResult(Alive);
+    }
+
+    public (IReadOnlyList<System.Net.IPEndPoint> Servers, uint? InterfaceIndex)? LastProbe { get; private set; }
+}
+
+internal sealed class FakeSshTunnelSession(SplitVpn.Core.SshTunnel.SingBoxParameters parameters, string privateKey, Action<SshTunnelEvent> onEvent) : ISshTunnelSession
+{
+    public SplitVpn.Core.SshTunnel.SingBoxParameters Parameters { get; } = parameters;
+
+    public string PrivateKey { get; } = privateKey;
+
+    public bool Disposed { get; private set; }
+
+    public void Emit(SshTunnelEvent engineEvent) => onEvent(engineEvent);
+
+    /// <summary>Выход процесса: по умолчанию сразу после Dispose, как у настоящего движка.</summary>
+    public TaskCompletionSource ExitSource { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public bool? EstablishedTransport { get; set; } = false;
+
+    public bool? HasEstablishedTransport() => EstablishedTransport;
+
+    public bool ExitOnDispose { get; set; } = true;
+
+    public Task Exited => ExitSource.Task;
+
+    public void Dispose()
+    {
+        Disposed = true;
+        if (ExitOnDispose)
+        {
+            ExitSource.TrySetResult();
+        }
+    }
+}
+
+/// <summary>
+/// Часы, которые можно перевести назад: настенное время - время фейковых часов плюс сдвиг, а монотонный счётчик и
+/// таймеры - от фейковых часов без сдвига, как у настоящего Stopwatch при переводе системных часов.
+/// </summary>
+internal sealed class ShiftedTimeProvider(FakeTimeProvider inner) : TimeProvider
+{
+    public TimeSpan Offset { get; set; }
+
+    public override DateTimeOffset GetUtcNow() => inner.GetUtcNow() + Offset;
+
+    public override long GetTimestamp() => inner.GetTimestamp();
+
+    public override long TimestampFrequency => inner.TimestampFrequency;
+
+    public override TimeZoneInfo LocalTimeZone => inner.LocalTimeZone;
+
+    public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) =>
+        inner.CreateTimer(callback, state, dueTime, period);
+}
+
+internal sealed class FakeAnyConnectSession(Action<SplitVpn.Core.OpenConnect.HelperEvent> onEvent) : IAnyConnectSession
+{
+    public List<SplitVpn.Core.OpenConnect.HelperCommand> Commands { get; } = [];
+
+    public bool Disposed { get; private set; }
+
+    public void Emit(SplitVpn.Core.OpenConnect.HelperEvent helperEvent) => onEvent(helperEvent);
+
+    public bool Send(SplitVpn.Core.OpenConnect.HelperCommand command)
+    {
+        if (Disposed)
+        {
+            return false;
+        }
+
+        // Как по трубе: служба очищает пароль команды Start сразу после отправки, помощник получил свою копию.
+        Commands.Add(command is SplitVpn.Core.OpenConnect.StartCommand start ? start with { Password = start.Password?.ToArray() } : command);
+        return true;
+    }
+
+    /// <summary>Выход процесса: тест завершает его сам, когда «помощник» попрощался со шлюзом.</summary>
+    public TaskCompletionSource ExitSource { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task Exited => ExitSource.Task;
+
+    public void Dispose() => Disposed = true;
+}
