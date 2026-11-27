@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "SplitVpn",
+  "version": "0.20.0",
+  "tag": "v0.20.0",
+  "releasedUtc": "2026-11-27T06:11:06Z",
+  "expiresUtc": "2027-01-26T06:11:06Z",
+  "package": {
+    "fileName": "SplitVpn-0.20.0.msi",
+    "size": 75436551,
+    "sha256": "b45b1bf6034cb7766470585ec38d3cee21a7ce9c5961549330a241e83bd0d429",
+    "urls": [
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/download/v0.20.0/SplitVpn-0.20.0.msi",
+      "https://github.com/larinevgenij41-lab/split-vpn/releases/latest/download/SplitVpn-0.20.0.msi"
+    ]
+  },
+  "notes": "Выпуск стабильности: исправлено около сотни ошибок, найденных двумя кругами проверки кода. Главное: закрыта утечка трафика мимо VPN через сети выключенного доверенного адаптера, долгие соединения к сайтам с правилами для доменов больше не обрываются, «Отключить» работает во время дозвона, Cisco AnyConnect замечает зависший сеанс, окно входа SSO не даёт продолжить при ошибке сертификата. Новых возможностей нет.",
+  "notesUrl": "https://github.com/larinevgenij41-lab/split-vpn/releases/tag/v0.20.0",
+  "kid": "sv-2026-09-2"
+}

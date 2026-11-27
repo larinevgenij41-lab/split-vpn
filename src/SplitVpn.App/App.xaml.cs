@@ -1,0 +1,475 @@
+using System.IO;
+using System.IO.Pipes;
+using System.Windows;
+using SplitVpn.App.Services;
+using SplitVpn.App.ViewModels;
+using SplitVpn.App.Views;
+using SplitVpn.Core.Diagnostics;
+
+namespace SplitVpn.App;
+
+/// <summary>
+/// Интерфейс «Раздельный VPN». Один экземпляр на сеанс: повторный запуск показывает окно первого.
+/// Интерфейс ничего не меняет в системе сам — только команды службе через канал IPC.
+/// </summary>
+[System.Diagnostics.CodeAnalysis.SuppressMessage("Design", "CA1001", Justification = "Ресурсы освобождаются в OnExit — жизненный цикл WPF-приложения.")]
+public partial class App : Application
+{
+    /// <summary>
+    /// Канал активации — свой на каждый сеанс Windows, как и мьютекс единственного экземпляра: при быстром
+    /// переключении пользователей и RDP ярлык открывает окно в своём сеансе, а не у другого пользователя.
+    /// </summary>
+    private static readonly string ActivationPipe = "SplitVpn.App.Activate." + System.Diagnostics.Process.GetCurrentProcess().SessionId;
+
+    private Mutex? _singleInstance;
+    private MainViewModel? _main;
+    private TrayIcon? _tray;
+    private ProxyService? _proxy;
+    private CancellationTokenSource? _activation;
+
+    protected override void OnStartup(StartupEventArgs e)
+    {
+        base.OnStartup(e);
+        if (EmergencyCommandLine.IsEmergencyOff(e.Args))
+        {
+            // Ярлык «Экстренно выключить»: раньше окон, трея, единственного экземпляра и канала службы — работает,
+            // когда приложение уже открыто и когда служба не отвечает. Код завершения — код команды. Ни одна ошибка не
+            // должна закрыть процесс молча: она пишется в ui-errors.log, а человеку показывается, что делать дальше.
+            int code;
+            try
+            {
+                code = EmergencyCommandLine.Run();
+            }
+            catch (Exception ex)
+            {
+                RecordHandled(ex);
+                try
+                {
+                    EmergencyCommandLine.NativeOk(EmergencyCommandLine.FallbackText, error: true);
+                }
+                catch (Exception shown) when (shown is not OutOfMemoryException)
+                {
+                    RecordHandled(shown);
+                }
+
+                code = Core.Recovery.EmergencyExitCodes.Unexpected;
+            }
+
+            Environment.Exit(code);
+            return;
+        }
+
+        if (e.Args.Contains("--selftest", StringComparer.OrdinalIgnoreCase))
+        {
+            // Проверка разметки: окно создаётся за пределами экрана, к службе приложение не обращается.
+            // Выход через Environment.Exit: у окна отменяется закрытие (оно прячется в трей).
+            // Обработчик ошибок не ставится: исключение самопроверки должно завершить процесс с ошибкой.
+            Environment.Exit(SelfTest.Run());
+            return;
+        }
+
+        DispatcherUnhandledException += (_, args) =>
+        {
+            // Ошибка интерфейса не должна закрывать приложение: служба и защита от него не зависят.
+            // Лавина одинаковых ошибок — исключение: интерфейс завершается, чтобы не занимать процессор и диск.
+            args.Handled = true;
+            if (!Record(args.Exception))
+            {
+                ExitAfterErrorStorm();
+            }
+        };
+        AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+        {
+            if (args.ExceptionObject is Exception exception)
+            {
+                Record(exception);
+            }
+
+            // Процесс сейчас завершится без OnExit: свой прокси шлюза снимается здесь, иначе браузеры останутся
+            // с PAC недоступного шлюза до следующего запуска интерфейса.
+            RevertProxyBeforeExit();
+        };
+        TaskScheduler.UnobservedTaskException += (_, args) =>
+        {
+            Record(args.Exception);
+            args.SetObserved();
+        };
+
+        // Подробный журнал — до проверки единственного экземпляра: запуск второго тоже важен для разбора.
+        UiVerbose.Start();
+        Verbose.Write("Ui", "запуск интерфейса, аргументы «" + string.Join(" ", e.Args) + "»");
+        bool first;
+        try
+        {
+            _singleInstance = new Mutex(true, @"Local\SplitVpn.App", out first);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            // Мьютекс создан копией с другими правами — обычно запущенной от имени администратора: открыть его
+            // обычной копии не дают права повышенного маркера. Значит, интерфейс в сеансе уже запущен.
+            Verbose.Write("Ui", "интерфейс в этом сеансе уже запущен с другими правами: " + ex.Message);
+            SignalFirstInstance(OtherRightsText);
+            Shutdown(1);
+            return;
+        }
+
+        if (!first)
+        {
+            Verbose.Write("Ui", "интерфейс в этом сеансе уже запущен: показывается его окно, второй экземпляр завершается");
+            SignalFirstInstance("Не удалось открыть окно уже запущенного приложения. Щёлкните по значку «Раздельного VPN» в области уведомлений.");
+            Shutdown();
+            return;
+        }
+
+        try
+        {
+            StartFirstInstance(e);
+        }
+        catch (Exception ex)
+        {
+            FailStartup(ex);
+        }
+    }
+
+    /// <summary>Канал активации первой копии недоступен второй, запущенной с другими правами.</summary>
+    private const string OtherRightsText = "«Раздельный VPN» уже запущен с другими правами — например, от имени администратора."
+        + " Закройте ту копию и запустите программу снова; если её значок в области уведомлений не отвечает, завершите её в диспетчере задач."
+        + " VPN и защита от этого не зависят.";
+
+    /// <summary>
+    /// Сбой инициализации после захвата мьютекса. Без этого процесс оставался без окна и значка, но с мьютексом:
+    /// каждый следующий запуск лишь просил его показать окно, которого нет, — до выхода из Windows.
+    /// </summary>
+    private void FailStartup(Exception exception)
+    {
+        Record(exception);
+        _activation?.Cancel();
+        try
+        {
+            _singleInstance?.ReleaseMutex();
+        }
+        catch (ApplicationException)
+        {
+            // Мьютекс уже не принадлежит этому потоку: освобождать нечего.
+        }
+
+        _singleInstance?.Dispose();
+        _singleInstance = null;
+        try
+        {
+            MessageBox.Show("Интерфейс «Раздельного VPN» не запустился из-за внутренней ошибки. Запустите программу ещё раз;"
+                + " если ошибка повторится, переустановите её. VPN и защита от этого не зависят.\n\nПодробности — в файле "
+                + ErrorLogPath + ".", "Раздельный VPN", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        catch (Exception shown) when (shown is not OutOfMemoryException)
+        {
+            Record(shown);
+        }
+
+        if (MainWindow is MainWindow window)
+        {
+            window.AllowClose = true;
+        }
+
+        // OnExit освободит то, что успело создаться, и снимет прокси шлюза, если он был поставлен.
+        Shutdown(1);
+    }
+
+    private void StartFirstInstance(StartupEventArgs e)
+    {
+        // Слушатель активации стартует сразу за мьютексом, до тяжёлой инициализации: второй запуск за секунду
+        // ожидания успевает подключиться. Запрос, пришедший до создания окна, запоминается и исполняется после.
+        _activation = new CancellationTokenSource();
+        _ = ListenForActivationAsync(_activation.Token);
+
+        var preferences = UiPreferences.Load();
+        ThemeService.Apply(preferences.Theme);
+
+        // Обновление из другого каталога установки оставляет автозапуск на удалённый файл: путь переписывается.
+        Autostart.RepairStalePath();
+
+        var connection = new ServiceConnection();
+        _main = new MainViewModel(connection, preferences) { Confirm = ConfirmAsync, ShowWindow = ShowMainWindow };
+        var window = new MainWindow { DataContext = _main };
+        MainWindow = window;
+        _tray = new TrayIcon(_main, ShowMainWindow, () => _ = RequestExitAsync());
+        var signIn = new SignInCoordinator(connection);
+        _main.ActivateSignIn = signIn.Activate;
+        _proxy = new ProxyService(new WinInetProxySettings());
+        var main = _main;
+        var proxy = _proxy;
+        // Перед экстренным выключением свой прокси шлюза снимается сразу, не дожидаясь опроса.
+        main.Emergency.RevertProxy = async () => main.ProxyError = await proxy.UpdateAsync(null, stopped: true);
+        main.StatusUpdated += () =>
+        {
+            // Обработчики независимы: сбой окна входа не должен оставлять прокси шлюза без обновления, и наоборот.
+            Isolate(() => signIn.OnStatus(main.Status, main.UnavailableReason));
+            _ = UpdateProxyAsync(main, _proxy);
+        };
+
+        var startHidden = e.Args.Contains("--tray", StringComparer.OrdinalIgnoreCase);
+        if (!startHidden)
+        {
+            window.Show();
+        }
+
+        // Выход из Windows и Restart Manager установщика (обновление при запущенном интерфейсе) закрывают
+        // интерфейс по-настоящему, а не прячут окно в трей: иначе файлы заменяются только после перезагрузки.
+        // Прокси шлюза снимается сразу, до ответа Windows: Shutdown асинхронен, и OnExit может не успеть до конца сеанса.
+        // Затем — идущая запись настроек интерфейса на диск, коротко: обработчик синхронный, ждётся только сама фоновая
+        // запись (ей поток интерфейса не нужен), а не её продолжение здесь — иначе взаимоблокировка.
+        SessionEnding += (_, _) =>
+        {
+            RevertProxyBeforeExit();
+            if (!main.WaitPreferencesDiskWrite(PreferencesSessionEndWait))
+            {
+                Verbose.Write("Ui", "настройки интерфейса не дописаны за " + PreferencesSessionEndWait.TotalSeconds + " с до конца сеанса");
+            }
+
+            ExitApplication();
+        };
+
+        _main.Start();
+        if (_activationPending)
+        {
+            ShowMainWindow();
+        }
+    }
+
+    /// <summary>Второй запуск попросил показать окно, когда его ещё не было.</summary>
+    private bool _activationPending;
+
+    private bool _stormExit;
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        Verbose.Write("Ui", "интерфейс завершается, код " + e.ApplicationExitCode);
+        _activation?.Cancel();
+        // Прокси шлюза ставит интерфейс: без него некому снять прокси при отключении туннеля.
+        _proxy?.Dispose();
+        _tray?.Dispose();
+        _main?.Dispose();
+        _singleInstance?.Dispose();
+        base.OnExit(e);
+    }
+
+    /// <summary>
+    /// Снять свой прокси шлюза перед завершением, которое может обойтись без OnExit (сбой, конец сеанса). Ожидание
+    /// фоновой синхронизации ограничено; ошибка здесь не должна мешать завершению.
+    /// </summary>
+    private void RevertProxyBeforeExit()
+    {
+        try
+        {
+            _proxy?.Close(ProxyService.ExitWait);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Verbose.Write("Ui", "прокси шлюза перед завершением не снят: " + ex.GetType().Name + " «" + ex.Message + "»");
+        }
+    }
+
+    /// <summary>
+    /// Лавина одинаковых ошибок UI-потока: контролируемый выход вместо падения — прокси шлюза снят, значок убран,
+    /// код завершения ненулевой. Environment.Exit, а не Shutdown: штатное завершение идёт через тот же диспетчер,
+    /// который сейчас крутит ошибку.
+    /// </summary>
+    private void ExitAfterErrorStorm()
+    {
+        // Ожидание прокси может прокачать сообщения окна (STA), и ошибка повторится: выход начинается один раз.
+        if (_stormExit) { return; }
+        _stormExit = true;
+        Verbose.Write("Ui", "лавина одинаковых ошибок: интерфейс завершается");
+        RevertProxyBeforeExit();
+        try
+        {
+            _tray?.Dispose();
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Verbose.Write("Ui", "значок в трее не убран: " + ex.Message);
+        }
+
+        Environment.Exit(2);
+    }
+
+    private static async Task UpdateProxyAsync(MainViewModel main, ProxyService proxy)
+    {
+        if (main.Emergency.IsOff)
+        {
+            // Программа экстренно выключена (в том числе с ярлыка или другой копией): свой прокси шлюза снят и здесь.
+            main.ProxyError = await proxy.UpdateAsync(null, stopped: true);
+            return;
+        }
+
+        if (main.Status is null && main.UnavailableReason != Core.Ipc.ServiceUnavailableReason.NotRunning) { return; }
+        main.ProxyError = await proxy.UpdateAsync(main.Status, main.UnavailableReason == Core.Ipc.ServiceUnavailableReason.NotRunning);
+    }
+
+    public void ShowMainWindow()
+    {
+        if (MainWindow is null)
+        {
+            _activationPending = true;
+            return;
+        }
+
+        _activationPending = false;
+        MainWindow.Show();
+        if (MainWindow.WindowState == WindowState.Minimized)
+        {
+            MainWindow.WindowState = WindowState.Normal;
+        }
+
+        MainWindow.Activate();
+        _ = _main?.RefreshAsync();
+    }
+
+    /// <summary>
+    /// Выход по команде пользователя (меню трея): несохранённые черновики подключений, доска, «Защита» и «Настройки»
+    /// молча не теряются — сначала подтверждение. Завершение сеанса Windows и установщик закрывают сразу.
+    /// </summary>
+    /// <remarks>Повторный выход из трея, пока открыт вопрос, второй диалог не открывает: возвращается тот же запрос.</remarks>
+    public Task RequestExitAsync() =>
+        _exitRequest is { IsCompleted: false } pending ? pending : _exitRequest = RunExitRequestAsync();
+
+    /// <summary>Последний запрос выхода; пока он не завершён (открыт вопрос о несохранённом), повтор к нему присоединяется.</summary>
+    private Task? _exitRequest;
+
+    private async Task RunExitRequestAsync()
+    {
+        if (_main is null || await _main.ConfirmDiscardUnsavedAsync())
+        {
+            await ExitApplicationAsync();
+        }
+    }
+
+    /// <summary>
+    /// Сколько штатный выход ждёт записи настроек интерфейса: замок файла настроек ждётся до 2 с, сама запись — доли
+    /// секунды. Дольше выход не задерживается: в худшем случае теряется последнее переключение, как прежде.
+    /// </summary>
+    internal static readonly TimeSpan PreferencesExitWait = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Сколько выход из Windows ждёт идущей записи настроек на диск: короче штатного — до этого уже ждалось снятие
+    /// прокси шлюза, а Windows долго не ждёт.
+    /// </summary>
+    private static readonly TimeSpan PreferencesSessionEndWait = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Штатный выход (меню трея, установка обновления): сначала дописываются настройки интерфейса — последнее
+    /// переключение темы или подсказки не теряется. Ожидание асинхронное, а не блокирующее: продолжение записи
+    /// возвращается в поток интерфейса, и Wait() здесь был бы взаимоблокировкой.
+    /// </summary>
+    public async Task ExitApplicationAsync()
+    {
+        if (_main is { } main && !await main.WaitPreferencesWrittenAsync(PreferencesExitWait))
+        {
+            Verbose.Write("Ui", "настройки интерфейса не дописаны за " + PreferencesExitWait.TotalSeconds + " с: выход без ожидания");
+        }
+
+        ExitApplication();
+    }
+
+    public void ExitApplication()
+    {
+        if (MainWindow is MainWindow window)
+        {
+            window.AllowClose = true;
+        }
+
+        Shutdown();
+    }
+
+    /// <summary>
+    /// Обработчик обновления состояния: ошибка пишется в журнал интерфейса и не мешает остальным.
+    /// Лавина одинаковых ошибок, как и везде, завершает приложение — служба и защита от него не зависят.
+    /// </summary>
+    private static void Isolate(Action handler)
+    {
+        try
+        {
+            handler();
+        }
+        catch (Exception ex) when (Record(ex))
+        {
+            // Записано в журнал интерфейса.
+        }
+    }
+
+    /// <summary>Необработанная ошибка — в журнал ошибок и в подробный журнал; false — лавина, пора завершаться.</summary>
+    private static bool Record(Exception exception)
+    {
+        if (Verbose.IsOn)
+        {
+            Verbose.Write("Ui", "необработанная ошибка: " + exception);
+        }
+
+        return ErrorLog.Record(exception);
+    }
+
+    /// <summary>
+    /// Ошибка, которую окно уже обработало и показало пользователю, — в постоянный журнал ошибок интерфейса
+    /// (подробный журнал по умолчанию выключен). Лавина здесь не завершает приложение: окно продолжает работать.
+    /// </summary>
+    public static void RecordHandled(Exception exception) => _ = ErrorLog.Record(exception);
+
+    /// <summary>Диалог подтверждения поверх главного окна (или без владельца, если окно скрыто в трее).</summary>
+    private async Task<bool> ConfirmAsync(string title, string text, string action)
+    {
+        var box = new Wpf.Ui.Controls.MessageBox
+        {
+            Title = title,
+            Content = new System.Windows.Controls.TextBlock { Text = text, TextWrapping = TextWrapping.Wrap, MaxWidth = 440 },
+            PrimaryButtonText = action,
+            CloseButtonText = "Отмена",
+            Owner = MainWindow is { IsVisible: true } owner ? owner : null,
+        };
+        return await box.ShowDialogAsync() == Wpf.Ui.Controls.MessageBoxResult.Primary;
+    }
+
+    private static readonly string ErrorLogPath =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SplitVpn", "ui-errors.log");
+
+    private static readonly ErrorLogWriter ErrorLog = new(ErrorLogPath, TimeProvider.System);
+
+    /// <param name="failureText">Что сказать человеку, если окно первой копии открыть не удалось.</param>
+    private static void SignalFirstInstance(string failureText)
+    {
+        try
+        {
+            using var client = new NamedPipeClientStream(".", ActivationPipe, PipeDirection.Out, PipeOptions.CurrentUserOnly);
+            client.Connect(5000);
+            // Слушатель активирует окно при установлении соединения.
+        }
+        catch (Exception ex) when (ex is IOException or TimeoutException or UnauthorizedAccessException)
+        {
+            Verbose.Write("Ui", "окно первого экземпляра не открыто: " + ex.GetType().Name + " «" + ex.Message + "»");
+            MessageBox.Show(failureText, "Раздельный VPN", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private async Task ListenForActivationAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await using var server = new NamedPipeServerStream(ActivationPipe, PipeDirection.In, 1, PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                await server.WaitForConnectionAsync(cancellationToken);
+                _ = Dispatcher.BeginInvoke(ShowMainWindow);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Слушатель не должен умирать молча: без него ярлык перестанет открывать окно.
+                Record(ex);
+                await Task.Delay(1000, CancellationToken.None);
+            }
+        }
+    }
+}
